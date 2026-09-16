@@ -443,19 +443,157 @@ extern "C" {
         GGML_TYPE_TURBO1_CQ = 51, // RESERVED (codec removed 2026-07-05)
         GGML_TYPE_TURBO1_TCQ = 52, // turbo1 Trellis-Coded: FWHT + k=1/L=8 trellis, separate K/V 256-state codebooks (1.25 bpw)
         GGML_TYPE_Q2_0_G128 = 53, // 2-bit ternary weight quant, group-128 (PrismML Bonsai; on-disk type-42 remapped here at load)
-        GGML_TYPE_COUNT   = 54,
+        GGML_TYPE_F8_E4M3 = 54, // raw signed E4M3FN weights; external per-channel scale is a separate tensor
+        GGML_TYPE_Q4_A32 = 55, // asymmetric 4-bit weights, BF16 scale + packed zero point per group-32 (4.625 bpw)
+        GGML_TYPE_Q8_0_G128 = 56, // symmetric 8-bit weights, one BF16 scale per group-128 (8.125 bpw)
+        // BitsAndBytes weights keep the checkpoint's packed nibbles. Their
+        // block scales/codebooks are attached as a separate MUL_MAT source.
+        GGML_TYPE_BNB_NF4 = 57,
+        GGML_TYPE_BNB_FP4 = 58,
+        // Native GPTQ act-order weights retain the checkpoint's packed I4
+        // matrix. Per-column group indices/scales/zeros are an attached
+        // MUL_MAT auxiliary rather than being flattened into Q4_1.
+        GGML_TYPE_GPTQ_AO = 59,
+        // EXL3 (exllamav3) trellis-coded weights: 16x16 tiles of 256 weights, K bits per
+        // weight through a procedural codebook; per-tensor Hadamard sign/scale vectors are
+        // attached as MUL_MAT sources. Rows are not independently decodable (matrix executor required).
+        GGML_TYPE_EXL3_1  = 60,
+        GGML_TYPE_EXL3_2  = 61,
+        GGML_TYPE_EXL3_3  = 62,
+        GGML_TYPE_EXL3_4  = 63,
+        GGML_TYPE_EXL3_5  = 64,
+        GGML_TYPE_EXL3_6  = 65,
+        GGML_TYPE_EXL3_7  = 66,
+        GGML_TYPE_EXL3_8  = 67,
+        // same tiles with the "mcg" codebook (exllamav3 < 0.0.x checkpoints) ...
+        GGML_TYPE_EXL3M_1 = 68,
+        GGML_TYPE_EXL3M_2 = 69,
+        GGML_TYPE_EXL3M_3 = 70,
+        GGML_TYPE_EXL3M_4 = 71,
+        GGML_TYPE_EXL3M_5 = 72,
+        GGML_TYPE_EXL3M_6 = 73,
+        GGML_TYPE_EXL3M_7 = 74,
+        GGML_TYPE_EXL3M_8 = 75,
+        // ... and the original "3inst" codebook
+        GGML_TYPE_EXL3T_1 = 76,
+        GGML_TYPE_EXL3T_2 = 77,
+        GGML_TYPE_EXL3T_3 = 78,
+        GGML_TYPE_EXL3T_4 = 79,
+        GGML_TYPE_EXL3T_5 = 80,
+        GGML_TYPE_EXL3T_6 = 81,
+        GGML_TYPE_EXL3T_7 = 82,
+        GGML_TYPE_EXL3T_8 = 83,
+        // exllamav3 n-gram embedding rows (exl3_ngram_trellis): 160-element rows, K bits each,
+        // fp16 row scale in word 0 (rows are independent, so the CPU can gather them)
+        GGML_TYPE_EXL3N_2 = 84,
+        GGML_TYPE_EXL3N_3 = 85,
+        GGML_TYPE_EXL3N_4 = 86,
+        GGML_TYPE_EXL3N_5 = 87,
+        GGML_TYPE_EXL3N_6 = 88,
+        GGML_TYPE_EXL3N_7 = 89,
+        GGML_TYPE_EXL3N_8 = 90,
+        GGML_TYPE_COUNT   = 91,
     };
 
-    // precision
+    // EXL3 helpers: the type encodes the bit width and the codebook.
+    // GGML_TYPE_EXL3_* = mul1 (codebook 2), EXL3M_* = mcg (1), EXL3T_* = 3inst (0)
+    static inline bool ggml_type_is_exl3(enum ggml_type type) {
+        return type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3T_8;
+    }
+    static inline int ggml_exl3_bits(enum ggml_type type) {
+        return ((int) type - (int) GGML_TYPE_EXL3_1) % 8 + 1;
+    }
+    static inline int ggml_exl3_codebook(enum ggml_type type) {
+        const int family = ((int) type - (int) GGML_TYPE_EXL3_1) / 8;
+        return family == 0 ? 2 : family == 1 ? 1 : 0;
+    }
+    static inline bool ggml_type_is_exl3_ngram(enum ggml_type type) {
+        return type >= GGML_TYPE_EXL3N_2 && type <= GGML_TYPE_EXL3N_8;
+    }
+    static inline int ggml_exl3_ngram_bits(enum ggml_type type) {
+        return (int) type - (int) GGML_TYPE_EXL3N_2 + 2;
+    }
+    static inline enum ggml_type ggml_exl3_type(int bits, int codebook) {
+        const int family = codebook == 2 ? 0 : codebook == 1 ? 1 : 2;
+        return (enum ggml_type) ((int) GGML_TYPE_EXL3_1 + family * 8 + bits - 1);
+    }
+
+    // Serialized auxiliary for GGML_TYPE_BNB_{NF4,FP4}. Offsets are from the
+    // beginning of this header and keep the checkpoint's optional nested
+    // (double-quantized) absmax representation intact.
+    #define GGML_BNB_SCALE_MAGIC 0x53424e42u // "BNBS"
+    #define GGML_BNB_SCALE_LAYOUT_NONE 0u
+    #define GGML_BNB_SCALE_LAYOUT_ROWS 1u
+    #define GGML_BNB_SCALE_LAYOUT_COLUMNS 2u
+    struct ggml_bnb_scale_header {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t n_blocks;
+        uint32_t block_size;
+        uint32_t nested_block_size;
+        float    nested_offset;
+        uint32_t absmax_offset;
+        uint32_t nested_absmax_offset;
+        uint32_t quant_map_offset;
+        uint32_t nested_quant_map_offset;
+        uint32_t total_size;
+        // Optional logical-layout mapping for architecture adapters that
+        // permute packed weights without rewriting nested scale groups.
+        uint32_t layout;
+        uint32_t layout_rows;
+        uint32_t layout_cols;
+        uint32_t layout_prefix;
+        uint32_t layout_n_key_heads;
+        uint32_t layout_values_per_key;
+        uint32_t layout_head_span;
+    };
+
+    #define GGML_GPTQ_AO_MAGIC 0x4f415147u // "GQAO"
+    struct ggml_gptq_ao_header {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t cols;
+        uint32_t rows;
+        uint32_t groups;
+        uint32_t group_size;
+        uint32_t scale_type; // 0 = F16, 1 = BF16
+        uint32_t zeros_offset;
+        uint32_t scales_offset;
+        uint32_t g_idx_offset;
+        uint32_t total_size;
+    };
+
+    // Serialized per-output-channel BF16 scale for weight-only INT8
+    // checkpoints. The I8 payload remains the canonical weight tensor; this
+    // sidecar distinguishes W8A16 from the dynamic/static W8A8 contracts.
+    #define GGML_W8A16_SCALE_MAGIC 0x36314157u // "WA16"
+    struct ggml_w8a16_scale_header {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t n_channels;
+        uint32_t values_offset;
+        uint32_t total_size;
+    };
+
+    // [TAG_GGML_PREC]
+    // Allowed accumulation and source-representation types, stored in op_params.
     enum ggml_prec {
-        GGML_PREC_DEFAULT =  0, // stored as ggml_tensor.op_params, 0 by default
-        GGML_PREC_F32     = 10,
+        GGML_PREC_UNDEFINED = 0,
+        GGML_PREC_DEFAULT   = 0, // deprecated, use GGML_PREC_UNDEFINED
+        GGML_PREC_F32       = 10,
+        GGML_PREC_BF16      = 15,
+        GGML_PREC_F16       = 20,
+        GGML_PREC_Q8        = 30,
+        GGML_PREC_Q4        = 40,
     };
 
     // op hint
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        // CUDA: bypass the small-batch MMVQ path and prefer MMA-backed MMQ when
+        // the matrix/type/architecture support it. Other backends ignore this.
+        GGML_HINT_FORCE_MMQ        = 2,
     };
 
     // model file types
@@ -584,9 +722,11 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_DSV4_HC_PARAMS,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DFLASH2_CONV,
         GGML_OP_GATED_DELTA_NET_TREE,
         GGML_OP_SSM_CONV_TREE,
         GGML_OP_TURBO_WHT,
@@ -643,6 +783,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SWIGLU_CLAMP,
 
         GGML_GLU_OP_COUNT,
     };
@@ -669,6 +810,9 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        // ...uses an E4M3 weight with a 128x128 block-scale tensor. Backends
+        // may use this to select a block-FP8-specific storage layout.
+        GGML_TENSOR_FLAG_BLOCK_FP8 = 32,
     };
 
     enum ggml_tri_type {
@@ -1407,6 +1551,12 @@ extern "C" {
             float                 alpha,
             float                 limit);
 
+    GGML_API struct ggml_tensor * ggml_swiglu_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 limit);
+
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(
             struct ggml_context * ctx,
@@ -1462,6 +1612,24 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 eps);
 
+    // [TAG_GGML_PREC]
+    // Minimum accumulator type: F32 requires F32; BF16 or F16 also allow F32.
+    // Q8 and Q4 are not accumulator types. Returns false for unsupported ops.
+    GGML_API bool ggml_prec_set_acc(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
+    // [TAG_GGML_PREC]
+    // Smallest representation rank allowed for src[idx], in decreasing order:
+    // F32, BF16, F16, Q8 (Q8_0/Q8_1/Q8_K/etc.), Q4 (Q4_K/NVFP4/MXFP4/etc.).
+    // For example, Q8 allows F32 -> Q8_0 but not F32 -> NVFP4.
+    // Currently only src[1] of MUL_MAT/MUL_MAT_ID is supported. Returns false
+    // for unsupported ops or sources; idx must be in [0, GGML_MAX_SRC).
+    GGML_API bool ggml_prec_set_src(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec,
+            int                  idx);
+
     // A: k columns, n rows => [ne03, ne02, n, k]
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
@@ -1472,9 +1640,10 @@ extern "C" {
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
-    GGML_API void ggml_mul_mat_set_prec(
+    GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
-            enum ggml_prec       prec);
+            enum ggml_prec       prec),
+        "use ggml_prec_set_acc() instead");
 
     // change the hint of a matrix multiplication
     GGML_API void ggml_mul_mat_set_hint(
@@ -1487,6 +1656,11 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // expert-parallel window: `as` holds only experts [lo, lo + n_local) of the routed expert space at local
+    // indices 0..n_local-1. Routed ids outside the window are skipped and their output rows are zero;
+    // n_local == 0 disables the window.
+    GGML_API void ggml_mul_mat_id_set_expert_window(struct ggml_tensor * mmid, int32_t lo, int32_t n_local);
 
     // A: m columns, n rows,
     // B: p columns, n rows,
@@ -1764,6 +1938,19 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   n_past);
 
+    GGML_API struct ggml_tensor * ggml_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 min,
+            float                 max);
+
+    // in-place, returns view(a)
+    GGML_API struct ggml_tensor * ggml_clamp_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 min,
+            float                 max);
+
     GGML_API struct ggml_tensor * ggml_soft_max(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -2021,14 +2208,14 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow);
 
-
-    // clamp
-    // in-place, returns view(a)
-    GGML_API struct ggml_tensor * ggml_clamp(
-            struct ggml_context * ctx,
+    // set the offset dims for RoPE
+    // a must be GGML_OP_ROPE or GGML_OP_ROPE_BACK
+    // vision RoPE is not supported
+    // example: (marking: x = rotated, 0 = unrotated)
+    //     n_embd = 10, n_dims = 4, offset = 2 --> [00xxxx0000]
+    GGML_API struct ggml_tensor * ggml_rope_set_offset(
             struct ggml_tensor  * a,
-            float                 min,
-            float                 max);
+            int                   n_offs);
 
     // im2col
     // converts data into a format that effectively results in a convolution when combined with matrix multiplication
@@ -2439,6 +2626,16 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   k);
 
+    // Stable variant orders equal values by ascending source index. Stable
+    // top-k currently supports k <= 64 on every backend.
+    GGML_API struct ggml_tensor * ggml_top_k_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k,
+            bool                  stable);
+
+    GGML_API bool ggml_top_k_is_stable(const struct ggml_tensor * tensor);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,
@@ -2466,11 +2663,28 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
-    GGML_API void ggml_flash_attn_ext_set_prec(
+    GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
-            enum ggml_prec       prec);
+            enum ggml_prec       prec),
+        "use ggml_prec_set_acc() instead");
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
+            const struct ggml_tensor * a);
+
+    // Use finite mask entries as a sparse K/V set. Set 0 to disable.
+    // n_kv_max must bound the number of finite entries in every mask row.
+    // This is independent of the boolean sparse-mask scheduling hint below.
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
+
+    // Hint that the mask selects a sparse, non-contiguous subset of KV rows.
+    // Backends may use this to skip fully masked work; it does not change results.
+    GGML_API void ggml_flash_attn_ext_set_sparse_mask(
+            struct ggml_tensor * a,
+            bool                 sparse);
+
+    GGML_API bool ggml_flash_attn_ext_get_sparse_mask(
             const struct ggml_tensor * a);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
@@ -2499,7 +2713,8 @@ extern "C" {
             struct ggml_tensor  * A,
             struct ggml_tensor  * B,
             struct ggml_tensor  * C,
-            struct ggml_tensor  * ids);
+            struct ggml_tensor  * ids,
+            int64_t               K);
 
     // partition into non-overlapping windows with padding if needed
     // example:
@@ -2673,6 +2888,17 @@ extern "C" {
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.
     //
+    // hc_params: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
+    //            -> [(2 + hc)*hc, n_tokens]
+    // The packed result contains pre [hc], post [hc], then comb [hc*hc] for each token.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_params(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
+
     // hc_comb: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
     //          -> [dst_hc, src_hc, n_tokens]
     // logits[dst, src, t] = mixes[2*hc + dst + hc*src, t]*scale[2]
@@ -2707,6 +2933,17 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // DFlash2 grouped two-tap convolution. hidden [n_embd, n_tokens],
+    // projected [4*n_groups, n_tokens], base [n_embd, 2, 2].
+    GGML_API struct ggml_tensor * ggml_dflash2_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * hidden,
+            struct ggml_tensor  * projected,
+            struct ggml_tensor  * base,
+            int32_t               side,
+            int32_t               group_size,
+            int32_t               block_size);
 
     // custom operators
 
@@ -2853,6 +3090,12 @@ extern "C" {
             int                   idx);
 
     GGML_API void ggml_build_forward_expand(
+            struct ggml_cgraph * cgraph,
+            struct ggml_tensor * tensor);
+
+    // add the tensor and its parents to the graph without marking them for compute
+    // the flag is set later, when the tensor is reached from a node that computes
+    GGML_API void ggml_build_forward_order(
             struct ggml_cgraph * cgraph,
             struct ggml_tensor * tensor);
 

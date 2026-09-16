@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cinttypes>
 #include <clocale>
@@ -22,10 +23,13 @@
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
+#include "llama-bench-vbr.h"
 #include "download.h"
 #include "fit.h"
 #include "ggml.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
+#include "log.h"
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -270,10 +274,112 @@ static const char * split_mode_str(llama_split_mode mode) {
     }
 }
 
+static const char * lazy_mode_str(llama_lazy_mode mode) {
+    switch (mode) {
+        case LLAMA_LAZY_MODE_OFF:
+            return "off";
+        case LLAMA_LAZY_MODE_AUTO:
+            return "auto";
+        case LLAMA_LAZY_MODE_ON:
+            return "on";
+        default:
+            GGML_ABORT("invalid lazy mode");
+    }
+}
+
+static const char * mmap_prefetch_mode_str(llama_mmap_prefetch_mode mode) {
+    switch (mode) {
+        case LLAMA_MMAP_PREFETCH_MODE_OFF:  return "off";
+        case LLAMA_MMAP_PREFETCH_MODE_AUTO: return "auto";
+        case LLAMA_MMAP_PREFETCH_MODE_ON:   return "on";
+    }
+    return "unknown";
+}
+
 static std::string pair_str(const std::pair<int, int> & p) {
     static char buf[32];
     snprintf(buf, sizeof(buf), "%d,%d", p.first, p.second);
     return buf;
+}
+
+static std::string parse_moe_cache_mode(const std::string & value) {
+    if (value == "off" || value == "0") {
+        return "off";
+    }
+    if (value == "auto" || value == "on" || value == "soft") {
+        return value;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long long budget_mb = strtoll(value.c_str(), &end, 10);
+    if (errno != 0 || end == value.c_str() || *end != '\0' ||
+        budget_mb <= 0 || budget_mb > 1024 * 1024) {
+        throw std::invalid_argument("expected auto, on, off, 0, or a positive MiB budget");
+    }
+    return std::to_string(budget_mb);
+}
+
+static bool moe_cache_mode_forces_canonical_weights(const std::string & mode) {
+    return mode == "on" || (mode != "auto" && mode != "off" && mode != "soft");
+}
+
+static common_moe_cache_params common_moe_cache_from_bench_mode(const std::string & mode) {
+    common_moe_cache_params result;
+    result.mode_explicit = true;
+    if (mode == "off") {
+        result.mode = COMMON_MOE_CACHE_MODE_OFF;
+    } else if (mode == "auto") {
+        result.mode = COMMON_MOE_CACHE_MODE_AUTO;
+    } else if (mode == "soft") {
+        result.mode = COMMON_MOE_CACHE_MODE_SOFT;
+    } else {
+        result.mode = COMMON_MOE_CACHE_MODE_ON;
+        if (mode != "on") {
+            result.budget_mib = std::stoull(mode);
+        }
+    }
+    return result;
+}
+
+static std::string parse_repack_mode(const std::string & value) {
+    if (value == "auto" || value == "on" || value == "off") {
+        return value;
+    }
+    throw std::invalid_argument("expected auto, on, or off");
+}
+
+static bool get_effective_repack(const std::string & cache_mode, const std::string & repack_mode) {
+    if (moe_cache_mode_forces_canonical_weights(cache_mode)) {
+        if (repack_mode == "on") {
+            throw std::invalid_argument("repack=on is incompatible with MoE cache on or a fixed cache budget");
+        }
+        return false;
+    }
+    return repack_mode != "off";
+}
+
+static void apply_moe_cache_mode(llama_context_params & cparams, const std::string & mode) {
+    if (mode == "off") {
+        cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_OFF;
+        cparams.moe_cache_budget_mib = 0;
+    } else if (mode == "auto") {
+        cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_AUTO;
+        cparams.moe_cache_budget_mib = 0;
+    } else if (mode == "on" || mode == "soft") {
+        cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_ON;
+        cparams.moe_cache_budget_mib = 0;
+    } else {
+        cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_ON;
+        cparams.moe_cache_budget_mib = std::stoull(mode);
+    }
+}
+
+static std::string get_moe_cache_mode_from_env() {
+    if (const char * mode = getenv("LLAMA_ARG_MOE_CACHE")) {
+        return parse_moe_cache_mode(mode);
+    }
+    return "auto";
 }
 
 static std::vector<int> parse_int_range(const std::string & s, bool allow_negative = false) {
@@ -318,6 +424,12 @@ static std::vector<int> parse_int_range(const std::string & s, bool allow_negati
     return result;
 }
 
+using cmd_cache_type = common_vbr_cache_choice;
+
+static const char * cmd_cache_type_name(const cmd_cache_type & choice) {
+    return choice.vbr ? "vbr" : ggml_type_name(choice.type);
+}
+
 struct cmd_params {
     std::vector<std::string>         model;
     std::vector<std::string>         hf_repo;
@@ -326,35 +438,45 @@ struct cmd_params {
     bool                             offline;
     std::vector<int>                 n_prompt;
     std::vector<int>                 n_gen;
+    int                              n_gen_warmup;
     std::vector<std::pair<int, int>> n_pg;
     std::vector<int>                 n_depth;
     std::vector<int>                 n_batch;
     std::vector<int>                 n_ubatch;
-    std::vector<ggml_type>           type_k;
-    std::vector<ggml_type>           type_v;
+    std::vector<cmd_cache_type>      type_k;
+    std::vector<cmd_cache_type>      type_v;
     std::vector<int>                 n_threads;
     std::vector<std::string>         cpu_mask;
     std::vector<bool>                cpu_strict;
     std::vector<int>                 poll;
     std::vector<int>                 n_gpu_layers;
     std::vector<int>                 n_cpu_moe;
+    std::vector<std::string>         moe_cache;
+    std::string                      repack;
     std::vector<llama_split_mode>    split_mode;
+    std::vector<llama_load_mode>     load_mode;
+    std::vector<llama_lazy_mode>     lazy_mode;
+    std::vector<llama_mmap_prefetch_mode> mmap_prefetch;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
-    std::vector<bool>                use_mmap;
-    std::vector<bool>                use_direct_io;
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
     std::vector<bool>                no_host;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
-    bool                             vbr = false; // arm dynamic VBR (F16 entry + decode-time degrade controller)
+    bool                             vbr = false; // arm dynamic VBR and its decode-time degrade controller
+    llama_vbr_codec                  vbr_codec = LLAMA_VBR_CODEC_TURBO;
+    bool                             vbr_codec_explicit = false;
+    std::string                      vbr_entry;  // discrete entry tier (quality-first default: f16)
     std::string                      vbr_floor;  // aggregate floor tier (t8/t4/t3tcq/t2tcq/t1tcq, auto = bottom)
     std::string                      vbr_vram;   // KV VRAM budget: auto (floor-layout fallback) or explicit MiB
+    bool                             vbr_entry_explicit = false;
+    bool                             vbr_floor_explicit = false;
+    bool                             vbr_vram_explicit = false;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -362,6 +484,11 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    bool                             moe_cache_explicit;
+    bool                             n_gen_warmup_explicit;
+    bool                             repack_explicit;
+    bool                             n_threads_explicit;
+    bool                             moe_cache_profile;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -374,35 +501,45 @@ static const cmd_params cmd_params_defaults = {
     /* offline              */ false,
     /* n_prompt             */ { 512 },
     /* n_gen                */ { 128 },
+    /* n_gen_warmup         */ 1,
     /* n_pg                 */ {},
     /* n_depth              */ { 0 },
     /* n_batch              */ { 2048 },
     /* n_ubatch             */ { 512 },
-    /* type_k               */ { GGML_TYPE_F16 },
-    /* type_v               */ { GGML_TYPE_F16 },
+    /* type_k               */ { { GGML_TYPE_F16, false, false } },
+    /* type_v               */ { { GGML_TYPE_F16, false, false } },
     /* n_threads            */ { common_cpu_get_num_math() },
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
     /* poll                 */ { 50 },
     /* n_gpu_layers         */ { -1 },
     /* n_cpu_moe            */ { 0 },
+    /* moe_cache            */ { "auto" },
+    /* repack               */ "auto",
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
+    /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
+    /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
+    /* mmap_prefetch        */ { LLAMA_MMAP_PREFETCH_MODE_AUTO },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
-    /* use_mmap             */ { true },
-    /* use_direct_io        */ { false },
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
     /* no_host              */ { false },
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
     /* vbr                  */ false,
+    /* vbr_codec            */ LLAMA_VBR_CODEC_TURBO,
+    /* vbr_codec_explicit   */ false,
+    /* vbr_entry            */ "f16",
     /* vbr_floor            */ "auto",
     /* vbr_vram             */ "auto",
+    /* vbr_entry_explicit   */ false,
+    /* vbr_floor_explicit   */ false,
+    /* vbr_vram_explicit    */ false,
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -410,6 +547,11 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* moe_cache_explicit   */ false,
+    /* n_gen_warmup_explicit*/ false,
+    /* repack_explicit      */ false,
+    /* n_threads_explicit   */ false,
+    /* moe_cache_profile    */ true,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -429,6 +571,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --n-gen-warmup <n>                         generation tokens to run before timing (default: %d)\n", cmd_params_defaults.n_gen_warmup);
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -436,51 +579,61 @@ static void print_usage(int /* argc */, char ** argv) {
     }
     printf("\n");
     printf("test parameters:\n");
-    printf("  -m, --model <filename>                      (default: %s)\n", join(cmd_params_defaults.model, ",").c_str());
-    printf("  -hf, -hfr, --hf-repo <user>/<model>[:quant] Hugging Face model repository; quant is optional, case-insensitive\n");
-    printf("                                              default to Q4_K_M, or falls back to the first file in the repo if Q4_K_M doesn't exist.\n");
-    printf("                                              example: ggml-org/GLM-4.7-Flash-GGUF:Q4_K_M\n");
-    printf("                                              (default: unused)\n");
-    printf("  -hff, --hf-file <file>                      Hugging Face model file. If specified, it will override the quant in --hf-repo\n");
-    printf("                                              (default: unused)\n");
-    printf("  -hft, --hf-token <token>                    Hugging Face access token\n");
-    printf("                                              (default: value from HF_TOKEN environment variable)\n");
-    printf("  --offline                                   Offline mode: forces use of cache, prevents network access\n");
-    printf("                                              (default: disabled)\n");
-    printf("  -p, --n-prompt <n>                          (default: %s)\n", join(cmd_params_defaults.n_prompt, ",").c_str());
-    printf("  -n, --n-gen <n>                             (default: %s)\n", join(cmd_params_defaults.n_gen, ",").c_str());
-    printf("  -pg <pp,tg>                                 (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_pg, pair_str), ",").c_str());
-    printf("  -d, --n-depth <n>                           (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
-    printf("  -b, --batch-size <n>                        (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
-    printf("  -ub, --ubatch-size <n>                      (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
-    printf("  -ctk, --cache-type-k <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
-    printf("  -ctv, --cache-type-v <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
-    printf("  --vbr-floor <t8|t4|t3tcq|t2tcq|t1tcq|auto>  arm dynamic VBR (F16 entry, both sides), aggregate floor tier\n");
-    printf("                                              (also enabled by -ctk vbr / -ctv vbr; default floor: bottom tier)\n");
-    printf("  --vbr-vram <auto|SIZE[K|M|G]>                VBR KV VRAM budget (default: auto = floor-layout-cost fallback)\n");
-    printf("  -t, --threads <n>                           (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
-    printf("  -C, --cpu-mask <hex,hex>                    (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
-    printf("  --cpu-strict <0|1>                          (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
-    printf("  --poll <0...100>                            (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
-    printf("  -ngl, --n-gpu-layers <n>                    (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
-    printf("  -ncmoe, --n-cpu-moe <n>                     (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
-    printf("  -sm, --split-mode <none|layer|row|tensor>   (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
-    printf("  -mg, --main-gpu <i>                         (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
-    printf("  -nkvo, --no-kv-offload <0|1>                (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
-    printf("  -fa, --flash-attn <on|off|auto>             (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
-    printf("  -dev, --device <dev0/dev1/...>              (default: auto)\n");
-    printf("  -mmp, --mmap <0|1>                          (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
-    printf("  -dio, --direct-io <0|1>                     (default: %s)\n", join(cmd_params_defaults.use_direct_io, ",").c_str());
-    printf("  -embd, --embeddings <0|1>                   (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
-    printf("  -ts, --tensor-split <ts0/ts1/..>            (default: 0)\n");
+    printf("  -m, --model <filename>                            (default: %s)\n", join(cmd_params_defaults.model, ",").c_str());
+    printf("  -hf, -hfr, --hf-repo <user>/<model>[:quant]       Hugging Face model repository; quant is optional, case-insensitive\n");
+    printf("                                                    default to Q4_K_M, or falls back to the first file in the repo if Q4_K_M doesn't exist.\n");
+    printf("                                                    example: ggml-org/GLM-4.7-Flash-GGUF:Q4_K_M\n");
+    printf("                                                    (default: unused)\n");
+    printf("  -hff, --hf-file <file>                            Hugging Face model file. If specified, it will override the quant in --hf-repo\n");
+    printf("                                                    (default: unused)\n");
+    printf("  -hft, --hf-token <token>                          Hugging Face access token\n");
+    printf("                                                    (default: value from HF_TOKEN environment variable)\n");
+    printf("  --offline                                         Offline mode: forces use of cache, prevents network access\n");
+    printf("                                                    (default: disabled)\n");
+    printf("  -p, --n-prompt <n>                                (default: %s)\n", join(cmd_params_defaults.n_prompt, ",").c_str());
+    printf("  -n, --n-gen <n>                                   (default: %s)\n", join(cmd_params_defaults.n_gen, ",").c_str());
+    printf("  -pg <pp,tg>                                       (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_pg, pair_str), ",").c_str());
+    printf("  -d, --n-depth <n>                                 (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
+    printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
+    printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
+    printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, cmd_cache_type_name), ",").c_str());
+    printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, cmd_cache_type_name), ",").c_str());
+    printf("  --vbr-codec <turbo|classic>                        dynamic VBR codec ladder (default: turbo)\n");
+    printf("  --vbr-entry <tier>                                  dynamic VBR entry tier (default: f16)\n");
+    printf("  --vbr-floor <tier|bits|auto>                        arm dynamic VBR (both sides), aggregate floor\n");
+    printf("                                                    (also enabled by -ctk vbr / -ctv vbr; default floor: bottom tier)\n");
+    printf("  --vbr-vram <auto|SIZE[K|M|G]>                     VBR KV VRAM budget (default: auto = floor-layout-cost fallback)\n");
+    printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
+    printf("  -C, --cpu-mask <hex,hex>                          (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
+    printf("  --cpu-strict <0|1>                                (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
+    printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
+    printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
+    printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
+    printf("  --moe-cache <auto|on|soft|off|0|MiB>                   (default: %s)\n", join(cmd_params_defaults.moe_cache, ",").c_str());
+    printf("                                                    on and fixed budgets disable weight repacking\n");
+    printf("  --repack <auto|on|off>                            weight repacking policy (default: %s)\n", cmd_params_defaults.repack.c_str());
+    printf("  -nr, --no-repack                                  equivalent to --repack off\n");
+    printf("  --[no-]moe-cache-profile                         persist expert heatmap (default: on)\n");
+    printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
+    printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
+    printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
+    printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
+    printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
+    printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
+    printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
+    printf("  --mmap-prefetch <on|auto|off>                     (default: %s)\n", join(transform_to_str(cmd_params_defaults.mmap_prefetch, mmap_prefetch_mode_str), ",").c_str());
+    printf("  -mmp, --mmap <0|1>                                (DEPRECATED IN FAVOUR OF --load-mode)\n");
+    printf("  -dio, --direct-io <0|1>                           (DEPRECATED IN FAVOUR OF --load-mode)\n");
+    printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
+    printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
-    printf("                                              (default: disabled)\n");
-    printf("  -nopo, --no-op-offload <0|1>                (default: 0)\n");
-    printf("  --no-host <0|1>                             (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
+    printf("                                                    (default: disabled)\n");
+    printf("  -nopo, --no-op-offload <0|1>                      (default: 0)\n");
+    printf("  --no-host <0|1>                                   (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
     printf("\n");
     printf(
-        "Multiple values can be given for each parameter by separating them with ','\n"
-        "or by specifying the parameter multiple times. Ranges can be given as\n"
+        "Multiple values can be given for list-valued parameters by separating them with ','\n"
+        "or by specifying the parameter multiple times. Supported ranges can be given as\n"
         "'first-last' or 'first-last+step' or 'first-last*mult'.\n");
 }
 
@@ -552,8 +705,21 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
     params.vbr                  = cmd_params_defaults.vbr;
+    params.vbr_codec            = cmd_params_defaults.vbr_codec;
+    params.vbr_codec_explicit   = cmd_params_defaults.vbr_codec_explicit;
+    params.vbr_entry            = cmd_params_defaults.vbr_entry;
     params.vbr_floor            = cmd_params_defaults.vbr_floor;
     params.vbr_vram             = cmd_params_defaults.vbr_vram;
+    params.vbr_entry_explicit   = cmd_params_defaults.vbr_entry_explicit;
+    params.vbr_floor_explicit   = cmd_params_defaults.vbr_floor_explicit;
+    params.vbr_vram_explicit    = cmd_params_defaults.vbr_vram_explicit;
+    params.n_gen_warmup         = cmd_params_defaults.n_gen_warmup;
+    params.repack               = cmd_params_defaults.repack;
+    params.moe_cache_explicit    = cmd_params_defaults.moe_cache_explicit;
+    params.n_gen_warmup_explicit = cmd_params_defaults.n_gen_warmup_explicit;
+    params.repack_explicit       = cmd_params_defaults.repack_explicit;
+    params.n_threads_explicit    = cmd_params_defaults.n_threads_explicit;
+    params.moe_cache_profile     = cmd_params_defaults.moe_cache_profile;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -612,6 +778,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_gen.insert(params.n_gen.end(), p.begin(), p.end());
+            } else if (arg == "--n-gen-warmup") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                if (p.size() != 1) {
+                    invalid_param = true;
+                    break;
+                }
+                params.n_gen_warmup = p[0];
+                params.n_gen_warmup_explicit = true;
             } else if (arg == "-pg") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -651,13 +829,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<std::string>(argv[i], split_delim);
 
-                std::vector<ggml_type> types;
+                std::vector<cmd_cache_type> types;
                 for (const auto & t : p) {
                     if (t == "vbr") {
-                        // dynamic VBR: F16 entry tier, controller armed in to_llama_cparams (both
-                        // sides). Floor via --vbr-floor (default: bottom tier).
                         params.vbr = true;
-                        types.push_back(GGML_TYPE_F16);
+                        types.push_back({ GGML_TYPE_F16, true, true });
                         continue;
                     }
                     ggml_type gt = ggml_type_from_name(t);
@@ -665,7 +841,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         invalid_param = true;
                         break;
                     }
-                    types.push_back(gt);
+                    types.push_back({ gt, false, true });
                 }
                 if (invalid_param) {
                     break;
@@ -678,13 +854,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<std::string>(argv[i], split_delim);
 
-                std::vector<ggml_type> types;
+                std::vector<cmd_cache_type> types;
                 for (const auto & t : p) {
                     if (t == "vbr") {
-                        // dynamic VBR: F16 entry tier, controller armed in to_llama_cparams (both
-                        // sides). Floor via --vbr-floor (default: bottom tier).
                         params.vbr = true;
-                        types.push_back(GGML_TYPE_F16);
+                        types.push_back({ GGML_TYPE_F16, true, true });
                         continue;
                     }
                     ggml_type gt = ggml_type_from_name(t);
@@ -692,7 +866,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         invalid_param = true;
                         break;
                     }
-                    types.push_back(gt);
+                    types.push_back({ gt, false, true });
                 }
                 if (invalid_param) {
                     break;
@@ -705,6 +879,31 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 params.vbr       = true;
                 params.vbr_floor = argv[i];
+                params.vbr_floor_explicit = true;
+            } else if (arg == "--vbr-entry") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.vbr       = true;
+                params.vbr_entry = argv[i];
+                params.vbr_entry_explicit = true;
+            } else if (arg == "--vbr-codec") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const std::string codec = argv[i];
+                if (codec == "turbo") {
+                    params.vbr_codec = LLAMA_VBR_CODEC_TURBO;
+                } else if (codec == "classic") {
+                    params.vbr_codec = LLAMA_VBR_CODEC_CLASSIC;
+                } else {
+                    invalid_param = true;
+                    break;
+                }
+                params.vbr = true;
+                params.vbr_codec_explicit = true;
             } else if (arg == "--vbr-vram" || arg == "--vbr-budget") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -712,6 +911,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 params.vbr      = true;
                 params.vbr_vram = argv[i];
+                params.vbr_vram_explicit = true;
             } else if (arg == "-dev" || arg == "--device") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -731,22 +931,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
             } else if (arg == "--list-devices") {
-                std::vector<ggml_backend_dev_t> devices;
-                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                    auto * dev = ggml_backend_dev_get(i);
-                    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                        devices.push_back(dev);
-                    }
-                }
-                printf("Available devices:\n");
-                if (devices.empty()) {
-                    printf("  (none)\n");
-                }
-                for (auto * dev : devices) {
-                    size_t free, total;
-                    ggml_backend_dev_memory(dev, &free, &total);
-                    printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / 1024 / 1024, free / 1024 / 1024);
-                }
+                common_print_available_devices();
                 exit(0);
             } else if (arg == "-t" || arg == "--threads") {
                 if (++i >= argc) {
@@ -755,6 +940,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_threads.insert(params.n_threads.end(), p.begin(), p.end());
+                params.n_threads_explicit = true;
             } else if (arg == "-C" || arg == "--cpu-mask") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -790,6 +976,30 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_cpu_moe.insert(params.n_cpu_moe.end(), p.begin(), p.end());
+            } else if (arg == "--moe-cache") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & value : p) {
+                    params.moe_cache.push_back(parse_moe_cache_mode(value));
+                }
+                params.moe_cache_explicit = true;
+            } else if (arg == "--repack") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.repack = parse_repack_mode(argv[i]);
+                params.repack_explicit = true;
+            } else if (arg == "-nr" || arg == "--no-repack") {
+                params.repack = "off";
+                params.repack_explicit = true;
+            } else if (arg == "--moe-cache-profile") {
+                params.moe_cache_profile = true;
+            } else if (arg == "--no-moe-cache-profile") {
+                params.moe_cache_profile = false;
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -830,6 +1040,85 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.split_mode.insert(params.split_mode.end(), modes.begin(), modes.end());
+            } else if (arg == "-lm" || arg == "--load-mode") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+
+                std::vector<llama_load_mode> modes;
+                for (const auto & m : p) {
+                    llama_load_mode mode;
+                    if (m == "auto") {
+                        mode = LLAMA_LOAD_MODE_AUTO;
+                    } else if (m == "none") {
+                        mode = LLAMA_LOAD_MODE_NONE;
+                    } else if (m == "mmap") {
+                        mode = LLAMA_LOAD_MODE_MMAP;
+                    } else if (m == "mlock") {
+                        mode = LLAMA_LOAD_MODE_MLOCK;
+                    } else if (m == "mmap+mlock") {
+                        mode = LLAMA_LOAD_MODE_MMAP_MLOCK;
+                    } else if (m == "dio") {
+                        mode = LLAMA_LOAD_MODE_DIRECT_IO;
+                    } else {
+                        invalid_param = true;
+                        break;
+                    }
+                    modes.push_back(mode);
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.load_mode.insert(params.load_mode.end(), modes.begin(), modes.end());
+            } else if (arg == "-lzm" || arg == "--lazy-mode") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+
+                std::vector<llama_lazy_mode> modes;
+                for (const auto & m : p) {
+                    llama_lazy_mode mode;
+                    if (m == "on") {
+                        mode = LLAMA_LAZY_MODE_ON;
+                    } else if (m == "auto") {
+                        mode = LLAMA_LAZY_MODE_AUTO;
+                    } else if (m == "off") {
+                        mode = LLAMA_LAZY_MODE_OFF;
+                    } else {
+                        invalid_param = true;
+                        break;
+                    }
+                    modes.push_back(mode);
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.lazy_mode.insert(params.lazy_mode.end(), modes.begin(), modes.end());
+            } else if (arg == "--mmap-prefetch") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                std::vector<llama_mmap_prefetch_mode> modes;
+                for (const auto & m : p) {
+                    if (m == "on") {
+                        modes.push_back(LLAMA_MMAP_PREFETCH_MODE_ON);
+                    } else if (m == "auto") {
+                        modes.push_back(LLAMA_MMAP_PREFETCH_MODE_AUTO);
+                    } else if (m == "off") {
+                        modes.push_back(LLAMA_MMAP_PREFETCH_MODE_OFF);
+                    } else {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                params.mmap_prefetch.insert(
+                        params.mmap_prefetch.end(), modes.begin(), modes.end());
             } else if (arg == "-mg" || arg == "--main-gpu") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -890,15 +1179,39 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
+                LOG_WRN("DEPRECATED: -mmp and --mmap are deprecated in favour of --load-mode. Please use --load-mode mmap instead.\n");
                 auto p = string_split<bool>(argv[i], split_delim);
-                params.use_mmap.insert(params.use_mmap.end(), p.begin(), p.end());
+
+                std::vector<llama_load_mode> modes;
+                for (const auto & m : p) {
+                    llama_load_mode mode;
+                    if (m) {
+                        mode = LLAMA_LOAD_MODE_MMAP;
+                    } else {
+                        mode = LLAMA_LOAD_MODE_NONE;
+                    }
+                    modes.push_back(mode);
+                }
+                params.load_mode.insert(params.load_mode.end(), modes.begin(), modes.end());
             } else if (arg == "-dio" || arg == "--direct-io") {
                 if (++i >= argc) {
                     invalid_param = true;
                     break;
                 }
+                LOG_WRN("DEPRECATED: -dio and --direct-io are deprecated in favour of --load-mode. Please use --load-mode dio instead.\n");
                 auto p = string_split<bool>(argv[i], split_delim);
-                params.use_direct_io.insert(params.use_direct_io.end(), p.begin(), p.end());
+
+                std::vector<llama_load_mode> modes;
+                for (const auto & m : p) {
+                    llama_load_mode mode;
+                    if (m) {
+                        mode = LLAMA_LOAD_MODE_DIRECT_IO;
+                    } else {
+                        mode = LLAMA_LOAD_MODE_NONE;
+                    }
+                    modes.push_back(mode);
+                }
+                params.load_mode.insert(params.load_mode.end(), modes.begin(), modes.end());
             } else if (arg == "-embd" || arg == "--embeddings") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1151,8 +1464,25 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_cpu_moe.empty()) {
         params.n_cpu_moe = cmd_params_defaults.n_cpu_moe;
     }
+    if (params.moe_cache.empty()) {
+        try {
+            params.moe_cache = { get_moe_cache_mode_from_env() };
+        } catch (const std::invalid_argument & e) {
+            fprintf(stderr, "error: invalid LLAMA_ARG_MOE_CACHE: %s\n", e.what());
+            exit(1);
+        }
+    }
     if (params.split_mode.empty()) {
         params.split_mode = cmd_params_defaults.split_mode;
+    }
+    if (params.load_mode.empty()) {
+        params.load_mode = cmd_params_defaults.load_mode;
+    }
+    if (params.lazy_mode.empty()) {
+        params.lazy_mode = cmd_params_defaults.lazy_mode;
+    }
+    if (params.mmap_prefetch.empty()) {
+        params.mmap_prefetch = cmd_params_defaults.mmap_prefetch;
     }
     if (params.main_gpu.empty()) {
         params.main_gpu = cmd_params_defaults.main_gpu;
@@ -1171,12 +1501,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     }
     if (params.tensor_buft_overrides.empty()) {
         params.tensor_buft_overrides = cmd_params_defaults.tensor_buft_overrides;
-    }
-    if (params.use_mmap.empty()) {
-        params.use_mmap = cmd_params_defaults.use_mmap;
-    }
-    if (params.use_direct_io.empty()) {
-        params.use_direct_io = cmd_params_defaults.use_direct_io;
     }
     if (params.embeddings.empty()) {
         params.embeddings = cmd_params_defaults.embeddings;
@@ -1205,6 +1529,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.fit_params_min_ctx.empty()) {
         params.fit_params_min_ctx = cmd_params_defaults.fit_params_min_ctx;
     }
+    if (params.no_warmup) {
+        params.n_gen_warmup = 0;
+    }
+    for (const auto & cache_mode : params.moe_cache) {
+        try {
+            (void) get_effective_repack(cache_mode, params.repack);
+        } catch (const std::invalid_argument & e) {
+            fprintf(stderr, "error: %s\n", e.what());
+            exit(1);
+        }
+    }
 
     return params;
 }
@@ -1213,6 +1548,7 @@ struct cmd_params_instance {
     std::string        model;
     int                n_prompt;
     int                n_gen;
+    int                n_gen_warmup;
     int                n_depth;
     int                n_batch;
     int                n_ubatch;
@@ -1224,21 +1560,28 @@ struct cmd_params_instance {
     int                poll;
     int                n_gpu_layers;
     int                n_cpu_moe;
+    std::string        moe_cache;
+    bool               repack;
     llama_split_mode   split_mode;
+    llama_load_mode    load_mode;
+    llama_lazy_mode    lazy_mode;
+    llama_mmap_prefetch_mode mmap_prefetch;
     int                main_gpu;
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
-    bool               use_mmap;
-    bool               use_direct_io;
     bool               embeddings;
     bool               no_op_offload;
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
     bool               vbr;
+    bool               vbr_k;
+    bool               vbr_v;
+    llama_vbr_codec    vbr_codec;
+    std::string        vbr_entry;
     double             vbr_min_bits;
     bool               vbr_min_bits_explicit;
     uint64_t           vbr_budget_bytes;
@@ -1252,10 +1595,12 @@ struct cmd_params_instance {
             mparams.devices = const_cast<ggml_backend_dev_t *>(devices.data());
         }
         mparams.split_mode    = split_mode;
+        mparams.load_mode     = load_mode;
+        mparams.lazy_mode     = lazy_mode;
+        mparams.mmap_prefetch = mmap_prefetch;
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
-        mparams.use_mmap      = use_mmap;
-        mparams.use_direct_io = use_direct_io;
+        mparams.use_extra_bufts = repack;
         mparams.no_host       = no_host;
 
         if (n_cpu_moe <= 0) {
@@ -1284,7 +1629,7 @@ struct cmd_params_instance {
             merged.reserve(merged.size() + (size_t) n_cpu_moe + 1);
 
             for (int i = 0; i < n_cpu_moe; ++i) {
-                patterns.push_back(llm_ffn_exps_block_regex(i));
+                patterns.push_back(llm_ffn_block_regex(i, LLM_FFN_EXPS_REGEX));
                 merged.push_back({ patterns.back().c_str(),
                                 ggml_backend_cpu_buffer_type() });
             }
@@ -1299,40 +1644,40 @@ struct cmd_params_instance {
 
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
+               repack == other.repack &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
-               use_mmap == other.use_mmap && use_direct_io == other.use_direct_io &&
-               devices == other.devices &&
-               no_host == other.no_host &&
+               load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
+               mmap_prefetch == other.mmap_prefetch &&
+               devices == other.devices && no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
 
     llama_context_params to_llama_cparams() const {
         llama_context_params cparams = llama_context_default_params();
 
-        cparams.n_ctx           = n_prompt + n_gen + n_depth;
+        cparams.n_ctx           = n_prompt + std::max(n_gen + n_depth, n_gen_warmup);
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
-        cparams.type_k          = type_k;
-        cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn;
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
 
-        if (vbr) {
-            // dynamic VBR: F16 entry tier (full quality until budget pressure), controller armed
-            // via cparams; the baked degrade order transcodes fp16->t8->... down to the floor. This
-            // mirrors the main CLI's -ctk vbr / --vbr-floor path (common_params_postprocess_vbr).
-            cparams.type_k                = GGML_TYPE_F16;
-            cparams.type_v                = GGML_TYPE_F16;
-            cparams.vbr_dynamic           = true;
-            cparams.vbr_min_bits          = vbr_min_bits;
-            cparams.vbr_min_bits_explicit = vbr_min_bits_explicit;
-            cparams.vbr_vram_budget_bytes = vbr_budget_bytes;
-            cparams.vbr_budget_explicit   = vbr_budget_explicit;
-        }
+        llama_bench_vbr_row row;
+        row.active = vbr;
+        row.k = vbr_k;
+        row.v = vbr_v;
+        row.type_k = type_k;
+        row.type_v = type_v;
+        row.codec = vbr_codec;
+        row.entry = vbr_entry;
+        row.floor_bits = vbr_min_bits;
+        row.floor_explicit = vbr_min_bits_explicit;
+        row.budget_bytes = vbr_budget_bytes;
+        row.budget_explicit = vbr_budget_explicit;
+        llama_bench_vbr_apply_row(row, cparams);
 
         return cparams;
     }
@@ -1340,14 +1685,10 @@ struct cmd_params_instance {
 
 static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_params & params) {
     std::vector<cmd_params_instance> instances;
-
-    // dynamic VBR (see -ctk vbr / --vbr-floor): resolve the floor bits and budget once for all
-    // instances. budget 0 = floor-layout-cost fallback, self-armed by the controller (no fit pass).
-    const double   vbr_min_bits       = params.vbr ? common_vbr_floor_bits(params.vbr_floor) : 0.0;
-    // canonical parser (shared with the CLI): "auto" -> 0, size specs -> bytes; explicit == a real cap.
-    const uint64_t vbr_budget_bytes    = params.vbr ? common_vbr_vram_bytes(params.vbr_vram) : 0;
-    const bool     vbr_budget_explicit = vbr_budget_bytes != 0;
-    const bool     vbr_min_bits_explicit = params.vbr && params.vbr_floor != "auto";
+    const llama_bench_vbr_plan vbr_plan = llama_bench_vbr_make_plan(
+        params.type_k, params.type_v, params.vbr_entry, params.vbr_floor, params.vbr_vram,
+        params.vbr_entry_explicit, params.vbr_floor_explicit, params.vbr_vram_explicit,
+        params.vbr_codec, params.vbr_codec_explicit);
 
     // this ordering minimizes the number of times that each model needs to be reloaded
     // clang-format off
@@ -1356,13 +1697,15 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & fpc : params.fit_params_min_ctx)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & ncmoe : params.n_cpu_moe)
+    for (const auto & mc : params.moe_cache)
     for (const auto & sm : params.split_mode)
+    for (const auto & lm : params.load_mode)
+    for (const auto & lzm : params.lazy_mode)
+    for (const auto & pfm : params.mmap_prefetch)
     for (const auto & mg : params.main_gpu)
     for (const auto & devs : params.devices)
     for (const auto & ts : params.tensor_split)
     for (const auto & ot : params.tensor_buft_overrides)
-    for (const auto & mmp : params.use_mmap)
-    for (const auto & dio : params.use_direct_io)
     for (const auto & noh : params.no_host)
     for (const auto & embd : params.embeddings)
     for (const auto & nopo : params.no_op_offload)
@@ -1377,44 +1720,53 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & cs : params.cpu_strict)
     for (const auto & nd : params.n_depth)
     for (const auto & pl : params.poll) {
+        const llama_bench_vbr_row vbr = llama_bench_vbr_resolve_row(vbr_plan, tk, tv);
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
                 continue;
             }
             cmd_params_instance instance = {
-                /* .model        = */ m,
-                /* .n_prompt     = */ n_prompt,
-                /* .n_gen        = */ 0,
-                /* .n_depth      = */ nd,
-                /* .n_batch      = */ nb,
-                /* .n_ubatch     = */ nub,
-                /* .type_k       = */ tk,
-                /* .type_v       = */ tv,
-                /* .n_threads    = */ nt,
-                /* .cpu_mask     = */ cm,
-                /* .cpu_strict   = */ cs,
-                /* .poll         = */ pl,
-                /* .n_gpu_layers = */ nl,
-                /* .n_cpu_moe    = */ ncmoe,
-                /* .split_mode   = */ sm,
-                /* .main_gpu     = */ mg,
-                /* .no_kv_offload= */ nkvo,
-                /* .flash_attn   = */ fa,
-                /* .devices      = */ devs,
-                /* .tensor_split = */ ts,
+                /* .model                 = */ m,
+                /* .n_prompt              = */ n_prompt,
+                /* .n_gen                 = */ 0,
+                /* .n_gen_warmup          = */ 0,
+                /* .n_depth               = */ nd,
+                /* .n_batch               = */ nb,
+                /* .n_ubatch              = */ nub,
+                /* .type_k                = */ vbr.type_k,
+                /* .type_v                = */ vbr.type_v,
+                /* .n_threads             = */ nt,
+                /* .cpu_mask              = */ cm,
+                /* .cpu_strict            = */ cs,
+                /* .poll                  = */ pl,
+                /* .n_gpu_layers          = */ nl,
+                /* .n_cpu_moe             = */ ncmoe,
+                /* .moe_cache             = */ mc,
+                /* .repack                = */ get_effective_repack(mc, params.repack),
+                /* .split_mode            = */ sm,
+                /* .load_mode             = */ lm,
+                /* .lazy_mode             = */ lzm,
+                /* .mmap_prefetch         = */ pfm,
+                /* .main_gpu              = */ mg,
+                /* .no_kv_offload         = */ nkvo,
+                /* .flash_attn            = */ fa,
+                /* .devices               = */ devs,
+                /* .tensor_split          = */ ts,
                 /* .tensor_buft_overrides = */ ot,
-                /* .use_mmap     = */ mmp,
-                /* .use_direct_io= */ dio,
-                /* .embeddings   = */ embd,
-                /* .no_op_offload= */ nopo,
-                /* .no_host      = */ noh,
-                /* .fit_target   = */ fpt,
-                /* .fit_min_ctx  = */ fpc,
-                /* .vbr          = */ params.vbr,
-                /* .vbr_min_bits = */ vbr_min_bits,
-                /* .vbr_min_bits_explicit = */ vbr_min_bits_explicit,
-                /* .vbr_budget_bytes    = */ vbr_budget_bytes,
-                /* .vbr_budget_explicit = */ vbr_budget_explicit,
+                /* .embeddings            = */ embd,
+                /* .no_op_offload         = */ nopo,
+                /* .no_host               = */ noh,
+                /* .fit_target            = */ fpt,
+                /* .fit_min_ctx           = */ fpc,
+                /* .vbr                   = */ vbr.active,
+                /* .vbr_k                 = */ vbr.k,
+                /* .vbr_v                 = */ vbr.v,
+                /* .vbr_codec             = */ vbr.codec,
+                /* .vbr_entry             = */ vbr.entry,
+                /* .vbr_min_bits          = */ vbr.floor_bits,
+                /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
+                /* .vbr_budget_bytes      = */ vbr.budget_bytes,
+                /* .vbr_budget_explicit   = */ vbr.budget_explicit,
             };
             instances.push_back(instance);
         }
@@ -1424,39 +1776,47 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 continue;
             }
             cmd_params_instance instance = {
-                /* .model        = */ m,
-                /* .n_prompt     = */ 0,
-                /* .n_gen        = */ n_gen,
-                /* .n_depth      = */ nd,
-                /* .n_batch      = */ nb,
-                /* .n_ubatch     = */ nub,
-                /* .type_k       = */ tk,
-                /* .type_v       = */ tv,
-                /* .n_threads    = */ nt,
-                /* .cpu_mask     = */ cm,
-                /* .cpu_strict   = */ cs,
-                /* .poll         = */ pl,
-                /* .n_gpu_layers = */ nl,
-                /* .n_cpu_moe    = */ ncmoe,
-                /* .split_mode   = */ sm,
-                /* .main_gpu     = */ mg,
-                /* .no_kv_offload= */ nkvo,
-                /* .flash_attn   = */ fa,
-                /* .devices      = */ devs,
-                /* .tensor_split = */ ts,
+                /* .model                 = */ m,
+                /* .n_prompt              = */ 0,
+                /* .n_gen                 = */ n_gen,
+                /* .n_gen_warmup          = */ params.n_gen_warmup,
+                /* .n_depth               = */ nd,
+                /* .n_batch               = */ nb,
+                /* .n_ubatch              = */ nub,
+                /* .type_k                = */ vbr.type_k,
+                /* .type_v                = */ vbr.type_v,
+                /* .n_threads             = */ nt,
+                /* .cpu_mask              = */ cm,
+                /* .cpu_strict            = */ cs,
+                /* .poll                  = */ pl,
+                /* .n_gpu_layers          = */ nl,
+                /* .n_cpu_moe             = */ ncmoe,
+                /* .moe_cache             = */ mc,
+                /* .repack                = */ get_effective_repack(mc, params.repack),
+                /* .split_mode            = */ sm,
+                /* .load_mode             = */ lm,
+                /* .lazy_mode             = */ lzm,
+                /* .mmap_prefetch         = */ pfm,
+                /* .main_gpu              = */ mg,
+                /* .no_kv_offload         = */ nkvo,
+                /* .flash_attn            = */ fa,
+                /* .devices               = */ devs,
+                /* .tensor_split          = */ ts,
                 /* .tensor_buft_overrides = */ ot,
-                /* .use_mmap     = */ mmp,
-                /* .use_direct_io= */ dio,
-                /* .embeddings   = */ embd,
-                /* .no_op_offload= */ nopo,
-                /* .no_host      = */ noh,
-                /* .fit_target   = */ fpt,
-                /* .fit_min_ctx  = */ fpc,
-                /* .vbr          = */ params.vbr,
-                /* .vbr_min_bits = */ vbr_min_bits,
-                /* .vbr_min_bits_explicit = */ vbr_min_bits_explicit,
-                /* .vbr_budget_bytes    = */ vbr_budget_bytes,
-                /* .vbr_budget_explicit = */ vbr_budget_explicit,
+                /* .embeddings            = */ embd,
+                /* .no_op_offload         = */ nopo,
+                /* .no_host               = */ noh,
+                /* .fit_target            = */ fpt,
+                /* .fit_min_ctx           = */ fpc,
+                /* .vbr                   = */ vbr.active,
+                /* .vbr_k                 = */ vbr.k,
+                /* .vbr_v                 = */ vbr.v,
+                /* .vbr_codec             = */ vbr.codec,
+                /* .vbr_entry             = */ vbr.entry,
+                /* .vbr_min_bits          = */ vbr.floor_bits,
+                /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
+                /* .vbr_budget_bytes      = */ vbr.budget_bytes,
+                /* .vbr_budget_explicit   = */ vbr.budget_explicit,
             };
             instances.push_back(instance);
         }
@@ -1466,39 +1826,47 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 continue;
             }
             cmd_params_instance instance = {
-                /* .model        = */ m,
-                /* .n_prompt     = */ n_pg.first,
-                /* .n_gen        = */ n_pg.second,
-                /* .n_depth      = */ nd,
-                /* .n_batch      = */ nb,
-                /* .n_ubatch     = */ nub,
-                /* .type_k       = */ tk,
-                /* .type_v       = */ tv,
-                /* .n_threads    = */ nt,
-                /* .cpu_mask     = */ cm,
-                /* .cpu_strict   = */ cs,
-                /* .poll         = */ pl,
-                /* .n_gpu_layers = */ nl,
-                /* .n_cpu_moe    = */ ncmoe,
-                /* .split_mode   = */ sm,
-                /* .main_gpu     = */ mg,
-                /* .no_kv_offload= */ nkvo,
-                /* .flash_attn   = */ fa,
-                /* .devices      = */ devs,
-                /* .tensor_split = */ ts,
+                /* .model                 = */ m,
+                /* .n_prompt              = */ n_pg.first,
+                /* .n_gen                 = */ n_pg.second,
+                /* .n_gen_warmup          = */ n_pg.second > 0 ? params.n_gen_warmup : 0,
+                /* .n_depth               = */ nd,
+                /* .n_batch               = */ nb,
+                /* .n_ubatch              = */ nub,
+                /* .type_k                = */ vbr.type_k,
+                /* .type_v                = */ vbr.type_v,
+                /* .n_threads             = */ nt,
+                /* .cpu_mask              = */ cm,
+                /* .cpu_strict            = */ cs,
+                /* .poll                  = */ pl,
+                /* .n_gpu_layers          = */ nl,
+                /* .n_cpu_moe             = */ ncmoe,
+                /* .moe_cache             = */ mc,
+                /* .repack                = */ get_effective_repack(mc, params.repack),
+                /* .split_mode            = */ sm,
+                /* .load_mode             = */ lm,
+                /* .lazy_mode             = */ lzm,
+                /* .mmap_prefetch         = */ pfm,
+                /* .main_gpu              = */ mg,
+                /* .no_kv_offload         = */ nkvo,
+                /* .flash_attn            = */ fa,
+                /* .devices               = */ devs,
+                /* .tensor_split          = */ ts,
                 /* .tensor_buft_overrides = */ ot,
-                /* .use_mmap     = */ mmp,
-                /* .use_direct_io= */ dio,
-                /* .embeddings   = */ embd,
-                /* .no_op_offload= */ nopo,
-                /* .no_host      = */ noh,
-                /* .fit_target   = */ fpt,
-                /* .fit_min_ctx  = */ fpc,
-                /* .vbr          = */ params.vbr,
-                /* .vbr_min_bits = */ vbr_min_bits,
-                /* .vbr_min_bits_explicit = */ vbr_min_bits_explicit,
-                /* .vbr_budget_bytes    = */ vbr_budget_bytes,
-                /* .vbr_budget_explicit = */ vbr_budget_explicit,
+                /* .embeddings            = */ embd,
+                /* .no_op_offload         = */ nopo,
+                /* .no_host               = */ noh,
+                /* .fit_target            = */ fpt,
+                /* .fit_min_ctx           = */ fpc,
+                /* .vbr                   = */ vbr.active,
+                /* .vbr_k                 = */ vbr.k,
+                /* .vbr_v                 = */ vbr.v,
+                /* .vbr_codec             = */ vbr.codec,
+                /* .vbr_entry             = */ vbr.entry,
+                /* .vbr_min_bits          = */ vbr.floor_bits,
+                /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
+                /* .vbr_budget_bytes      = */ vbr.budget_bytes,
+                /* .vbr_budget_explicit   = */ vbr.budget_explicit,
             };
             instances.push_back(instance);
         }
@@ -1526,17 +1894,30 @@ struct test {
     ggml_type                type_k;
     ggml_type                type_v;
     bool                     vbr;
+    bool                     vbr_k;
+    bool                     vbr_v;
+    std::string              vbr_codec;
+    std::string              vbr_entry;
+    double                   vbr_floor;
+    bool                     vbr_floor_explicit;
+    uint64_t                 vbr_vram_bytes;
+    bool                     vbr_vram_explicit;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
+    std::string              moe_cache;
+    bool                     moe_cache_fit;
+    bool                     repack;
     llama_split_mode         split_mode;
+    llama_load_mode          load_mode;
+    llama_lazy_mode          lazy_mode;
+    llama_mmap_prefetch_mode mmap_prefetch;
+    bool                     moe_cache_profile;
     int                      main_gpu;
     bool                     no_kv_offload;
     llama_flash_attn_type    flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
-    bool                     use_mmap;
-    bool                     use_direct_io;
     bool                     embeddings;
     bool                     no_op_offload;
     bool                     no_host;
@@ -1544,11 +1925,14 @@ struct test {
     uint32_t                 fit_min_ctx;
     int                      n_prompt;
     int                      n_gen;
+    int                      n_gen_warmup;
     int                      n_depth;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
 
-    test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
+    test(const cmd_params_instance & inst, const llama_model_params & mparams,
+            bool cache_fit_selected, bool profile_enabled,
+            const llama_model * lmodel, const llama_context * ctx) :
         cpu_info(get_cpu_info()),
         gpu_info(get_gpu_info()) {
 
@@ -1567,17 +1951,43 @@ struct test {
         type_k         = inst.type_k;
         type_v         = inst.type_v;
         vbr            = inst.vbr;
-        n_gpu_layers   = inst.n_gpu_layers;
+        vbr_k          = inst.vbr_k;
+        vbr_v          = inst.vbr_v;
+        vbr_codec      = inst.vbr_codec == LLAMA_VBR_CODEC_CLASSIC ? "classic" : "turbo";
+        vbr_entry      = inst.vbr_entry;
+        vbr_floor      = inst.vbr_min_bits;
+        vbr_floor_explicit = inst.vbr_min_bits_explicit;
+        vbr_vram_bytes = inst.vbr_budget_bytes;
+        vbr_vram_explicit = inst.vbr_budget_explicit;
+        n_gpu_layers   = mparams.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
-        split_mode     = inst.split_mode;
-        main_gpu       = inst.main_gpu;
+        moe_cache      = inst.moe_cache;
+        moe_cache_fit  = cache_fit_selected;
+        repack         = mparams.use_extra_bufts;
+        split_mode     = mparams.split_mode;
+        load_mode      = mparams.load_mode;
+        lazy_mode      = mparams.lazy_mode;
+        mmap_prefetch  = mparams.mmap_prefetch;
+        moe_cache_profile = profile_enabled;
+        main_gpu       = mparams.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
         devices        = inst.devices;
-        tensor_split   = inst.tensor_split;
-        tensor_buft_overrides = inst.tensor_buft_overrides;
-        use_mmap       = inst.use_mmap;
-        use_direct_io  = inst.use_direct_io;
+        if (mparams.tensor_split) {
+            tensor_split.assign(mparams.tensor_split, mparams.tensor_split + llama_max_devices());
+        } else {
+            tensor_split.assign(llama_max_devices(), 0.0f);
+        }
+        if (mparams.tensor_buft_overrides) {
+            for (size_t i = 0; i < llama_max_tensor_buft_overrides(); ++i) {
+                tensor_buft_overrides.push_back(mparams.tensor_buft_overrides[i]);
+                if (!mparams.tensor_buft_overrides[i].pattern) {
+                    break;
+                }
+            }
+        } else {
+            tensor_buft_overrides.push_back({nullptr, nullptr});
+        }
         embeddings     = inst.embeddings;
         no_op_offload  = inst.no_op_offload;
         no_host        = inst.no_host;
@@ -1585,6 +1995,7 @@ struct test {
         fit_min_ctx    = inst.fit_min_ctx;
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
+        n_gen_warmup   = inst.n_gen_warmup;
         n_depth        = inst.n_depth;
         // RFC 3339 date-time format
         time_t t       = time(NULL);
@@ -1637,11 +2048,16 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
+            "type_k",         "type_v",         "vbr_codec",     "vbr_entry",      "vbr_floor",
+            "vbr_floor_explicit",
+            "vbr_vram_bytes", "vbr_vram_explicit", "n_gpu_layers", "n_cpu_moe",    "moe_cache",
+            "moe_cache_fit",  "repack",         "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
-            "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
-            "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
-            "n_prompt",       "n_gen",          "n_depth",
+            "tensor_buft_overrides",            "load_mode",     "lazy_mode",
+            "mmap_prefetch",  "moe_cache_profile",
+            "embeddings",
+            "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
+            "n_prompt",       "n_gen",          "n_gen_warmup",  "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
         return fields;
@@ -1652,17 +2068,23 @@ struct test {
     static field_type get_field_type(const std::string & field) {
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
-            field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
+            field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_gen_warmup" ||
+            field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
+            field == "vbr_vram_bytes") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
-            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
+            field == "embeddings" || field == "no_host" || field == "moe_cache_fit" || field == "repack" ||
+            field == "moe_cache_profile" || field == "vbr_floor_explicit" || field == "vbr_vram_explicit") {
             return BOOL;
         }
-        if (field == "avg_ts" || field == "stddev_ts") {
+        if (field == "avg_ts" || field == "stddev_ts" || field == "vbr_floor") {
             return FLOAT;
+        }
+        if (field == "load_mode" || field == "lazy_mode" || field == "mmap_prefetch") {
+            return STRING;
         }
         return STRING;
     }
@@ -1719,10 +2141,19 @@ struct test {
                                             cpu_mask,
                                             std::to_string(cpu_strict),
                                             std::to_string(poll),
-                                            vbr ? "vbr" : ggml_type_name(type_k),
-                                            vbr ? "vbr" : ggml_type_name(type_v),
+                                            vbr_k ? "vbr" : ggml_type_name(type_k),
+                                            vbr_v ? "vbr" : ggml_type_name(type_v),
+                                            vbr_codec,
+                                            vbr_entry,
+                                            std::to_string(vbr_floor),
+                                            std::to_string(vbr_floor_explicit),
+                                            std::to_string(vbr_vram_bytes),
+                                            std::to_string(vbr_vram_explicit),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
+                                            moe_cache,
+                                            std::to_string(moe_cache_fit),
+                                            std::to_string(repack),
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
@@ -1730,8 +2161,10 @@ struct test {
                                             devices_to_string(devices),
                                             tensor_split_str,
                                             tensor_buft_overrides_str,
-                                            std::to_string(use_mmap),
-                                            std::to_string(use_direct_io),
+                                            llama_load_mode_name(load_mode),
+                                            lazy_mode_str(lazy_mode),
+                                            mmap_prefetch_mode_str(mmap_prefetch),
+                                            std::to_string(moe_cache_profile),
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
@@ -1739,6 +2172,7 @@ struct test {
                                             std::to_string(fit_min_ctx),
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
+                                            std::to_string(n_gen_warmup),
                                             std::to_string(n_depth),
                                             test_time,
                                             std::to_string(avg_ns()),
@@ -1752,6 +2186,7 @@ struct test {
         std::map<std::string, std::string> map;
         auto                               fields = get_fields();
         auto                               values = get_values();
+        GGML_ASSERT(fields.size() == values.size());
         std::transform(fields.begin(), fields.end(), values.begin(), std::inserter(map, map.end()),
                        std::make_pair<const std::string &, const std::string &>);
         return map;
@@ -1895,6 +2330,18 @@ struct markdown_printer : public printer {
         if (field == "n_gpu_layers") {
             return 3;
         }
+        if (field == "moe_cache") {
+            return -9;
+        }
+        if (field == "moe_cache_fit") {
+            return 5;
+        }
+        if (field == "repack") {
+            return -6;
+        }
+        if (field == "n_gen_warmup") {
+            return 9;
+        }
         if (field == "n_threads") {
             return 7;
         }
@@ -1910,17 +2357,14 @@ struct markdown_printer : public printer {
         if (field == "split_mode") {
             return 6;
         }
+        if (field == "load_mode") {
+            return 10;
+        }
         if (field == "flash_attn") {
             return 3;
         }
         if (field == "devices") {
             return -12;
-        }
-        if (field == "use_mmap") {
-            return 4;
-        }
-        if (field == "use_direct_io") {
-            return 3;
         }
         if (field == "test") {
             return 15;
@@ -1947,6 +2391,15 @@ struct markdown_printer : public printer {
         if (field == "split_mode") {
             return "sm";
         }
+        if (field == "moe_cache") {
+            return "moe-cache";
+        }
+        if (field == "moe_cache_fit") {
+            return "fit";
+        }
+        if (field == "n_gen_warmup") {
+            return "warmup";
+        }
         if (field == "n_threads") {
             return "threads";
         }
@@ -1956,11 +2409,8 @@ struct markdown_printer : public printer {
         if (field == "flash_attn") {
             return "fa";
         }
-        if (field == "use_mmap") {
-            return "mmap";
-        }
-        if (field == "use_direct_io") {
-            return "dio";
+        if (field == "load_mode") {
+            return "lm";
         }
         if (field == "embeddings") {
             return "embd";
@@ -2004,6 +2454,27 @@ struct markdown_printer : public printer {
         if (params.n_cpu_moe.size() > 1 || params.n_cpu_moe != cmd_params_defaults.n_cpu_moe) {
             fields.emplace_back("n_cpu_moe");
         }
+        if (params.moe_cache_explicit || params.moe_cache.size() > 1 ||
+            params.moe_cache != cmd_params_defaults.moe_cache) {
+            fields.emplace_back("moe_cache");
+        }
+        const bool fitting =
+            params.fit_params_target.size() > 1 ||
+            params.fit_params_target != cmd_params_defaults.fit_params_target ||
+            params.fit_params_min_ctx.size() > 1 ||
+            params.fit_params_min_ctx != cmd_params_defaults.fit_params_min_ctx;
+        if (fitting && std::any_of(
+                params.moe_cache.begin(), params.moe_cache.end(),
+                [](const std::string & mode) { return mode != "off"; })) {
+            fields.emplace_back("moe_cache_fit");
+        }
+        const bool cache_forces_canonical_weights =
+            std::any_of(params.moe_cache.begin(), params.moe_cache.end(),
+                moe_cache_mode_forces_canonical_weights);
+        if (params.repack_explicit || params.repack != cmd_params_defaults.repack ||
+            cache_forces_canonical_weights) {
+            fields.emplace_back("repack");
+        }
         if (params.n_threads.size() > 1 || params.n_threads != cmd_params_defaults.n_threads || is_cpu_backend) {
             fields.emplace_back("n_threads");
         }
@@ -2028,6 +2499,14 @@ struct markdown_printer : public printer {
         if (params.type_v.size() > 1 || params.type_v != cmd_params_defaults.type_v) {
             fields.emplace_back("type_v");
         }
+        if (params.vbr) {
+            fields.emplace_back("vbr_codec");
+            fields.emplace_back("vbr_entry");
+            fields.emplace_back("vbr_floor");
+            fields.emplace_back("vbr_floor_explicit");
+            fields.emplace_back("vbr_vram_bytes");
+            fields.emplace_back("vbr_vram_explicit");
+        }
         if (params.main_gpu.size() > 1 || params.main_gpu != cmd_params_defaults.main_gpu) {
             fields.emplace_back("main_gpu");
         }
@@ -2049,11 +2528,17 @@ struct markdown_printer : public printer {
         if (params.tensor_buft_overrides.size() > 1 || !vec_vec_tensor_buft_override_equal(params.tensor_buft_overrides, cmd_params_defaults.tensor_buft_overrides)) {
             fields.emplace_back("tensor_buft_overrides");
         }
-        if (params.use_mmap.size() > 1 || params.use_mmap != cmd_params_defaults.use_mmap) {
-            fields.emplace_back("use_mmap");
+        if (params.load_mode.size() > 1 || params.load_mode != cmd_params_defaults.load_mode) {
+            fields.emplace_back("load_mode");
         }
-        if (params.use_direct_io.size() > 1 || params.use_direct_io != cmd_params_defaults.use_direct_io) {
-            fields.emplace_back("use_direct_io");
+        if (params.lazy_mode.size() > 1 || params.lazy_mode != cmd_params_defaults.lazy_mode) {
+            fields.emplace_back("lazy_mode");
+        }
+        if (params.mmap_prefetch.size() > 1 || params.mmap_prefetch != cmd_params_defaults.mmap_prefetch) {
+            fields.emplace_back("mmap_prefetch");
+        }
+        if (params.moe_cache_profile != cmd_params_defaults.moe_cache_profile) {
+            fields.emplace_back("moe_cache_profile");
         }
         if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
             fields.emplace_back("embeddings");
@@ -2069,6 +2554,10 @@ struct markdown_printer : public printer {
         }
         if (params.fit_params_min_ctx.size() > 1 || params.fit_params_min_ctx != cmd_params_defaults.fit_params_min_ctx) {
             fields.emplace_back("fit_min_ctx");
+        }
+        if (params.n_gen_warmup_explicit ||
+            params.n_gen_warmup != cmd_params_defaults.n_gen_warmup) {
+            fields.emplace_back("n_gen_warmup");
         }
         fields.emplace_back("test");
         fields.emplace_back("t/s");
@@ -2095,6 +2584,8 @@ struct markdown_printer : public printer {
             char        buf[128];
             if (field == "model") {
                 value = t.model_type;
+            } else if (field == "repack") {
+                value = t.repack ? "on" : "off";
             } else if (field == "size") {
                 if (t.model_size < 1024 * 1024 * 1024) {
                     snprintf(buf, sizeof(buf), "%.2f MiB", t.model_size / 1024.0 / 1024.0);
@@ -2190,11 +2681,23 @@ struct sql_printer : public printer {
 
 struct ctx_state {
     int depth = 0; // in tokens
+    const cmd_params_instance * instance = nullptr;
+    std::string moe_cache;
+    bool repack = false;
 
     std::vector<uint8_t> buf; // the llama_context state buffer
 };
 
-static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
+static llama_token bench_random_token(uint64_t & state, int32_t n_vocab) {
+    state += 0x9e3779b97f4a7c15ULL;
+    uint64_t value = state;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    value ^= value >> 31;
+    return (llama_token) (value % (uint32_t) n_vocab);
+}
+
+static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads, uint64_t seed) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
@@ -2207,9 +2710,9 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
 
     while (n_processed < n_prompt) {
         int n_tokens = std::min(n_prompt - n_processed, n_batch);
-        tokens[0]    = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+        tokens[0]    = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : bench_random_token(seed, n_vocab);
         for (int i = 1; i < n_tokens; i++) {
-            tokens[i] = std::rand() % n_vocab;
+            tokens[i] = bench_random_token(seed, n_vocab);
         }
         int res = llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens));
         if (res != 0) {
@@ -2223,14 +2726,14 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
     return true;
 }
 
-static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
+static bool test_gen(llama_context * ctx, int n_gen, int n_threads, uint64_t seed) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
 
-    llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+    llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : bench_random_token(seed, n_vocab);
 
     for (int i = 0; i < n_gen; i++) {
         int res = llama_decode(ctx, llama_batch_get_one(&token, 1));
@@ -2239,7 +2742,7 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
             return false;
         }
         llama_synchronize(ctx);
-        token = std::rand() % n_vocab;
+        token = bench_random_token(seed, n_vocab);
     }
     return true;
 }
@@ -2292,6 +2795,13 @@ int llama_bench(int argc, char ** argv) {
     ggml_backend_load_all();
 
     cmd_params params = parse_cmd_params(argc, argv);
+    std::vector<cmd_params_instance> params_instances;
+    try {
+        params_instances = get_cmd_params_instances(params);
+    } catch (const std::invalid_argument & e) {
+        fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
 
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
@@ -2328,12 +2838,10 @@ int llama_bench(int argc, char ** argv) {
         p_err->print_header(params);
     }
 
-    std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
-
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
 
-    // store the llama_context state at the previous depth that we performed a test
+    // store context state for repeated benchmarks with matching cache and repack settings
     // ref: https://github.com/ggml-org/llama.cpp/pull/16944#issuecomment-3478151721
     ctx_state cstate;
 
@@ -2346,9 +2854,11 @@ int llama_bench(int argc, char ** argv) {
         }
         auto mparams = inst.to_llama_mparams();
         auto cparams = inst.to_llama_cparams();
+        apply_moe_cache_mode(cparams, inst.moe_cache);
 
         bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||
                       inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0];
+        bool cache_fit_selected = false;
 
         std::vector<float> fit_tensor_split(llama_max_devices(), 0.0f);
         std::vector<llama_model_tensor_buft_override> fit_overrides(llama_max_tensor_buft_overrides(), {nullptr, nullptr});
@@ -2369,15 +2879,28 @@ int llama_bench(int argc, char ** argv) {
 
             std::vector<size_t> margins(llama_max_devices(), inst.fit_target * 1024 * 1024);
 
-            uint32_t n_ctx_needed = inst.n_prompt + inst.n_gen + inst.n_depth;
+            uint32_t n_ctx_needed = inst.n_prompt + std::max(inst.n_gen + inst.n_depth, inst.n_gen_warmup);
             cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
+            common_moe_cache_params fit_moe_cache = common_moe_cache_from_bench_mode(inst.moe_cache);
 
-            common_fit_params(inst.model.c_str(), &mparams, &cparams,
+            const common_params_fit_status fit_status = common_fit_params(
+                inst.model.c_str(), &mparams, &cparams,
                 fit_tensor_split.data(),
                 fit_overrides.data(),
+                &fit_moe_cache,
                 margins.data(),
                 inst.fit_min_ctx,
+                nullptr,
                 params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                // Never report PP/TG numbers for a failed fit. The logger is
+                // suppressed by default, so print an unconditional diagnostic.
+                fprintf(stderr,
+                    "%s: error: failed to fit parameters for benchmark %d/%zu (status=%d); skipping this case\n",
+                    __func__, params_idx, params_count, (int) fit_status);
+                continue;
+            }
+            cache_fit_selected = fit_moe_cache.fit_selected;
        }
 
         // keep the same model between tests when possible
@@ -2394,6 +2917,33 @@ int llama_bench(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
+        int resolved_threads = inst.n_threads;
+        if (!params.n_threads_explicit && inst.cpu_mask == "0x0" &&
+                llama_model_has_host_moe_weights(lmodel)) {
+            resolved_threads = common_cpu_get_num_moe_threads();
+            if (resolved_threads != inst.n_threads) {
+                fprintf(stderr, "llama-bench: host-resident routed experts; auto-resolved threads %d -> %d\n",
+                        inst.n_threads, resolved_threads);
+            }
+            cparams.n_threads = resolved_threads;
+            cparams.n_threads_batch = resolved_threads;
+        }
+        std::string moe_profile_path;
+        if (params.moe_cache_profile &&
+                inst.moe_cache != "off" && inst.moe_cache != "0") {
+            uint8_t digest[32];
+            if (llama_model_semantic_family_digest(lmodel, digest)) {
+                try {
+                    moe_profile_path = common_moe_cache_profile_file(digest);
+                    cparams.moe_cache_profile_path = moe_profile_path.c_str();
+                } catch (const std::exception & e) {
+                    fprintf(stderr, "llama-bench: MoE cache profile disabled: %s\n", e.what());
+                }
+            } else {
+                fprintf(stderr, "llama-bench: MoE cache profile disabled: model has no semantic identity\n");
+            }
+        }
+
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
@@ -2401,7 +2951,8 @@ int llama_bench(int argc, char ** argv) {
             return 1;
         }
 
-        test t(inst, lmodel, ctx);
+        test t(inst, mparams, cache_fit_selected, !moe_profile_path.empty(), lmodel, ctx);
+        t.n_threads = resolved_threads;
 
         llama_memory_clear(llama_get_memory(ctx), false);
 
@@ -2437,8 +2988,8 @@ int llama_bench(int argc, char ** argv) {
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup prompt run\n", params_idx, params_count);
                 }
-                //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads,
+                                       0x6a09e667f3bcc909ULL ^ (uint64_t) t.n_prompt);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
                     llama_free(ctx);
@@ -2446,11 +2997,13 @@ int llama_bench(int argc, char ** argv) {
                     exit(1);
                 }
             }
-            if (t.n_gen > 0) {
+            if (t.n_gen_warmup > 0) {
                 if (params.progress) {
-                    fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup generation run\n", params_idx, params_count);
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup generation run (%d tokens)\n",
+                            params_idx, params_count, t.n_gen_warmup);
                 }
-                bool res = test_gen(ctx, 1, t.n_threads);
+                bool res = test_gen(ctx, t.n_gen_warmup, t.n_threads,
+                                    0xbb67ae8584caa73bULL ^ (uint64_t) t.n_gen_warmup);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
                     llama_free(ctx);
@@ -2464,10 +3017,13 @@ int llama_bench(int argc, char ** argv) {
             llama_memory_clear(llama_get_memory(ctx), false);
 
             if (t.n_depth > 0) {
-                bool is_cached = t.n_depth == cstate.depth;
+                bool is_cached = cstate.instance == &inst &&
+                                 t.n_depth == cstate.depth &&
+                                 t.moe_cache == cstate.moe_cache &&
+                                 t.repack == cstate.repack;
 
                 if (is_cached) {
-                    // if previously we have computed at this depth, just restore the state
+                    // restore state from the same cache and repack configuration
                     const size_t ret = llama_state_seq_set_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
                     if (ret == 0) {
                         // if the old state is incompatible with the current context - reprocess from scratch
@@ -2480,7 +3036,8 @@ int llama_bench(int argc, char ** argv) {
                         fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
                                 i + 1, params.reps);
                     }
-                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
+                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads,
+                                           0x3c6ef372fe94f82bULL ^ (uint64_t) t.n_depth);
                     if (!res) {
                         fprintf(stderr, "%s: error: failed to run depth\n", __func__);
                         llama_free(ctx);
@@ -2488,8 +3045,11 @@ int llama_bench(int argc, char ** argv) {
                         exit(1);
                     }
 
-                    // store the context state for reuse in later runs
-                    cstate.depth = t.n_depth;
+                    // store the context state for reuse by matching later runs
+                    cstate.instance  = &inst;
+                    cstate.depth     = t.n_depth;
+                    cstate.moe_cache = t.moe_cache;
+                    cstate.repack    = t.repack;
                     cstate.buf.resize(llama_state_seq_get_size(ctx, 0));
                     llama_state_seq_get_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
                 } else {
@@ -2507,7 +3067,8 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads,
+                                       0xa54ff53a5f1d36f1ULL ^ (uint64_t) i);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                     llama_free(ctx);
@@ -2520,7 +3081,8 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_gen(ctx, t.n_gen, t.n_threads);
+                bool res = test_gen(ctx, t.n_gen, t.n_threads,
+                                    0x510e527fade682d1ULL ^ (uint64_t) i);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen\n", __func__);
                     llama_free(ctx);

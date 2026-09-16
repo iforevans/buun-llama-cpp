@@ -539,11 +539,9 @@ static_assert(get_VKQ_stride( 80, 1, 16) ==  16, "Test failed.");
 static_assert(get_VKQ_stride( 80, 2, 16) ==  16, "Test failed.");
 static_assert(get_VKQ_stride( 80, 4, 16) ==  16, "Test failed.");
 
-template <int D, int cols_per_block, typename KQ_acc_t>
-void ggml_cuda_flash_attn_ext_wmma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <int D, int cols_per_block, int nwarps, typename KQ_acc_t>
+void ggml_cuda_flash_attn_ext_wmma_f16_case_nwarps(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
-
-    constexpr int nwarps = 4;
 
     constexpr int frag_m = cols_per_block == 8 && D % 32 == 0 ? 32 : 16;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
@@ -561,7 +559,24 @@ void ggml_cuda_flash_attn_ext_wmma_f16_case(ggml_backend_cuda_context & ctx, ggm
         fattn_kernel = flash_attn_ext_f16<
             D, cols_per_block, nwarps, get_VKQ_stride(D, nwarps, frag_m), KQ_acc_t, use_logit_softcap>;
     }
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, 0, FATTN_KQ_STRIDE, true, true, false, warp_size);
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, 0, FATTN_KQ_STRIDE, true, true, false, false, warp_size);
+}
+
+template <int D, int cols_per_block, typename KQ_acc_t>
+void ggml_cuda_flash_attn_ext_wmma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(GGML_USE_HIP)
+    if constexpr (D == 128 && cols_per_block == 32) {
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+            // The wider workgroup processes more independent VKQ rows in
+            // parallel without changing the arithmetic within each row.
+            ggml_cuda_flash_attn_ext_wmma_f16_case_nwarps<D, cols_per_block, 8, KQ_acc_t>(ctx, dst);
+            return;
+        }
+    }
+#endif
+
+    ggml_cuda_flash_attn_ext_wmma_f16_case_nwarps<D, cols_per_block, 4, KQ_acc_t>(ctx, dst);
 }
 
 void ggml_cuda_flash_attn_ext_wmma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

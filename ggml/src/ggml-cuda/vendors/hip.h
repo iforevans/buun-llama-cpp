@@ -8,6 +8,7 @@
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
+#include "hip-runtime.h"
 
 #if defined(GGML_HIP_ROCWMMA_FATTN)
 #include <rocwmma/rocwmma-version.hpp>
@@ -60,10 +61,13 @@
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
+#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaError_t hipError_t
+#define cudaErrorInvalidValue hipErrorInvalidValue
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
+#define cudaErrorUnknown hipErrorUnknown
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
@@ -79,7 +83,10 @@
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
+#define cudaPeekAtLastError hipPeekAtLastError
 #define cudaHostRegister hipHostRegister
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocPortable hipHostMallocPortable
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
 #define cudaHostUnregister hipHostUnregister
@@ -89,8 +96,8 @@
 #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
 #define cudaMallocManaged hipMallocManaged
 #define cudaMemAdvise hipMemAdvise
-#define cudaMemcpy hipMemcpy
-#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpy ggml_hip_memcpy
+#define cudaMemcpyAsync ggml_hip_memcpy_async
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
 #define cudaMemoryTypeDevice hipMemoryTypeDevice
 #define cudaPointerAttributes hipPointerAttribute_t
@@ -133,6 +140,7 @@
 #define CUmemAllocationProp hipMemAllocationProp
 #define cuDeviceGetAttribute hipDeviceGetAttribute
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
+#define cudaStreamCreateWithPriority hipStreamCreateWithPriority
 #define cudaStreamDestroy hipStreamDestroy
 #define cudaStreamFireAndForget hipStreamFireAndForget
 #define cudaStreamNonBlocking hipStreamNonBlocking
@@ -145,6 +153,7 @@
 #define cudaKernelNodeParams hipKernelNodeParams
 #define cudaGraphExecDestroy hipGraphExecDestroy
 #define cudaGraphLaunch hipGraphLaunch
+#define cudaGraphUpload hipGraphUpload
 #define cudaErrorGraphExecUpdateFailure hipErrorGraphExecUpdateFailure
 #define cudaGraphExecUpdateResult hipGraphExecUpdateResult
 #define cudaGraphNodeType hipGraphNodeType
@@ -159,6 +168,9 @@
 #define cudaGraphGetNodes hipGraphGetNodes
 #define cudaGraphExecUpdate hipGraphExecUpdate
 #define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+#define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaStreamBeginCapture hipStreamBeginCapture
 #define cudaGraph_t hipGraph_t
 #define cudaStream_t hipStream_t
@@ -197,9 +209,9 @@
 
 #define __CUDA_ARCH__ 1300
 
-#if defined(__gfx900__) || defined(__gfx906__)
+#if defined(__gfx900__) || defined(__gfx906__) || defined(__gfx909__) || defined(__gfx90c__)
 #define GCN5
-#endif // defined(__gfx900__) || defined(__gfx906__)
+#endif // defined(__gfx900__) || defined(__gfx906__) || defined(__gfx909__) || defined(__gfx90c__)
 
 #if defined(__gfx803__)
 #define GCN4

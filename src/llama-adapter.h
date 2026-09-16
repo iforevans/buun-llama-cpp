@@ -4,8 +4,10 @@
 
 #include "ggml-cpp.h"
 
+#include <array>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // TODO: pimpl
@@ -69,13 +71,16 @@ struct llama_adapter_lora {
     std::vector<ggml_context_ptr> ctxs;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
-    float alpha;
+    float alpha = 0.0f;
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
     // activated lora (aLoRA)
     std::vector<llama_token> alora_invocation_tokens;
+
+    // SHA-256 over the execution-relevant adapter contents (see llama-adapter.cpp).
+    std::array<uint8_t, 32> digest = {};
 
     explicit llama_adapter_lora(llama_model * model) : model(model) {}
     ~llama_adapter_lora() = default;
@@ -89,3 +94,6 @@ struct llama_adapter_lora {
 
 using llama_adapter_loras = std::unordered_map<llama_adapter_lora *, float>;
 using llama_adapter_loras_ptr = std::unique_ptr<llama_adapter_loras>;
+
+using llama_adapter_loras_ordered = std::vector<std::pair<llama_adapter_lora *, float>>;
+using llama_adapter_loras_ordered_ptr = std::unique_ptr<llama_adapter_loras_ordered>;

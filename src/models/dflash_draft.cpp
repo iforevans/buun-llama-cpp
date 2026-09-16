@@ -100,8 +100,8 @@ static int64_t dflash_max_cross_ctx() {
 // Holds the target hidden states, context positions, and asymmetric non-causal attention mask
 class llm_graph_input_dflash : public llm_graph_input_i {
 public:
-    llm_graph_input_dflash(const llama_cross * cross, int64_t ctx_len, int64_t n_block, uint32_t n_swa)
-        : cross(cross), ctx_len(ctx_len), n_block(n_block), n_swa(n_swa) {}
+    llm_graph_input_dflash(const llama_cross * cross, int64_t ctx_len, int64_t n_block, uint32_t n_swa, bool ckv_active)
+        : cross(cross), ctx_len(ctx_len), n_block(n_block), n_swa(n_swa), ckv_active(ckv_active) {}
 
     void set_input(const llama_ubatch * ubatch) override;
 
@@ -111,6 +111,12 @@ public:
     // graph (and re-captures CUDA graphs) on every draft call.
     bool can_reuse(const llm_graph_params & params) override {
         if (cross != params.cross || n_block != (int64_t) params.ubatch.n_tokens) {
+            return false;
+        }
+        // consumer-mode graphs read cached projected K/V instead of target_hidden —
+        // a mode flip (e.g. crosskv failure fallback) needs a different graph
+        const int n_slots_now = std::clamp(params.cparams.dflash_n_slots, 1, (int) LLAMA_DFLASH_MAX_SLOTS);
+        if (ckv_active != (cross && cross->ckv.active && n_slots_now == 1)) {
             return false;
         }
         // ctx_len is baked into every tensor here but derived from live cross state at
@@ -130,7 +136,7 @@ public:
         return want_ctx == ctx_len;
     }
 
-    ggml_tensor * target_hidden     = nullptr; // [n_target_features, ctx_len]
+    ggml_tensor * target_hidden     = nullptr; // [n_target_features, ctx_len] (legacy mode)
     ggml_tensor * pos_ctx           = nullptr; // [ctx_len]
     ggml_tensor * kq_mask           = nullptr; // [ctx_len + n_block, n_block, 1, 1]
     ggml_tensor * kq_mask_cnv       = nullptr;
@@ -138,10 +144,15 @@ public:
     ggml_tensor * kq_mask_swa       = nullptr;
     ggml_tensor * kq_mask_swa_cnv   = nullptr;
 
+    // consumer mode: per-layer cached projected K (pre-RoPE) / V windows
+    std::vector<ggml_tensor *> k_ctx; // [n_embd_k_gqa, ctx_len] each
+    std::vector<ggml_tensor *> v_ctx; // [n_embd_v_gqa, ctx_len] each
+
     const llama_cross * cross;
     int64_t ctx_len;
     int64_t n_block;
     uint32_t n_swa;
+    bool ckv_active;
 };
 
 void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
@@ -154,7 +165,9 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         const void *  src_gpu   = nullptr;
         int64_t       src_n_enc  = 0;
         int64_t       src_n_real = 0;
-        if (cross) {
+        if (ckv_active && cross && cross->ckv.active) {
+            src_n_real = cross->ckv.n_real;
+        } else if (cross) {
             llama_seq_id active_seq = -1;
             if (ubatch && ubatch->n_seqs_unq > 0 && ubatch->seq_id_unq) {
                 active_seq = ubatch->seq_id_unq[0];
@@ -191,7 +204,29 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         const int64_t n_copy  = std::min(src_real, ctx_len);
         const int64_t win_off = (src_real > ctx_len) ? (src_real - ctx_len) : 0;
 
-        if (target_hidden && (src_data || src_gpu) && n_copy > 0) {
+        if (ckv_active && cross && cross->ckv.active) {
+            // consumer mode: gather the cached projected K/V window (ring order →
+            // window order, ≤2 contiguous spans, D2D) and zero any pad rows so
+            // stale slots can never feed NaNs into flash-attention
+            const auto & ckv = cross->ckv;
+            const int start = ckv.ring_size > 0 ? (int)((ckv.read_start + win_off) % ckv.ring_size) : 0;
+            for (size_t il = 0; il < k_ctx.size(); ++il) {
+                ggml_tensor * k = k_ctx[il];
+                ggml_tensor * v = v_ctx[il];
+                if (n_copy > 0 && ckv.fn_read_window) {
+                    ckv.fn_read_window(ckv.cache, (int) il, 0, start, (int) n_copy, k->data, 0);
+                    ckv.fn_read_window(ckv.cache, (int) il, 1, start, (int) n_copy, v->data, 0);
+                }
+                const size_t k_valid = (size_t) n_copy * ckv.k_row * sizeof(float);
+                const size_t v_valid = (size_t) n_copy * ckv.v_row * sizeof(float);
+                if (k_valid < ggml_nbytes(k)) {
+                    ggml_backend_tensor_memset(k, 0, k_valid, ggml_nbytes(k) - k_valid);
+                }
+                if (v_valid < ggml_nbytes(v)) {
+                    ggml_backend_tensor_memset(v, 0, v_valid, ggml_nbytes(v) - v_valid);
+                }
+            }
+        } else if (target_hidden && (src_data || src_gpu) && n_copy > 0) {
             const int64_t n_feat = cross->n_embd;
             const size_t copy_bytes  = (size_t) n_feat * (size_t) n_copy * sizeof(float);
             const size_t tensor_bytes = ggml_nbytes(target_hidden);
@@ -414,13 +449,32 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     const int64_t n_kv_total = ctx_len + n_tokens;
 
     // --- DFlash-specific inputs ---
-    const bool have_swa = hparams.is_swa_any();
-    auto inp_dflash = std::make_unique<llm_graph_input_dflash>(cross, ctx_len, n_tokens, hparams.n_swa);
+    // Consumer mode (projected cross-KV cache): the graph reads per-layer cached
+    // K (pre-RoPE, post k-norm) and V windows instead of re-projecting the whole
+    // hidden-state ring through dflash_fc + wk/wv on every draft call.
+    const bool use_ckv = cross && cross->ckv.active && n_slots == 1;
 
-    // concatenated target hidden states [n_target_features, ctx_len]
-    inp_dflash->target_hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_target_features, ctx_len);
-    ggml_set_input(inp_dflash->target_hidden);
-    cb(inp_dflash->target_hidden, "dflash_target_hidden", -1);
+    const bool have_swa = hparams.is_swa_any();
+    auto inp_dflash = std::make_unique<llm_graph_input_dflash>(cross, ctx_len, n_tokens, hparams.n_swa, use_ckv);
+
+    if (use_ckv) {
+        for (int il = 0; il < n_layer; ++il) {
+            ggml_tensor * k = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_k_gqa(il), ctx_len);
+            ggml_set_input(k);
+            cb(k, "dflash_k_ctx_cache", il);
+            inp_dflash->k_ctx.push_back(k);
+
+            ggml_tensor * v = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_v_gqa(il), ctx_len);
+            ggml_set_input(v);
+            cb(v, "dflash_v_ctx_cache", il);
+            inp_dflash->v_ctx.push_back(v);
+        }
+    } else {
+        // concatenated target hidden states [n_target_features, ctx_len]
+        inp_dflash->target_hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_target_features, ctx_len);
+        ggml_set_input(inp_dflash->target_hidden);
+        cb(inp_dflash->target_hidden, "dflash_target_hidden", -1);
+    }
 
     // context positions for K RoPE [ctx_len]
     inp_dflash->pos_ctx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx_len);
@@ -448,6 +502,9 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     ggml_tensor * pos_ctx       = inp_dflash->pos_ctx;
     ggml_tensor * target_hidden = inp_dflash->target_hidden;
 
+    const std::vector<ggml_tensor *> k_ctx_in = inp_dflash->k_ctx;
+    const std::vector<ggml_tensor *> v_ctx_in = inp_dflash->v_ctx;
+
     res->add_input(std::move(inp_dflash));
 
     // --- Embedding ---
@@ -463,9 +520,13 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     ggml_tensor * inp_pos = build_inp_pos();
 
     // --- Fusion layer: project concatenated target hidden states ---
-    ggml_tensor * fused_target = build_lora_mm(model.dflash_fc, target_hidden);
-    fused_target = build_norm(fused_target, model.dflash_hidden_norm, nullptr, LLM_NORM_RMS, -1);
-    cb(fused_target, "fused_target", -1);
+    // (skipped in consumer mode — the cache already holds the projections)
+    ggml_tensor * fused_target = nullptr;
+    if (!use_ckv) {
+        fused_target = build_lora_mm(model.dflash_fc, target_hidden);
+        fused_target = build_norm(fused_target, model.dflash_hidden_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(fused_target, "fused_target", -1);
+    }
 
     // --- Transformer layers ---
     for (int il = 0; il < n_layer; ++il) {
@@ -496,10 +557,17 @@ llm_build_dflash_draft::llm_build_dflash_draft(
                                        ext_factor, attn_factor, beta_fast, beta_slow);
             cb(Kcur_noise, "Kcur_noise", il);
 
-            // K from target (context features)
-            ggml_tensor * Kcur_ctx = build_lora_mm(model.layers[il].wk, fused_target);
-            Kcur_ctx = ggml_reshape_3d(ctx0, Kcur_ctx, n_embd_head, n_head_kv, ctx_len);
-            Kcur_ctx = build_norm(Kcur_ctx, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+            // K from target (context features) — consumer mode reads the cached
+            // pre-RoPE projection; RoPE must stay in-graph because window positions
+            // slide (a token's pos_ctx changes as older tokens fall out of the ring)
+            ggml_tensor * Kcur_ctx;
+            if (use_ckv) {
+                Kcur_ctx = ggml_reshape_3d(ctx0, k_ctx_in[il], n_embd_head, n_head_kv, ctx_len);
+            } else {
+                Kcur_ctx = build_lora_mm(model.layers[il].wk, fused_target);
+                Kcur_ctx = ggml_reshape_3d(ctx0, Kcur_ctx, n_embd_head, n_head_kv, ctx_len);
+                Kcur_ctx = build_norm(Kcur_ctx, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+            }
             Kcur_ctx = ggml_rope_ext(ctx0, Kcur_ctx, pos_ctx, nullptr,
                                      n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                                      ext_factor, attn_factor, beta_fast, beta_slow);
@@ -511,8 +579,13 @@ llm_build_dflash_draft::llm_build_dflash_draft(
             cb(Vcur_noise, "Vcur_noise", il);
 
             // V from target (context features)
-            ggml_tensor * Vcur_ctx = build_lora_mm(model.layers[il].wv, fused_target);
-            Vcur_ctx = ggml_reshape_3d(ctx0, Vcur_ctx, n_embd_head, n_head_kv, ctx_len);
+            ggml_tensor * Vcur_ctx;
+            if (use_ckv) {
+                Vcur_ctx = ggml_reshape_3d(ctx0, v_ctx_in[il], n_embd_head, n_head_kv, ctx_len);
+            } else {
+                Vcur_ctx = build_lora_mm(model.layers[il].wv, fused_target);
+                Vcur_ctx = ggml_reshape_3d(ctx0, Vcur_ctx, n_embd_head, n_head_kv, ctx_len);
+            }
             cb(Vcur_ctx, "Vcur_ctx", il);
 
             // concatenate K: [ctx, noise] along sequence dim (dim 2)
@@ -531,7 +604,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
             // asymmetric attention: Q [head_dim, n_head, n_tokens]
             //                       K [head_dim, n_head_kv, n_kv_total]
             //                    mask [n_kv_total, n_tokens, 1, 1]
-            cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, kq_mask, nullptr, nullptr,
+            cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, kq_mask, nullptr, nullptr, 0,
                                  1.0f / sqrtf(float(n_embd_head)), il);
             cb(cur, "kqv_out", il);
 
@@ -579,16 +652,24 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
-    // GPU top-K or argmax — avoids 15.9MB logits transfer + CPU scan for DFlash draft
-    const float sample_temp = cparams.dflash_sample_temp;
-    static std::atomic<uint64_t> gumbel_counter{1};
-    const uint64_t seed = (sample_temp > 0.0f) ? gumbel_counter.fetch_add(1) : 0;
-    const int topk = cparams.dflash_topk;
-    if (topk > 1) {
-        res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, sample_temp, seed);
-    } else {
-        res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, sample_temp, seed);
-    }
+    ggml_build_forward_expand(gf, cur);
 
-    ggml_build_forward_expand(gf, res->t_logits_argmax);
+    // GPU top-K or argmax — avoids 15.9MB logits transfer + CPU scan for DFlash draft.
+    // Gated on dflash_argmax (default off, enabled at drafter-context init): the extended
+    // ids + log-probs layout is only implemented by the GPU argmax kernels, so the draft
+    // loop disables the tail and samples on the host when the sched puts it on the CPU
+    // backend (e.g. -ngld 0). With the tail off, raw logits are extracted instead.
+    if (cparams.dflash_argmax) {
+        const float sample_temp = cparams.dflash_sample_temp;
+        static std::atomic<uint64_t> gumbel_counter{1};
+        const uint64_t seed = (sample_temp > 0.0f) ? gumbel_counter.fetch_add(1) : 0;
+        const int topk = cparams.dflash_topk;
+        if (topk > 1) {
+            res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, sample_temp, seed);
+        } else {
+            res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, sample_temp, seed);
+        }
+
+        ggml_build_forward_expand(gf, res->t_logits_argmax);
+    }
 }

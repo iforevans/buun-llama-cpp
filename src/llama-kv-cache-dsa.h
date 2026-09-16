@@ -26,7 +26,8 @@ public:
                      uint32_t   n_pad,
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
-        const layer_filter_cb & filter,
+        const layer_filter_cb & filter_mla,
+        const layer_filter_cb & filter_lid,
         const  layer_reuse_cb & reuse);
 
     ~llama_kv_cache_dsa() = default;
@@ -45,6 +46,9 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool can_seq_rm_partial() const override {
+        return kv_mla->can_seq_rm_partial() && kv_lid->can_seq_rm_partial();
+    }
 
     // no VBR params are threaded to the children today, so this is a no-op — kept for
     // coverage symmetry with get_vbr_epoch should that ever change

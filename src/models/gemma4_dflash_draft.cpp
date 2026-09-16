@@ -509,7 +509,7 @@ llm_build_gemma4_dflash_draft::llm_build_gemma4_dflash_draft(
             ggml_build_forward_expand(gf, Vcur);
 
             // z-lab drafter is Qwen3-arch: standard softmax scale = 1/sqrt(head_dim), not gemma's 1.0
-            cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, kq_mask, nullptr, nullptr,
+            cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, kq_mask, nullptr, nullptr, 0,
                                  1.0f/sqrtf((float) hparams.n_embd_head_k(il)), il);
             cb(cur, "kqv_out", il);
 
@@ -558,16 +558,24 @@ llm_build_gemma4_dflash_draft::llm_build_gemma4_dflash_draft(
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
-    // GPU top-K or argmax for the DFlash draft.
-    const float sample_temp = cparams.dflash_sample_temp;
-    static std::atomic<uint64_t> gumbel_counter{1};
-    const uint64_t seed = (sample_temp > 0.0f) ? gumbel_counter.fetch_add(1) : 0;
-    const int topk = cparams.dflash_topk;
-    if (topk > 1) {
-        res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, sample_temp, seed);
-    } else {
-        res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, sample_temp, seed);
-    }
+    ggml_build_forward_expand(gf, cur);
 
-    ggml_build_forward_expand(gf, res->t_logits_argmax);
+    // GPU top-K or argmax for the DFlash draft. Gated on dflash_argmax (default off,
+    // enabled at drafter-context init): the extended ids + log-probs layout is only
+    // implemented by the GPU argmax kernels, so the draft loop disables the tail and
+    // samples on the host when the sched puts it on the CPU backend (e.g. -ngld 0).
+    // With the tail off, raw logits are extracted instead.
+    if (cparams.dflash_argmax) {
+        const float sample_temp = cparams.dflash_sample_temp;
+        static std::atomic<uint64_t> gumbel_counter{1};
+        const uint64_t seed = (sample_temp > 0.0f) ? gumbel_counter.fetch_add(1) : 0;
+        const int topk = cparams.dflash_topk;
+        if (topk > 1) {
+            res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, sample_temp, seed);
+        } else {
+            res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, sample_temp, seed);
+        }
+
+        ggml_build_forward_expand(gf, res->t_logits_argmax);
+    }
 }

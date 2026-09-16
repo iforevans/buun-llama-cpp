@@ -15,6 +15,8 @@ struct llama_sampler_chain {
     // has .backend_init() been called?
     bool is_init = false;
 
+    uint32_t n_nodes = 0;
+
     struct info {
         bool is_backend;
 
@@ -33,10 +35,21 @@ struct llama_sampler_chain {
     mutable int32_t n_sample;
 };
 
+uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
+void llama_sampler_backend_begin(llama_sampler * sampler);
+
 struct llama_sampler * llama_sampler_init_dry_testing(
-        int32_t context_size,
         float   dry_multiplier,
         float   dry_base,
         int32_t dry_allowed_length,
         int32_t dry_penalty_last_n,
         const std::vector<std::vector<llama_token>> & seq_breakers);
+
+// Whether backend_apply() will run at least the first element of this initialized
+// sampler chain. Later unsupported elements are allowed and run on the CPU.
+bool llama_sampler_chain_has_backend_prefix(const llama_sampler * chain);
+
+// Whether every sampler in the active backend prefix preserves an explicit
+// candidate-token domain. Unknown and index-producing samplers fail closed so
+// callers can fall back to dense full-vocabulary logits.
+bool llama_sampler_chain_supports_candidates(const llama_sampler * chain);

@@ -1,7 +1,7 @@
 #pragma once
 
-// Backend interface for TurboQuant KV-cache support (turbo-typed KV tensors and the
-// dynamic VBR degrade controller).
+// Backend interface for dynamically retiered KV caches (TurboQuant and classic
+// F16/Q8_0/Q4_0 representation ladders).
 //
 // libllama links NO backend symbols for this feature. At KV-cache init it resolves this
 // vtable through the backend registry:
@@ -44,7 +44,7 @@ static inline void ggml_vbr_kv_dequant_sides(enum ggml_type tk, enum ggml_type t
     *need_v = turbo_v || ((tv == GGML_TYPE_Q8_0 || tv == GGML_TYPE_BF16) && turbo_k);
 }
 
-// Dynamic VBR: transcode the first n_cells rows of a turbo KV tensor (src) to a lower turbo tier
+// Dynamic VBR: transcode the first n_cells rows of a managed KV tensor (src) to another rung
 // (type_B), writing into dst (a region of the KV pool buffer; == src->data for the in-place
 // degrade). src->name must be the cache tensor name (cache_k_l<L>_ms<M> / cache_v_l<L>_ms<M>) so the encoder
 // picks the right K/V codebook. stash_f16/stash_rows (nullable/0): f16 sink-stash — rows
@@ -65,6 +65,41 @@ struct ggml_vbr_transcode_params {
     int64_t                    stash_rows;
     size_t                     scrub_bytes;
 };
+
+// Cross-domain reconstruction reuses the ordinary tiled transcode, but restores the baked
+// affine mean between source dequantization and full-domain re-encoding. logical_offset selects
+// this tensor-parallel shard's columns within the canonical logical row.
+struct ggml_vbr_cross_domain_reconstruct_params {
+    struct ggml_vbr_transcode_params transcode;
+    int32_t                          meansub_model_id;
+    int32_t                          meansub_layer;
+    uint64_t                         logical_offset;
+};
+
+struct ggml_vbr_transcode_workspace_params_v2 {
+    int64_t n_cells;
+    int64_t ne0;
+    int64_t stash_rows;
+    bool    mean_addback;
+};
+
+// Shared CPU-visible launch contract for the cross-domain mean add-back. One block owns one
+// logical row; its threads stride columns, avoiding a runtime division/modulo for every value.
+struct ggml_vbr_mean_addback_launch_shape {
+    uint32_t blocks;
+    uint32_t threads;
+};
+
+static inline bool ggml_vbr_mean_addback_launch_shape_for(
+        int64_t rows, int64_t columns,
+        struct ggml_vbr_mean_addback_launch_shape * output) {
+    if (output == NULL || rows <= 0 || columns <= 0 || (uint64_t) rows > UINT32_MAX) {
+        return false;
+    }
+    output->blocks = (uint32_t) rows;
+    output->threads = 256;
+    return true;
+}
 
 struct ggml_vbr_backend_iface {
     // -- device utilities ------------------------------------------------------------
@@ -139,12 +174,41 @@ struct ggml_vbr_backend_iface {
     // recoverable and returns false, allowing the caller to reclaim/retry before tier mutation.
     bool (*kv_transcode_workspace_reserve)(ggml_backend_t backend,
                                             int64_t n_cells, int64_t ne0, int64_t stash_rows);
+    // Clear a tensor subrange on the backend's side stream. Ordered with kv_transcode and async
+    // tensor uploads submitted through the same backend. This is the final member of the legacy
+    // interface: extending this unversioned object would make even a null-check read beyond an
+    // older backend's static object.
+    void (*tensor_memset_async)(ggml_backend_t backend, struct ggml_tensor * tensor,
+                                size_t offset, size_t size);
+};
+
+// Cross-domain reconstruction is a separate, versioned proc-address capability. A backend that
+// exports only GGML_VBR_BACKEND_IFACE_PROC remains safely usable for every legacy operation; the
+// absence of this proc makes cross-domain reconstruction report-only without reading past the
+// legacy object. Future versions use a new proc name rather than changing this layout.
+#define GGML_VBR_CROSS_DOMAIN_IFACE_V1_VERSION 1u
+struct ggml_vbr_cross_domain_iface_v1 {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    bool (*kv_cross_domain_reconstruct)(
+        ggml_backend_t backend,
+        const struct ggml_vbr_cross_domain_reconstruct_params * params);
+    bool (*kv_transcode_workspace_memory_v2)(
+        ggml_backend_t backend_or_null, int device,
+        const struct ggml_vbr_transcode_workspace_params_v2 * params,
+        size_t * physical_now, size_t * physical_if_reserved);
+    bool (*kv_transcode_workspace_reserve_v2)(
+        ggml_backend_t backend,
+        const struct ggml_vbr_transcode_workspace_params_v2 * params);
 };
 
 // proc name resolved via ggml_backend_reg_get_proc_address
 #define GGML_VBR_BACKEND_IFACE_PROC "ggml_backend_vbr_iface"
+#define GGML_VBR_CROSS_DOMAIN_IFACE_V1_PROC "ggml_backend_vbr_cross_domain_iface_v1"
 
 typedef const struct ggml_vbr_backend_iface * (*ggml_backend_vbr_iface_fn_t)(void);
+typedef const struct ggml_vbr_cross_domain_iface_v1 *
+    (*ggml_backend_vbr_cross_domain_iface_v1_fn_t)(void);
 
 #ifdef __cplusplus
 }

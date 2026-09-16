@@ -6,14 +6,18 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-model-source.h"
 
 #include "ggml-cpp.h"
 
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <set>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -35,6 +39,13 @@ struct llama_model_loader {
         size_t   offs; // tensor data offset in the original file
 
         ggml_tensor * tensor;
+
+        llama_tensor_weight(const llama_file * file, uint16_t idx, size_t offset, ggml_tensor * tensor) :
+            idx(idx), offs(offset), tensor(tensor) {
+            if (offs > file->size() || ggml_nbytes(tensor) > file->size() - offs) {
+                throw std::runtime_error(format("tensor '%s' data is not within the file bounds", tensor->name));
+            }
+        }
 
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
@@ -67,10 +78,17 @@ struct llama_model_loader {
     static const int TENSOR_DUPLICATED      = 1 << 1;
     static const int TENSOR_SKIP            = 1 << 2;
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
+    static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
+    static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
 
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;
+    int tensor_capacity = 0;
+    // names touched by create_tensor: created (incl. skipped) and the subset that was skipped;
+    // lets done_getting_tensors forgive .scale/.input_scale side tensors of skipped weights
+    std::unordered_set<std::string> created_tensors;
+    std::unordered_set<std::string> skipped_tensors;
 
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;
@@ -79,8 +97,54 @@ struct llama_model_loader {
     bool use_direct_io = false;
     bool check_tensors;
     bool no_alloc;
+    bool load_mtp;
+
+    // Target model whose embedding/output tensors may be borrowed by an MTP
+    // sidecar that explicitly declares nextn_shared_target_tensors.
+    const struct llama_model * model_shared = nullptr;
+    int shared_target_tensors = -1;
+
+    // antirez/ds4 standalone DeepSeek-V4-Flash DSpark support GGUF.  This
+    // container intentionally omits the target model's architectural and
+    // tokenizer metadata and retains the original mtp.* tensor names.
+    bool deepseek4_dspark_support = false;
+
+    // handle TENSOR_READ_LAZY
+    // use case: keep PLE / engrams embd tensors on disk, read them on demand
+    struct lazy_read {
+        // set by the caller before the create_tensor() calls
+        enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
+
+        // decide whether this tensor is read lazily
+        // pass w to also record it, or nullptr to only ask
+        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+
+        bool any() const {
+            return !ranges.empty();
+        }
+
+        bool has(const ggml_tensor * t) const {
+            return tensors.count(ggml_get_name(t)) > 0;
+        }
+
+        const llama_mmap::ranges & for_file(uint32_t idx) const {
+            static const llama_mmap::ranges none;
+
+            const auto it = ranges.find(idx);
+            return it == ranges.end() ? none : it->second;
+        }
+
+        // lazy tensors are gathered on the host, so no offload setting applies to them
+        static ggml_backend_buffer_type_t buft();
+
+    private:
+        std::map<uint32_t, llama_mmap::ranges> ranges;
+        std::set<std::string>                  tensors;
+    } lazy;
 
     llama_files files;
+    // nullopt denotes canonical bytes to be prepared after placement.
+    std::map<ggml_tensor *, std::optional<llama_model_tensor_file_region>> source_regions;
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -94,6 +158,7 @@ struct llama_model_loader {
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
     llama_model_set_tensor_data_t set_tensor_data;
     void * set_tensor_data_ud;
+    const llama_model_tensor_source * tensor_source;
     std::vector<ggml_context_ptr> contexts;
 
     std::string arch_name;
@@ -110,7 +175,26 @@ struct llama_model_loader {
         }
     };
 
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    // lazy tensors need dedicated context
+    struct ctx_key {
+        ggml_backend_buffer_type_t buft;
+        bool lazy;
+        bool source_mapped = false;
+    };
+
+    struct ctx_key_comparator {
+        bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
+            if (lhs.source_mapped != rhs.source_mapped) {
+                return lhs.source_mapped < rhs.source_mapped;
+            }
+            if (lhs.lazy != rhs.lazy) {
+                return lhs.lazy < rhs.lazy;
+            }
+            return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
+        }
+    };
+
+    std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> ctx_map;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
@@ -123,13 +207,14 @@ struct llama_model_loader {
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
         void * set_tensor_data_ud,
+        const llama_model_tensor_source * tensor_source,
         const std::string & fname,
         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
         FILE * file,
-        bool use_mmap,
-        bool use_direct_io,
+        llama_load_mode load_mode,
         bool check_tensors,
         bool no_alloc,
+        bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
 
@@ -168,30 +253,53 @@ struct llama_model_loader {
 
     enum llm_arch get_arch() const;
 
+    bool is_deepseek4_dspark_support() const;
+
     const llama_tensor_weight * get_weight(const char * name) const;
 
     const llama_tensor_weight & require_weight(const char * name) const;
 
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 
+    bool has_tensor(const char * name) const;
+
+    bool get_tensor_info(const char * name, ggml_type & type, std::array<int64_t, GGML_MAX_DIMS> & ne) const;
+
+    // Exact GGUF wire-name lookup. Unlike get_tensor_meta(), this deliberately
+    // bypasses architecture compatibility aliases.
+    struct ggml_tensor * get_tensor_meta_exact(const char * name) const;
+
     struct ggml_tensor * require_tensor_meta(const std::string & name) const;
 
-    const struct ggml_tensor * check_tensor_dims(const std::string & name, const std::vector<int64_t> & ne, bool required) const;
+    const struct ggml_tensor * check_tensor_dims(
+            const std::string & name,
+            const std::vector<int64_t> & ne,
+            bool required,
+            bool allow_reshape) const;
 
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
-    struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
+    struct ggml_tensor * borrow_shared_tensor(
+        const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne);
 
     void done_getting_tensors(bool partial = false) const;
 
-    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
+    // Device that can wrap mapped bytes in this buffer type, or nullptr.
+    static ggml_backend_dev_t mmap_buffer_device(ggml_backend_buffer_type_t buft);
+
+    void init_mappings(enum llama_mmap_prefetch_mode prefetch, llama_mlocks * mlock_mmaps = nullptr,
+                       llama_progress_callback progress = nullptr, void * progress_data = nullptr);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
 
-    // for backwards compatibility, does not support ggml-backend
-    void load_data_for(struct ggml_tensor * cur) const;
+    // release a weight's mmap pages
+    void unmap_weight(const llama_tensor_weight & w) const;
+
+    // read a byte range of a weight's data
+    // with mmap, returns a pointer into the mapping, otherwise reads into buf and returns buf
+    const void * load_data_range(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const;
 
     // Returns false if cancelled by progress_callback
     bool load_all_data(
@@ -201,7 +309,25 @@ struct llama_model_loader {
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
 
+    void validate_source_complete() const;
+
     std::string ftype_name() const;
 
     void print_info() const;
 };
+
+// Pure policy helper used by tests and by init_mappings(). Unknown availability
+// preserves the historical eager-prefetch behavior; a known zero disables it.
+bool llama_mmap_prefetch_resolve(
+        enum llama_mmap_prefetch_mode mode,
+        uint64_t mapped_bytes,
+        uint64_t available_bytes,
+        bool available_known);
+
+#if defined(__linux__)
+// Testable Linux controller discovery and ancestor-limit calculation.
+bool llama_linux_cgroup_memory_available(
+        const char * cgroup_file,
+        const char * mountinfo_file,
+        uint64_t & available_bytes);
+#endif

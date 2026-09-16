@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "fattn-rdna2-policy.h"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -425,6 +426,29 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
+// Whether V can be read through K's data pointer with K's strides.
+// True when V is a view of K (or both are views of the same source at the same
+// offset) with an identical layout, i.e. the PV phase can reuse the K shared
+// tile for V (K-only attention such as DeepSeek V4 Flash passes V == K, MLA
+// models pass V as a narrower prefix view of K). Requires the same strides and
+// offsets, so same-source views with different permutations are rejected.
+static inline bool ggml_cuda_fattn_V_is_K_view(const ggml_tensor * K, const ggml_tensor * V) {
+    return K && V
+        && V->data == K->data
+        && V->type == K->type
+        && (V == K ? true
+            : V->view_src == K ? V->view_offs == 0
+                             : (V->view_src && V->view_src == K->view_src && V->view_offs == K->view_offs))
+        && V->ne[0] <= K->ne[0]
+        && V->ne[1] == K->ne[1]
+        && V->ne[2] == K->ne[2]
+        && V->ne[3] == K->ne[3]
+        && V->nb[0] == K->nb[0]
+        && V->nb[1] == K->nb[1]
+        && V->nb[2] == K->nb[2]
+        && V->nb[3] == K->nb[3];
+}
+
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
@@ -435,7 +459,7 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
-    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    const bool V_is_K_view = ggml_cuda_fattn_V_is_K_view(K, V);
 
     ggml_cuda_flash_attn_ext_f16_extra_data data = {};
     data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
@@ -1887,10 +1911,14 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+void ggml_cuda_flash_attn_ext_compact_mask(
+        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream);
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
+    const int warp_size = WARP_SIZE
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1898,7 +1926,7 @@ void launch_fattn(
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    const bool V_is_K_view = ggml_cuda_fattn_V_is_K_view(K, V);
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
@@ -2006,10 +2034,20 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
+    const int32_t n_kv_max = use_sparse ? ggml_get_op_params_i32(KQV, 4) : 0;
+    if (use_sparse) {
+        GGML_ASSERT(mask != nullptr);
+        GGML_ASSERT(n_kv_max > 0);
+        const size_t mask_rows = size_t(mask->ne[1]) * mask->ne[3];
+
+        KV_max.alloc(size_t(n_kv_max) * mask_rows);
+        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+    }
+
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -2029,10 +2067,39 @@ void launch_fattn(
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+#if defined(GGML_USE_HIP)
+    if (max_blocks_per_sm == 0 && GGML_CUDA_CC_IS_RDNA2(cc)) {
+        hipFuncAttributes attr = {};
+        hipDeviceProp_t prop = {};
+        const cudaError_t attr_status = hipFuncGetAttributes(
+            &attr, reinterpret_cast<const void *>(fattn_kernel));
+        const cudaError_t prop_status = hipGetDeviceProperties(
+            &prop, ggml_cuda_info().devices[id].physical_device);
+        if (attr_status == cudaSuccess && prop_status == cudaSuccess) {
+            max_blocks_per_sm = ggml_cuda_fattn_correct_rdna2_wgp_occupancy({
+                true,
+                true,
+                max_blocks_per_sm,
+                (int) Q->ne[0],
+                DV,
+                ncols1,
+                ncols2,
+                (int) (block_dim.x * block_dim.y * block_dim.z),
+                attr.maxThreadsPerBlock,
+                attr.numRegs,
+                prop.regsPerBlock,
+                attr.sharedSizeBytes,
+                nbytes_shared,
+                ggml_cuda_info().devices[id].smpb,
+            });
+        }
+    }
+#endif // defined(GGML_USE_HIP)
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+    const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
+    const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
     if (stream_k) {
@@ -2041,7 +2108,9 @@ void launch_fattn(
         const int tiles_nwaves = (ntiles_dst + max_blocks - 1) / max_blocks;
         const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
-        const bool use_stream_k = cc >= GGML_CUDA_CC_ADA_LOVELACE || amd_wmma_available(cc) || tiles_efficiency_percent < 75;
+        const bool use_stream_k =
+            (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) ||
+            (amd_wmma_available(cc) && Q->ne[0] == 64) || tiles_efficiency_percent < 75;
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;
@@ -2136,7 +2205,7 @@ void launch_fattn(
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
+        K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0

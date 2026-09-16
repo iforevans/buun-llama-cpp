@@ -58,6 +58,11 @@ logger = logging.getLogger("hf-to-gguf")
 AnyModel = TypeVar("AnyModel", bound="type[ModelBase]")
 
 
+# for checkpoints that ship no config.json, we will try to provide a synthetic one
+HparamsMatcher = Callable[[Path], bool]
+HparamsLoader = Callable[[Path], dict[str, Any]]
+
+
 class SentencePieceTokenTypes(IntEnum):
     NORMAL = 1
     UNKNOWN = 2
@@ -77,6 +82,7 @@ class ModelBase:
         ModelType.TEXT: {},
         ModelType.MMPROJ: {},
     }
+    _hparams_loaders: list[tuple[HparamsMatcher, HparamsLoader]] = []
 
     dir_model: Path
     ftype: gguf.LlamaFileType
@@ -124,7 +130,8 @@ class ModelBase:
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False):
+                 fp8_as_q8: bool = False,
+                 fuse_qkv: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -147,6 +154,15 @@ class ModelBase:
         self.fuse_gate_up_exps = fuse_gate_up_exps
         self._gate_exp_buffer: dict[int, Tensor] = {}
         self._up_exp_buffer: dict[int, Tensor] = {}
+        self.fuse_qkv = fuse_qkv
+        self._q_buffer: dict[int, Tensor] = {}
+        self._k_buffer: dict[int, Tensor] = {}
+        self._v_buffer: dict[int, Tensor] = {}
+        self._q_bias_buffer: dict[int, Tensor] = {}
+        self._k_bias_buffer: dict[int, Tensor] = {}
+        self._v_bias_buffer: dict[int, Tensor] = {}
+        self._fusable_qkv_weight_layers: set[int] = set()
+        self._fusable_qkv_bias_layers: set[int] = set()
         self.hparams = ModelBase.load_hparams(self.dir_model, self.is_mistral_format) if hparams is None else hparams
         self.model_tensors = self.index_tensors(remote_hf_model_id=remote_hf_model_id)
         self.metadata_override = metadata_override
@@ -156,6 +172,7 @@ class ModelBase:
         self._is_mxfp4 = False
         self._fp8_as_q8 = fp8_as_q8
         self._fp8_dequantized: set[str] = set()
+        self._has_fp8_channel = False
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
         # NOTE: can't use field "torch_dtype" in config.json, because some finetunes lie.
@@ -303,6 +320,90 @@ class ModelBase:
             scale_vals = np.array(scales, dtype=np.float32)
             logger.info(f"  + {scale_name} (per-expert scale, shape [{len(scales)}])")
             self.gguf_writer.add_tensor(scale_name, scale_vals)
+
+    def _transform_fp8_channel_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
+        """Architecture hook for layout transforms that must also move channel scales."""
+        del name
+        return weight, scale
+
+    @staticmethod
+    def _compressed_target_matches(target: str, module_name: str) -> bool:
+        if target == "Linear":
+            return True
+        if target.startswith("re:"):
+            return re.match(target[3:], module_name) is not None
+        return target == module_name
+
+    def _compressed_tensor_group(self, module_name: str) -> dict[str, Any] | None:
+        """Return the producer-selected compressed-tensors group for a module."""
+        config = self.hparams.get("quantization_config") or {}
+        if config.get("quant_method") != "compressed-tensors":
+            return None
+        if any(self._compressed_target_matches(target, module_name) for target in config.get("ignore", [])):
+            return None
+
+        # A later duplicate target replaces its scheme without changing the
+        # target's original position, matching Python dict construction in the
+        # producer implementation.
+        rules: dict[str, dict[str, Any]] = {}
+        for group in (config.get("config_groups") or {}).values():
+            for target in group.get("targets", []):
+                rules[target] = group
+        for target, group in rules.items():
+            if self._compressed_target_matches(target, module_name):
+                return group
+        return None
+
+    def _generate_fp8_channel_tensors(self):
+        """Write channel-scaled E4M3 weights without expanding or requantizing them."""
+        consumed: list[str] = []
+
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith(".weight"):
+                continue
+            scale_name = name.replace(".weight", ".weight_scale")
+            if scale_name not in self.model_tensors:
+                continue
+
+            weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
+            if weight.dtype != torch.float8_e4m3fn:
+                continue
+            if (self.hparams.get("quantization_config") or {}).get("quant_method") == "compressed-tensors":
+                group = self._compressed_tensor_group(name.removesuffix(".weight"))
+                config_format = (self.hparams.get("quantization_config") or {}).get("format")
+                if group is None or group.get("format", config_format) != "float-quantized":
+                    raise ValueError(f"FP8 tensor {name!r} is not assigned to a supported float-quantized group")
+            scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
+            weight, scale = self._transform_fp8_channel_weight(name, weight, scale)
+
+            bid = next((int(part) for part in name.split(".") if part.isdecimal()), None)
+            mapped = list(ModelBase.modify_tensors(self, weight, name, bid))
+            if len(mapped) != 1:
+                raise ValueError(f"FP8 tensor {name!r} mapped to {len(mapped)} tensors; add an architecture-specific handler")
+            new_name, weight = mapped[0]
+
+            raw = weight.contiguous().view(torch.uint8).numpy()
+            logger.info(f"Preserved {new_name} as raw channel-scaled E4M3, shape {list(weight.shape)}")
+            self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
+
+            scale = scale.contiguous().flatten()
+            if scale.numel() != weight.shape[0]:
+                raise ValueError(
+                    f"FP8 channel scale for {name!r} has {scale.numel()} values, expected {weight.shape[0]}"
+                )
+            if scale.dtype != torch.bfloat16:
+                scale = scale.to(torch.bfloat16)
+            scale_bits = scale.view(torch.uint16).numpy()
+            self.gguf_writer.add_tensor(
+                new_name.replace(".weight", ".scale"),
+                scale_bits,
+                raw_dtype=gguf.GGMLQuantizationType.BF16,
+            )
+            consumed.extend((name, scale_name))
+
+        for name in consumed:
+            self.model_tensors.pop(name, None)
+        self._has_fp8_channel |= bool(consumed)
 
     def dequant_model(self):
         # If all quantized tensors were already handled (e.g. pure NVFP4), skip
@@ -479,14 +580,25 @@ class ModelBase:
             elif quant_method == "compressed-tensors":
                 quant_format = quant_config["format"]
                 groups = quant_config["config_groups"]
+                group_formats = {
+                    group.get("format")
+                    for group in groups.values()
+                    if isinstance(group, dict)
+                }
                 nvfp4_compressed_tensors = (
                     quant_format == "nvfp4-pack-quantized"
                     or quant_format == "mixed-precision"
                     and bool(groups)
-                    and all(g.get("format") == "nvfp4-pack-quantized" for g in groups.values() if isinstance(g, dict))
+                    and "nvfp4-pack-quantized" in group_formats
                 )
 
-                if len(groups) > 1 and not nvfp4_compressed_tensors:
+                mixed_nvfp4_fp8 = (
+                    quant_format == "mixed-precision"
+                    and nvfp4_compressed_tensors
+                    and group_formats <= {"nvfp4-pack-quantized", "float-quantized"}
+                )
+
+                if len(groups) > 1 and not mixed_nvfp4_fp8:
                     raise NotImplementedError("Can't handle multiple config groups for compressed-tensors yet")
                 weight_config = tuple(groups.values())[0]["weights"]
 
@@ -508,6 +620,48 @@ class ModelBase:
                             self.model_tensors[weight_name] = lambda w=w, s=s: dequant_simple(w(), s(), block_size)
                             tensors_to_remove.append(name)
                             if self._fp8_as_q8 and is_fp8:
+                                self._fp8_dequantized.add(weight_name)
+                elif mixed_nvfp4_fp8:
+                    fp8_groups = [
+                        group
+                        for group in groups.values()
+                        if isinstance(group, dict) and group.get("format") == "float-quantized"
+                    ]
+                    if not fp8_groups:
+                        # A mixed-precision checkpoint may contain only NVFP4
+                        # groups. Those tensors were already consumed by
+                        # _generate_nvfp4_tensors().
+                        pass
+                    else:
+                        for group in fp8_groups:
+                            fp8_weight_config = group["weights"]
+                            if not (
+                                fp8_weight_config.get("type") == "float"
+                                and fp8_weight_config.get("num_bits") == 8
+                                and fp8_weight_config.get("strategy") == "channel"
+                                and fp8_weight_config.get("group_size") is None
+                                and fp8_weight_config.get("block_structure") is None
+                            ):
+                                raise NotImplementedError(
+                                    "Mixed compressed-tensors currently supports only "
+                                    "channel-scaled FP8 alongside NVFP4"
+                                )
+
+                        # NVFP4 tensors and their 2-D group scales have already
+                        # been removed. The remaining weight_scale tensors are
+                        # the channel scales for the FP8 matrices.
+                        for name in list(self.model_tensors.keys()):
+                            if not name.endswith(".weight_scale"):
+                                continue
+                            weight_name = name.removesuffix("_scale")
+                            if weight_name not in self.model_tensors:
+                                tensors_to_remove.append(name)
+                                continue
+                            w = self.model_tensors[weight_name]
+                            s = self.model_tensors[name]
+                            self.model_tensors[weight_name] = lambda w=w, s=s: dequant_simple(w(), s(), None)
+                            tensors_to_remove.append(name)
+                            if self._fp8_as_q8:
                                 self._fp8_dequantized.add(weight_name)
                 elif quant_format == "pack-quantized":
                     assert weight_config.get("strategy") == "group"
@@ -611,6 +765,43 @@ class ModelBase:
             raise ValueError(f"Can not map tensor {name!r}")
         return new_name
 
+    def prepare_qkv_fusion(self) -> None:
+        self._fusable_qkv_weight_layers.clear()
+        self._fusable_qkv_bias_layers.clear()
+        if not self.fuse_qkv or gguf.MODEL_TENSOR.ATTN_QKV not in gguf.MODEL_TENSORS[self.model_arch]:
+            return
+
+        qkv_types = {
+            gguf.MODEL_TENSOR.ATTN_Q,
+            gguf.MODEL_TENSOR.ATTN_K,
+            gguf.MODEL_TENSOR.ATTN_V,
+        }
+        weights: dict[int, set[gguf.MODEL_TENSOR]] = {}
+        biases: dict[int, set[gguf.MODEL_TENSOR]] = {}
+
+        for name in self.model_tensors:
+            mapped = self.tensor_map.get_type_and_name(name, try_suffixes=(".weight", ".bias"))
+            if mapped is None:
+                continue
+            tensor_type, new_name = mapped
+            if tensor_type not in qkv_types:
+                continue
+
+            bid = next((int(part) for part in new_name.split(".") if part.isdecimal()), None)
+            if bid is None:
+                continue
+            if new_name.endswith(".weight"):
+                weights.setdefault(bid, set()).add(tensor_type)
+            elif new_name.endswith(".bias"):
+                biases.setdefault(bid, set()).add(tensor_type)
+
+        for bid, weight_types in weights.items():
+            bias_types = biases.get(bid, set())
+            if weight_types == qkv_types and (not bias_types or bias_types == qkv_types):
+                self._fusable_qkv_weight_layers.add(bid)
+                if bias_types:
+                    self._fusable_qkv_bias_layers.add(bid)
+
     def set_gguf_parameters(self):
         raise NotImplementedError("set_gguf_parameters() must be implemented in subclasses")
 
@@ -639,6 +830,40 @@ class ModelBase:
                self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.FFN_UP_EXP, bid):
                 return []
 
+        # Handle Q/K/V tensor fusion if enabled
+        qkv_bid = next((int(part) for part in new_name.split(".") if part.isdecimal()), None) if self.fuse_qkv else None
+        if qkv_bid is not None:
+            is_bias = new_name.endswith('.bias')
+            suffix = '.bias' if is_bias else '.weight'
+            fusable_layers = self._fusable_qkv_bias_layers if is_bias else self._fusable_qkv_weight_layers
+            if qkv_bid not in fusable_layers:
+                return [(new_name, data_torch)]
+
+            buf_q = self._q_bias_buffer if is_bias else self._q_buffer
+            buf_k = self._k_bias_buffer if is_bias else self._k_buffer
+            buf_v = self._v_bias_buffer if is_bias else self._v_buffer
+
+            if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_Q, qkv_bid, suffix):
+                buf_q[qkv_bid] = data_torch
+            elif self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_K, qkv_bid, suffix):
+                buf_k[qkv_bid] = data_torch
+            elif self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_V, qkv_bid, suffix):
+                buf_v[qkv_bid] = data_torch
+
+            if qkv_bid in buf_q and qkv_bid in buf_k and qkv_bid in buf_v:
+                q_data = buf_q.pop(qkv_bid)
+                k_data = buf_k.pop(qkv_bid)
+                v_data = buf_v.pop(qkv_bid)
+                fused_data = torch.cat([q_data, k_data, v_data], dim=0)
+                fused_name = self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_QKV, qkv_bid, suffix=suffix)
+                logger.info(f"Fused Q, K, V {suffix[1:]} into QKV for layer {qkv_bid}")
+                return [(fused_name, fused_data)]
+
+            if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_Q, qkv_bid, suffix) or \
+               self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_K, qkv_bid, suffix) or \
+               self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_V, qkv_bid, suffix):
+                return []
+
         return [(new_name, data_torch)]
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
@@ -651,6 +876,43 @@ class ModelBase:
     # some models need extra generated tensors (like rope_freqs)
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         return ()
+
+    @staticmethod
+    def repack_mxfp4_blocks(packed: Tensor, scale: Tensor) -> np.ndarray:
+        """
+        Repack 4-bit MX weights into ggml `block_mxfp4`. Lossless - only moves bits.
+
+        Source (compressed-tensors "mxfp4-pack-quantized", also used by DeepSeek-V4):
+          packed  uint8 [rows, cols/2]  element 2i in the low nibble, 2i+1 in the high one
+          scale   uint8 [rows, cols/32] one E8M0 biased exponent per 32-element group
+
+        Destination, per group: one scale byte then 16 code bytes, where byte j holds
+        element j in the low nibble and element j+16 in the high one.
+
+        The 4-bit codes need no remapping: both sides index into ggml's kvalues_mxfp4
+        order. ggml doubles the kvalues and halves the scale, so the value is the same.
+        """
+        p = packed.contiguous().view(torch.uint8)
+        s = scale.contiguous().view(torch.uint8)
+
+        rows, packed_cols = p.shape
+        cols = packed_cols * 2
+        if cols % 32 != 0:
+            raise ValueError(f"MXFP4 source row has {cols} values, expected a multiple of 32")
+
+        n_blocks = cols // 32
+        if tuple(s.shape) != (rows, n_blocks):
+            raise ValueError(f"MXFP4 scale shape {tuple(s.shape)} does not match {(rows, n_blocks)}")
+
+        src = p.reshape(rows, n_blocks, 16)
+        lo = src & 0x0F           # elements 0, 2, 4, ...
+        hi = (src >> 4) & 0x0F    # elements 1, 3, 5, ...
+
+        vals = torch.stack((lo, hi), dim=-1).reshape(rows, n_blocks, 32)
+        qs = vals[:, :, :16] | (vals[:, :, 16:] << 4)
+
+        raw = torch.cat((s.unsqueeze(-1), qs.to(torch.uint8)), dim=-1)
+        return raw.reshape(rows, n_blocks * 17).cpu().numpy()
 
     @staticmethod
     def _nvfp4_pack(weight: Tensor, scale: Tensor) -> tuple[np.ndarray, list[int]]:
@@ -666,8 +928,11 @@ class ModelBase:
         w = weight.reshape(out_features, n_blocks, 8)
         vals = torch.stack([w & 0x0F, w >> 4], dim=-1).reshape(out_features, n_blocks, 16)
 
-        # Preserve original E4M3 scale bits as UE4M3 (strip sign bit)
-        d_ue = scale.view(torch.uint8).numpy().reshape(out_features, n_blocks) & 0x7F
+        # NVFP4 block scales are unsigned E4M3. Do not silently turn an
+        # incompatible negative source scale into a different positive value.
+        d_ue = scale.view(torch.uint8).numpy().reshape(out_features, n_blocks)
+        if np.any(d_ue & 0x80) or np.any(d_ue == 0x7F):
+            raise ValueError("NVFP4 block scales must be non-negative finite E4M3 values")
         qs = (vals[:, :, :8] | (vals[:, :, 8:] << 4)).to(torch.uint8).numpy()
 
         # Pack into super-blocks: [4 UE4M3 scales, 32 qs bytes] = 36 bytes per 64 elements
@@ -708,9 +973,16 @@ class ModelBase:
             weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
             scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
 
-            # Skip non-NVFP4 tensors (e.g. FP8 with per-channel 1D scales)
-            if scale.ndim < 2:
+            # Packed NVFP4 weights are byte tensors. Scale rank is not a safe
+            # discriminator: a channel-scaled FP8 matrix may store [N, 1]
+            # scales (notably an untied LM head).
+            if weight.dtype != torch.uint8:
                 continue
+
+            if (self.hparams.get("quantization_config") or {}).get("quant_method") == "compressed-tensors":
+                group = self._compressed_tensor_group(name.removesuffix(".weight"))
+                if group is None or group.get("format") != "nvfp4-pack-quantized":
+                    raise ValueError(f"packed tensor {name!r} is not assigned to a supported NVFP4 group")
 
             scale2 = LazyTorchTensor.to_eager(self.model_tensors.get(scale2_name, lambda: torch.tensor(1.0))())
             input_scale = LazyTorchTensor.to_eager(self.model_tensors.get(input_scale_name, lambda: torch.tensor(1.0))())
@@ -815,7 +1087,11 @@ class ModelBase:
             quant_format == "nvfp4-pack-quantized"
             or quant_format == "mixed-precision"
             and bool(quant_groups)
-            and all(g.get("format") == "nvfp4-pack-quantized" for g in quant_groups.values() if isinstance(g, dict))
+            and any(
+                g.get("format") == "nvfp4-pack-quantized"
+                for g in quant_groups.values()
+                if isinstance(g, dict)
+            )
         )
         if quant_algo != "NVFP4":
             if nvfp4_compressed_tensors:
@@ -823,7 +1099,7 @@ class ModelBase:
             elif any(str(v.get("quant_algo")).endswith("NVFP4") for v in quant_layers.values() if isinstance(v, dict)):
                 quant_algo = "NVFP4"
 
-        self._is_nvfp4 = quant_algo == "NVFP4"
+        self._is_nvfp4 = quant_algo in ("NVFP4", "W4A16_NVFP4")
         self._is_mxfp4 = quant_method == "mxfp4"
 
         # NVFP4 weights are repacked and written directly to gguf_writer.
@@ -853,8 +1129,14 @@ class ModelBase:
                         if input_scale_name not in self.model_tensors:
                             self.model_tensors[input_scale_name] = inverse_scale(self.model_tensors.pop(name))
             self._generate_nvfp4_tensors()
+            if not self._fp8_as_q8:
+                self._generate_fp8_channel_tensors()
+        elif quant_method == "compressed-tensors" and not self._fp8_as_q8:
+            self._generate_fp8_channel_tensors()
 
         self.dequant_model()
+
+        self.prepare_qkv_fusion()
 
         # Handle empty tensor_map for models with block_count=0 (like MobileNetV5)
         if self.tensor_map.mapping:
@@ -963,12 +1245,16 @@ class ModelBase:
                     else:
                         raise ValueError(f"Unknown file type: {self.ftype.name}")
 
+                # a chunked tensor quantizes as one chunk at a time, while it is written
+                quantize = data.quantize if isinstance(data, gguf.LazyChunkedTensor) else (
+                    lambda qtype, d=data: gguf.quants.quantize(d, qtype))
+
                 try:
-                    data = gguf.quants.quantize(data, data_qtype)
+                    data = quantize(data_qtype)
                 except gguf.QuantError as e:
                     logger.warning("%s, %s", e, "falling back to F16")
                     data_qtype = gguf.GGMLQuantizationType.F16
-                    data = gguf.quants.quantize(data, data_qtype)
+                    data = quantize(data_qtype)
 
                 shape = gguf.quant_shape_from_byte_shape(data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
 
@@ -979,6 +1265,13 @@ class ModelBase:
                 logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
 
                 self.gguf_writer.add_tensor(new_name, data, raw_dtype=data_qtype)
+
+        qkv_buffers = (
+            self._q_buffer, self._k_buffer, self._v_buffer,
+            self._q_bias_buffer, self._k_bias_buffer, self._v_bias_buffer,
+        )
+        if any(qkv_buffers):
+            raise ValueError("QKV fusion did not consume all buffered tensors")
 
     def set_type(self):
         self.gguf_writer.add_type(gguf.GGUFType.MODEL)
@@ -1002,6 +1295,8 @@ class ModelBase:
                 self.ftype = gguf.LlamaFileType.MOSTLY_NVFP4
             elif self._is_mxfp4:
                 self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE
+            elif self._has_fp8_channel:
+                self.ftype = gguf.LlamaFileType.MOSTLY_F8_E4M3
 
         # Generate parameter weight class (useful for leader boards) if not yet determined
         if self.metadata.size_label is None and total_params > 0:
@@ -1041,6 +1336,24 @@ class ModelBase:
         return part_names
 
     @staticmethod
+    def load_hparams_guess(dir_model: Path) -> dict[str, Any] | None:
+        # some models ship no config.json, will try to guess them
+        from conversion import load_all_models
+        load_all_models()
+
+        for matcher, loader in ModelBase._hparams_loaders:
+            if matcher(dir_model):
+                return loader(dir_model)
+        return None
+
+    @classmethod
+    def register_hparams_loader(cls, matcher: HparamsMatcher) -> Callable[[HparamsLoader], HparamsLoader]:
+        def inner(loader: HparamsLoader) -> HparamsLoader:
+            cls._hparams_loaders.append((matcher, loader))
+            return loader
+        return inner
+
+    @staticmethod
     def load_hparams(dir_model: Path, is_mistral_format: bool):
         if is_mistral_format:
             with open(dir_model / "params.json", "r", encoding="utf-8") as f:
@@ -1053,6 +1366,10 @@ class ModelBase:
             config = AutoConfig.from_pretrained(dir_model, trust_remote_code=False).to_dict()
         except Exception as e:
             logger.warning(f"Failed to load model config from {dir_model}: {e}")
+            if not (dir_model / "config.json").is_file():
+                config = ModelBase.load_hparams_guess(dir_model)
+                if config is not None:
+                    return config
             logger.warning("Trying to load config.json instead")
             with open(dir_model / "config.json", "r", encoding="utf-8") as f:
                 config = json.load(f)
@@ -1081,6 +1398,14 @@ class ModelBase:
             model_type = ModelType.MMPROJ if modelcls.model_arch == gguf.MODEL_ARCH.MMPROJ else ModelType.TEXT
             for name in names:
                 cls._model_classes[model_type][name] = modelcls
+            return modelcls
+        return func
+
+    @classmethod
+    def example(cls, *hf_repos: str) -> Callable[[AnyModel], AnyModel]:
+        del hf_repos  # unused
+
+        def func(modelcls: AnyModel) -> AnyModel:
             return modelcls
         return func
 
@@ -1156,7 +1481,7 @@ class TextModel(ModelBase):
                 or "projector." in name or "pre_mm_projector_norm" in name \
                 or "image_newline" in name or "view_seperator" in name \
                 or "patch_embed" in name or "patch_embedding" in name \
-                or "patch_merger." in name or "model.connector." in name:
+                or "patch_merger." in name or "patch_merge_mlp." in name or "model.connector." in name:
             return None
 
         return super().filter_tensors(item)
@@ -1203,7 +1528,7 @@ class TextModel(ModelBase):
             self.gguf_writer.add_embedding_length(n_embd)
             logger.info(f"gguf: embedding length = {n_embd}")
 
-        if (n_ff := self.find_hparam(["prefix_dense_intermediate_size", "intermediate_size", "n_inner", "hidden_dim"], optional=True)) is not None:
+        if (n_ff := self.find_hparam(["prefix_dense_intermediate_size", "dense_intermediate_size", "intermediate_size", "n_inner", "hidden_dim"], optional=True)) is not None:
             self.gguf_writer.add_feed_forward_length(n_ff)
             logger.info(f"gguf: feed forward length = {n_ff}")
 
@@ -1430,6 +1755,9 @@ class TextModel(ModelBase):
         if chkhsh == "bba3b3366b646dbdded5dbc42d59598b849371afc42f7beafa914afaa5b70aa6":
             # ref: https://huggingface.co/tencent/Hunyuan-4B-Instruct
             res = "hunyuan-dense"
+        if chkhsh == "e6ddf9c6686791c12d698d34c31ab9be1fea9af5a3d9a6909783ab382198ae1c":
+            # ref: https://huggingface.co/tencent/Hy4-preview
+            res = "hy_v4"
         if chkhsh == "a6b57017d60e6edb4d88ecc2845188e0eb333a70357e45dcc9b53964a73bbae6":
             # ref: https://huggingface.co/tiiuae/Falcon-H1-0.5B-Base
             res = "falcon-h1"
@@ -1463,6 +1791,9 @@ class TextModel(ModelBase):
         if chkhsh == "9e454714343b69b99b71795c1d27a68c2a1d15dab111f4d353109f966af29da7":
             # ref: https://huggingface.co/LiquidAI/LFM2.5-8B-A1B
             res = "lfm2"
+        if chkhsh == "0a766d034107bc736a3f2dc4968fd62e54a3570f1454443e0c5a4cc6bd7941ed":
+            # ref: https://huggingface.co/XHToken/Spark-X2.5-1.7B
+            res = "spark2_5"
         if chkhsh == "0ef9807a4087ebef797fc749390439009c3b9eda9ad1a097abbe738f486c01e5":
             # ref: https://huggingface.co/meta-llama/Meta-Llama-3-8B
             res = "llama-bpe"
@@ -2633,7 +2964,10 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
     # Step3-VL keeps text config under text_config but uses a custom top-level architecture.
     # For text conversion we route to a dedicated text-only class.
     # TODO: refactor this later to avoid adding exception here
-    if model_type == ModelType.TEXT and arch in ("StepVLForConditionalGeneration", "Sarashina2VisionForCausalLM", "Exaone4_5_ForConditionalGeneration", "Step3p7ForConditionalGeneration"):
+    # Kimi-K3's text_config reports "KimiLinearForCausalLM", which is the older
+    # Kimi-Linear-48B architecture and cannot load K3 (no attention residuals,
+    # latent MoE, situ, ...). Route on the top-level architecture instead.
+    if model_type == ModelType.TEXT and arch in ("StepVLForConditionalGeneration", "Sarashina2VisionForCausalLM", "Exaone4_5_ForConditionalGeneration", "Step3p7ForConditionalGeneration", "KimiK3ForConditionalGeneration"):
         return arch
 
     # if "architectures" is found in the sub-config, use that instead

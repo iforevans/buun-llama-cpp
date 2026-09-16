@@ -1,6 +1,9 @@
 *
 !*.*
 !snapshots/
+!fusion/
+!fixtures/
+!fixtures/*.json
 *.o
 ggml-common.h
 **/*.swp

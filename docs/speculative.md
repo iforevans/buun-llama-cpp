@@ -52,6 +52,66 @@ Supported EAGLE-3 draft models include:
 
 For the full and up-to-date list of supported models, see #18039.
 
+### Native MTP (`draft-mtp`)
+
+For single-head MTP with a separate draft cache (such as Qwen3.5/3.6/3.8),
+`llama-server` samples draft proposals at the request's temperature and verifies
+their probabilities against the target distribution. This is automatic for
+nonzero temperature, `top_k` from 1 to 64, and `--spec-draft-p-min 0` (the default).
+It uses the same runtime for embedded GGUF MTP, native safetensors MTP, and MTP
+sidecars, and works with adaptive draft depth. No additional flag is needed.
+
+Greedy requests, positive draft-confidence thresholds, Mirostat/adaptive-p,
+and shared-cache or chained-head MTP retain the existing drafting path. The
+probability-aware path preserves the target sampling distribution, not the exact
+seeded text of non-speculative decoding. Target penalties and filters still apply
+during verification; the draft need not use an identical sampling chain.
+
+Qwen3.5, Qwen3.6, and Qwen3.8 27B models can use their native next-token-prediction
+layer as an external MTP sidecar. For a standalone Qwen-27B MTP GGUF with a full
+output head, `llama-server` automatically creates a smaller derived sidecar in the
+llama.cpp cache directory. The original GGUF is never modified. Subsequent starts
+reuse the derivative.
+
+The derivative scores a frequency-ranked 32,768-token subset in the draft model and
+maps those logits back to the full target vocabulary with `d2t`. The map is the
+MIT-licensed [public balanced map](https://huggingface.co/Avifenesh/memra-bench/blob/main/mtp-Qwen3.6-27B-Q4_K_M-frspec-balanced32768.gguf)
+from Avifenesh/memra-bench, built from a reproducible 50/50 code-prose corpus for
+the Qwen3.6/3.8 tokenizer family. The target
+model still verifies every proposed token over its complete vocabulary, so speculative
+decoding remains lossless; an omitted draft token can reduce acceptance but does
+not restrict the target's output vocabulary or sampling distribution.
+
+```bash
+llama-server -m Qwen3.8-27B.gguf -md mtp-Qwen3.8-27B.gguf \
+    --spec-type draft-mtp --spec-mtp-vocab-size 32768
+```
+
+`--spec-mtp-vocab-size` defaults to the measured 32768 map. `0` disables automatic
+repacking. Smaller prefixes are intentionally not exposed: on Qwen3.8-27B with a
+Q4_K_M MTP head, 16K and 8K lost more draft acceptance than their smaller heads saved.
+Unsupported architectures, model sizes, split files, and already-trimmed sidecars
+fall back to their original behavior.
+
+Qwen3.8-Flash-Next uses the official MTP sidecars published with the
+[Unsloth GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF). Prefer the
+`shared-Q8_0` sidecar on memory-constrained GPUs: it borrows the target model's
+embedding and output tensors instead of loading duplicate copies. The target must
+remain loaded for the lifetime of the sidecar. A shared sidecar therefore cannot be
+loaded as a standalone target, and mismatched target tensor shapes are rejected.
+
+```bash
+llama-server -m Qwen3.8-Flash-Next.gguf \
+    -md mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+    --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0
+```
+
+This path is intended primarily for low-concurrency serving. CUDA graphs keep a
+bounded cache for the alternating verification shapes, and the Qwen4 recurrent and
+PLE convolution histories are included in partial rollback. For byte-for-byte
+speculative/non-speculative comparisons, also pass `--ctx-checkpoints 0` so server
+prompt-checkpoint recomputation does not introduce an independent numerical change.
+
 ### DFlash (`draft-dflash`)
 
 DFlash produces an entire block of draft tokens in a single forward pass (block diffusion) and
@@ -74,9 +134,105 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
+#### DFlash2
+
+DFlash2 sidecars use the shared `draft-dflash` runtime. Their learned grouped
+convolutions and candidate selector are detected from GGUF metadata. Every
+backbone position and the selector's complete adjacent-candidate score lattice
+run in parallel; only the final path walk is sequential. At nonzero temperature,
+the selector also supplies its proposal probabilities to exact p/q speculative
+verification.
+
+```bash
+python convert_hf_to_gguf.py z-lab/Qwen3.8-27B-DFlash2 \
+    --target-model-dir Qwen/Qwen3.8-27B --outtype q8_0 --outfile Qwen3.8-27B-DFlash2-Q8_0.gguf
+
+llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2-Q8_0.gguf \
+    -fa on --jinja
+```
+
+The server detects DFlash2 from the sidecar, so `-md` does not require an
+explicit `--spec-type`. Unless `--spec-draft-n-max` is supplied, it also selects
+the sidecar's fastest measured full draft depth. The released Qwen3.8 sidecar
+advertises an eight-position block; the runtime defaults that geometry to the
+faster measured `anchor + 12` block. `--spec-dflash-default` remains a compatible
+spelling. Set
+`GGML_DFLASH2_BLOCK_SIZE_OVERRIDE=8` to restore the checkpoint metadata, or use
+another value from 3 through 64 for experimentation:
+
+```bash
+GGML_DFLASH2_BLOCK_SIZE_OVERRIDE=8 llama-server \
+    -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2-Q8_0.gguf \
+    -fa on --jinja
+```
+
+The shared driver keeps independent adaptive-depth and proposal state for every
+server slot, and batches armed slots into one drafter decode. The legacy
+`--dflash-max-slots` cap does not apply to it. Tensor-sharded targets are
+supported; the sidecar itself falls back to layer placement and can be pinned
+with `--spec-draft-device`. Adaptive depth is enabled by default; set
+`GGML_DFLASH_DRAFT_ADAPTIVE=0` to hold every cycle at the configured maximum.
+By default, DFlash2 matches the server's resolved main sampling temperature
+(the target GGUF default, or an explicit `--temp`). Use `--spec-draft-temp T`
+to override it; an explicit value of `0` keeps greedy draft proposals. Legacy
+DFlash sidecars retain their greedy default.
+
+CopySpec can be composed with DFlash2 explicitly using
+`--spec-type draft-dflash,copyspec`. It is not enabled automatically: on an RTX
+3090 copy-heavy passage it improved 242.05 to 337.52 t/s, while the standard
+quicksort probe fell from 217.67 to 199.97 t/s. Both fixed-seed comparisons
+produced identical target output. Use the combination for workloads that often
+repeat long spans from their input, not as a general DFlash2 default.
+
+`--mmproj-gpu-swap` can unload and recreate an external DFlash sidecar around
+image encoding. On NVIDIA Ampere, `GGML_DFLASH2_TARGET_MMQ=1` experimentally
+forces MMQ for pure DFlash2 verification batches; benchmark it on the intended
+model and batch width. It can change greedy trajectories at close decisions, so
+ordinary CUDA dispatch remains the default. A DFlash2 selector score is not an
+independent-token probability, so `--spec-draft-p-min` is ignored for these
+sidecars. The learned selector is required model computation, so ordinary DFlash's
+`--no-spec-draft-backend-sampling` and `GGML_DFLASH_DRAFT_GPUSAMPLE=0` controls
+do not disable it.
+
 See:
 
 - #22105
+
+### DSpark (`draft-dspark`)
+
+DSpark extends DFlash with a semi-autoregressive _Markov head_: the draft still emits a whole
+block per forward pass, but each block position's logits are biased by a low-rank term keyed on
+the previous token, chained in-graph across the block. This keeps drafting at one decode per
+block while recovering some of the left-to-right signal that pure block diffusion loses.
+
+The draft is a small DeepSpec checkpoint trained for a specific target (for example
+[`deepseek-ai/dspark_qwen3_4b_block7`](https://huggingface.co/deepseek-ai/dspark_qwen3_4b_block7)
+for `Qwen/Qwen3-4B`). Convert it with `--target-model-dir` so it inherits the target's tokenizer
+and token embeddings:
+
+```bash
+python convert_hf_to_gguf.py deepseek-ai/dspark_qwen3_4b_block7 \
+    --target-model-dir Qwen/Qwen3-4B --outtype bf16 --outfile Qwen3-4B-DSpark.gguf
+
+llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
+    --spec-type draft-dspark --spec-draft-n-max 7 -fa on --jinja
+```
+
+`--spec-draft-n-max` is clamped to the draft model's trained block size.
+
+`--spec-draft-conf-min P` truncates each drafted block at the first position whose predicted
+acceptance (from the draft's confidence head, if present) falls below `P` (default 0 = disabled).
+
+Currently only drafts with a Qwen3 backbone are supported; support for other backbones
+(e.g. Gemma4) is planned.
+
+DSpark drafts exported in the [speculators](https://github.com/vllm-project/speculators) format
+(for example [`RedHatAI/gemma-4-31B-it-speculator.dspark`](https://huggingface.co/RedHatAI/gemma-4-31B-it-speculator.dspark))
+convert the same way.
+
+See:
+
+- #25173
 
 ### n-gram Cache (`ngram-cache`)
 
@@ -170,10 +326,25 @@ Example Video:
 
 If a draft model is combined with a draftless decoding the draftless decoding has higher precedence.
 
+### Backend Sampling
+
+Use `--backend-sampling` to run supported target-model samplers on the model backend. Draft-model sampling uses the backend by default and can be controlled with `--spec-draft-backend-sampling` and `--no-spec-draft-backend-sampling`.
+
+Unsupported samplers and device layouts fall back to CPU sampling. Tensor split mode does not support backend sampling. A fixed seed produces repeatable random draws, but stochastic CPU and backend sampling can still select different tokens because floating-point operations can differ between implementations and devices. Use greedy sampling when exact output matching is required.
+
+### Synthetic Acceptance
+
+`llama-server` and `llama-cli` can replace normal speculative verification with synthetic decisions for benchmarking. The generated output is not valid model output because accepted draft tokens do not have to match the target model.
+
+Use exactly one of these options:
+
+- `--spec-synth-rates P0,P1,...` sets unconditional per-position acceptance probabilities. Entry `i` is the probability that the first `i+1` draft tokens are all accepted. The number of entries must match the effective maximum draft length. Values must be finite, within `[0, 1]`, and monotonically non-increasing.
+- `--spec-synth-len L` sets the target mean acceptance length, including the target token. For `K` maximum draft tokens, `L` must be within `[1, K+1]`. The server finds a constant conditional probability `p` such that `p + p^2 + ... + p^K = L - 1`, then uses unconditional rates `[p, p^2, ..., p^K]`.
+
 ### General Speculative Parameters
 
 ```
---spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
+--spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
                                         comma-separated list of types of speculative decoding to use
                                         (default: none)
                                         (env: LLAMA_ARG_SPEC_TYPE)
@@ -196,6 +367,10 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
+--spec-mtp-vocab-size                   N
+                                        Qwen-27B MTP public balanced vocabulary; 0 disables, 32768 enables
+                                        (default: 32768)
+                                        (env: LLAMA_ARG_SPEC_MTP_VOCAB_SIZE)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)
@@ -314,6 +489,7 @@ Specifies a comma-separated list of speculative decoding types to use.
 | `draft-simple` | Use a simple draft model for speculation |
 | `draft-eagle3` | Use an EAGLE-3 draft model that reads the target's hidden states |
 | `draft-dflash` | Use a DFlash block-diffusion draft model that emits a block per step |
+| `draft-dspark` | Use a DSpark draft model (DFlash backbone + semi-autoregressive Markov head) |
 | `draft-mtp` | Use Multi Token Prediction (MTP) heads from the main model |
 | `ngram-cache` | Use n-gram cache lookup |
 | `ngram-simple` | Use simple n-gram pattern matching |

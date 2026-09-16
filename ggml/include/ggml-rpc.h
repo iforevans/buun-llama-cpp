@@ -6,15 +6,15 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    4
+#define RPC_PROTO_MAJOR_VERSION    6
 #define RPC_PROTO_MINOR_VERSION    0
-// 4: fork op enum (tree ops + TURBO_WHT) diverges from stock upstream wire ordering —
-//    stock patch version is 3; the fork must advertise a different patch version so a
-//    fork client can't false-match a stock rpc-server; fork-to-fork RPC only.
-#define RPC_PROTO_PATCH_VERSION    4
+// 6: the fork op enum (tree ops + TURBO_WHT + DSV4_HC_PARAMS) has a different wire
+//    ordering from protocol 5. The HELLO handshake checks major/minor only, so an enum
+//    change must bump the major version rather than just the informational patch field.
+#define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

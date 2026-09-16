@@ -270,6 +270,12 @@ int main(int argc, char * argv[]) {
             continue;
         }
 
+        // fork KV-cache codecs: no vec_dot by design (fused fattn decode) — the
+        // vec_dot benchmark below would call through NULL. Gated by the KLD suites.
+        if (ggml_is_turbo_kv_type(type)) {
+            continue;
+        }
+
         if (qfns_cpu->from_float && qfns->to_float) {
             printf("%s\n", ggml_type_name(type));
 

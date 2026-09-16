@@ -5,6 +5,8 @@
 
 #undef NDEBUG
 #include <assert.h>
+#include <algorithm>
+#include <cmath>
 #include <math.h>
 #include <stdio.h>
 #include <string>
@@ -32,9 +34,9 @@ static const char* RESULT_STR[] = {"ok", "FAILED"};
 
 
 // Generate synthetic data
-static void generate_data(float offset, size_t n, float * dst) {
+static void generate_data(float offset, size_t n, float * dst, float amplitude = 2.0f) {
     for (size_t i = 0; i < n; i++) {
-        dst[i] = 0.1 + 2*cosf(i + offset);
+        dst[i] = 0.1 + amplitude*cosf(i + offset);
     }
 }
 
@@ -83,23 +85,50 @@ static float dot_product(const float * a1, const float * a2, size_t test_size) {
 }
 
 // Total dot product error
-static float dot_product_error(const ggml_type_traits * qfns, const ggml_type_traits_cpu * qfns_cpu, size_t test_size, const float * test_data1, const float * test_data2) {
-    GGML_UNUSED(qfns);
-
-    std::vector<uint8_t> tmp_q1(2*test_size);
-    std::vector<uint8_t> tmp_q2(2*test_size);
-
+static float dot_product_error(const ggml_type_traits_cpu * qfns_cpu, ggml_type src0_type, size_t test_size,
+                               const float * test_data1, const float * test_data2,
+                               const float * test_data3, const float * test_data4,
+                               const int nrc) {
     const auto * vdot = ggml_get_type_traits_cpu(qfns_cpu->vec_dot_type);
+    const size_t pad  = 64;
+    const size_t bx   = ggml_row_size(src0_type, test_size) + pad;
+    const size_t by   = ggml_row_size(qfns_cpu->vec_dot_type, test_size) + pad;
+
+    std::vector<uint8_t> tmp_q1(bx * nrc);
+    std::vector<uint8_t> tmp_q2(by * nrc);
 
     qfns_cpu->from_float(test_data1, tmp_q1.data(), test_size);
     vdot->from_float(test_data2, tmp_q2.data(), test_size);
 
-    float result = INFINITY;
-    qfns_cpu->vec_dot(test_size, &result, 0, tmp_q1.data(), 0, tmp_q2.data(), 0, 1);
+    if (nrc == 1) {
+        float result = INFINITY;
+        qfns_cpu->vec_dot(test_size, &result, 0, tmp_q1.data(), 0, tmp_q2.data(), 0, 1);
 
-    const float dot_ref = dot_product(test_data1, test_data2, test_size);
+        const float dot_ref = dot_product(test_data1, test_data2, test_size);
+        return fabsf(result - dot_ref) / test_size;
+    }
 
-    return fabsf(result - dot_ref) / test_size;
+    // nrc == 2: kernel computes a 2x2 dot product matrix
+    // Output layout: s[0]=dot(vx0,vy0), s[1]=dot(vx1,vy0), s[bs]=dot(vx0,vy1), s[bs+1]=dot(vx1,vy1)
+    // row and output strides are padded, same as in the mul_mat path
+    qfns_cpu->from_float(test_data3, tmp_q1.data() + bx, test_size);
+    vdot->from_float(test_data4, tmp_q2.data() + by, test_size);
+
+    const size_t bs = 16;
+    std::vector<float> result(bs + 2, INFINITY);
+    qfns_cpu->vec_dot(test_size, result.data(), bs, tmp_q1.data(), bx, tmp_q2.data(), by, 2);
+
+    const float ref00 = dot_product(test_data1, test_data2, test_size);
+    const float ref10 = dot_product(test_data3, test_data2, test_size);
+    const float ref01 = dot_product(test_data1, test_data4, test_size);
+    const float ref11 = dot_product(test_data3, test_data4, test_size);
+
+    const auto err = [test_size](float val, float ref) {
+        const float e = fabsf(val - ref) / test_size;
+        return std::isfinite(e) ? e : INFINITY;
+    };
+
+    return std::max({err(result[0], ref00), err(result[1], ref10), err(result[bs], ref01), err(result[bs + 1], ref11)});
 }
 
 static int test_vec_dot_f32(bool verbose) {
@@ -126,6 +155,41 @@ static int test_vec_dot_f32(bool verbose) {
     return num_failed;
 }
 
+static int test_f8_e4m3_known_codes(bool verbose) {
+    const auto * traits = ggml_get_type_traits(GGML_TYPE_F8_E4M3);
+    const uint8_t codes[] = { 0x00, 0x01, 0x07, 0x08, 0x38, 0x77, 0x78, 0x7e, 0x80, 0xb8, 0xfe };
+    const float expected[] = {
+        0.0f, 0.001953125f, 0.013671875f, 0.015625f, 1.0f, 240.0f,
+        256.0f, 448.0f, -0.0f, -1.0f, -448.0f,
+    };
+    float actual[sizeof(codes)] = {};
+    traits->to_float(codes, actual, sizeof(codes));
+
+    int num_failed = 0;
+    for (size_t i = 0; i < sizeof(codes); ++i) {
+        const bool failed = actual[i] != expected[i] || (codes[i] == 0x80 && !signbit(actual[i]));
+        num_failed += failed;
+        if (failed || verbose) {
+            printf(" f8_e4m3 code 0x%02x:              %s (expected=%g got=%g)\n",
+                   codes[i], RESULT_STR[failed], expected[i], actual[i]);
+        }
+    }
+
+    const float infinities[] = { INFINITY, -INFINITY };
+    uint8_t     saturated[2] = {};
+    traits->from_float_ref(infinities, saturated, 2);
+    for (size_t i = 0; i < 2; ++i) {
+        const uint8_t expected_code = i == 0 ? 0x7e : 0xfe;
+        const bool    failed        = saturated[i] != expected_code;
+        num_failed += failed;
+        if (failed || verbose) {
+            printf(" f8_e4m3 infinity %zu:               %s (expected=0x%02x got=0x%02x)\n", i,
+                   RESULT_STR[failed], expected_code, saturated[i]);
+        }
+    }
+    return num_failed;
+}
+
 static int test_vec_dot_q(bool verbose) {
     int num_failed = 0;
 
@@ -133,9 +197,13 @@ static int test_vec_dot_q(bool verbose) {
 
     std::vector<float> test_data(test_size);
     std::vector<float> test_data2(test_size);
+    std::vector<float> test_data3(test_size);
+    std::vector<float> test_data4(test_size);
 
     generate_data(0.0, test_data.size(), test_data.data());
     generate_data(1.0, test_data2.size(), test_data2.data());
+    generate_data(3.0, test_data3.size(), test_data3.data(), 1.0f);
+    generate_data(4.0, test_data4.size(), test_data4.data(), 1.5f);
 
     for (int i = 0; i < GGML_TYPE_COUNT; i++) {
         ggml_type type = (ggml_type) i;
@@ -144,6 +212,14 @@ static int test_vec_dot_q(bool verbose) {
 
         // deprecated - skip
         if (qfns->blck_size == 0) {
+            continue;
+        }
+
+        // fork KV-cache codecs (turbo/TCQ) are not weight-quant types: they have no
+        // vec_dot by design (decode is fused inside flash-attention) and their error
+        // profile is defined on FWHT-rotated distributions, not this test's raw data.
+        // They are gated by the KLD suites; running them here null-calls vec_dot.
+        if (ggml_is_turbo_kv_type(type)) {
             continue;
         }
 
@@ -159,6 +235,7 @@ static int test_vec_dot_q(bool verbose) {
                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                type == GGML_TYPE_Q2_0_G128 ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
@@ -178,13 +255,13 @@ static int test_vec_dot_q(bool verbose) {
                 printf("%5s reference implementation error: %s (%f)\n", ggml_type_name(type), RESULT_STR[failed], reference_error);
             }
 
-            const float vec_dot_error = dot_product_error(qfns, qfns_cpu, test_size, test_data.data(), test_data2.data());
+            const float vec_dot_error = dot_product_error(qfns_cpu, type, test_size, test_data.data(), test_data2.data(), nullptr, nullptr, 1);
             const float max_allowed_error = type == GGML_TYPE_Q2_K || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS ||
                 type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S
                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
                 : type == GGML_TYPE_Q1_0
                 ? MAX_DOT_PRODUCT_ERROR_BINARY
-                : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0
+                : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_0_G128
                 ? MAX_DOT_PRODUCT_ERROR_TERNARY
                 : type == GGML_TYPE_NVFP4
                 ? MAX_DOT_PRODUCT_ERROR_FP4
@@ -193,6 +270,16 @@ static int test_vec_dot_q(bool verbose) {
             num_failed += failed;
             if (failed || verbose) {
                 printf("%5s dot product error:              %s (%f)\n", ggml_type_name(type), RESULT_STR[failed], vec_dot_error);
+            }
+
+            // Test nrc=2 path for types that support it
+            if (qfns_cpu->nrows == 2) {
+                const float vec_dot_error_nrc2 = dot_product_error(qfns_cpu, type, test_size, test_data.data(), test_data2.data(), test_data3.data(), test_data4.data(), 2);
+                failed = !(vec_dot_error_nrc2 < max_allowed_error);
+                num_failed += failed;
+                if (failed || verbose) {
+                    printf("%5s dot product error (nrc=2):    %s (%f)\n", ggml_type_name(type), RESULT_STR[failed], vec_dot_error_nrc2);
+                }
             }
         }
     }
@@ -220,6 +307,7 @@ int main(int argc, char * argv[]) {
     int num_failed = 0;
 
     num_failed += test_vec_dot_f32(verbose);
+    num_failed += test_f8_e4m3_known_codes(verbose);
     num_failed += test_vec_dot_q(verbose);
 
     if (num_failed || verbose) {

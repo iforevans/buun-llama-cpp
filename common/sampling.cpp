@@ -12,6 +12,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -111,6 +112,11 @@ struct ring_buffer {
 struct common_sampler {
     common_params_sampling params;
 
+    // True when the configured chain is provably equivalent to selecting the
+    // largest raw model logit. Computed once from the chain configuration at
+    // construction so callers do not have to duplicate sampler semantics.
+    bool raw_argmax_exact;
+
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
@@ -121,10 +127,18 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // Independent randomness for maximal-coupling speculative verification.
+    // The ordinary sampler still runs once per verified row, so all configured
+    // sampler RNGs advance exactly once; these draws choose accept/reject and,
+    // on rejection, the residual p-q distribution.
+    uint32_t speculative_seed;
+    std::mt19937 speculative_rng;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
+        speculative_rng.seed(speculative_seed);
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -161,6 +175,16 @@ struct common_sampler {
         cur_p = { cur.data(), cur.size(), -1, false };
     }
 
+    void set_logits(const float * logits, size_t n_logits) {
+        GGML_ASSERT(logits != nullptr && n_logits > 0);
+        cur.resize(n_logits);
+        for (size_t token_id = 0; token_id < n_logits; ++token_id) {
+            cur[token_id] = llama_token_data{
+                llama_token(token_id), logits[token_id], 0.0f };
+        }
+        cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
     common_time_meas tm() {
         return common_time_meas(t_total_us, params.no_perf);
     }
@@ -184,9 +208,21 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
-struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
+struct common_sampler * common_sampler_init(
+        const struct llama_model * model,
+        struct common_params_sampling & params) {
+    if (!std::isfinite(params.penalty_repeat) ||
+        params.penalty_repeat <= 0.0f ||
+        !std::isfinite(1.0f/params.penalty_repeat)) {
+        throw std::invalid_argument("penalty_repeat must be finite and greater than 0");
+    }
+    if (!std::isfinite(params.penalty_freq)) {
+        throw std::invalid_argument("penalty_freq must be finite");
+    }
+    if (!std::isfinite(params.penalty_present)) {
+        throw std::invalid_argument("penalty_present must be finite");
+    }
     const llama_vocab * vocab = llama_model_get_vocab(model);
-
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
     lparams.no_perf = params.no_perf;
@@ -309,7 +345,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (need_rbudget_for_grammar || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
         rbudget = common_reasoning_budget_init(
             vocab,
-            params.reasoning_budget_start,
+            {params.reasoning_budget_start},
             params.reasoning_budget_end,
             params.reasoning_budget_forced,
             params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
@@ -320,8 +356,19 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         }
     }
 
-    if (params.has_logit_bias()) {
-        samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), params.logit_bias.size(), params.logit_bias.data()));
+    // logit bias: user biases + model suppress tokens (-INFINITY)
+    {
+        std::vector<llama_logit_bias> merged = params.logit_bias;
+
+        int32_t n_suppress = 0;
+        const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        for (int32_t i = 0; i < n_suppress; ++i) {
+            merged.push_back({ suppress[i], -INFINITY });
+        }
+
+        if (!merged.empty()) {
+            samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+        }
     }
 
     if (params.mirostat == 0) {
@@ -337,7 +384,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
                         for (const auto & str : params.dry_sequence_breakers) {
                             c_breakers.push_back(str.c_str());
                         }
-                        samplers.push_back(llama_sampler_init_dry(vocab, llama_model_n_ctx_train(model), params.dry_multiplier, params.dry_base, params.dry_allowed_length, params.dry_penalty_last_n, c_breakers.data(), c_breakers.size()));
+                        samplers.push_back(llama_sampler_init_dry(vocab, params.dry_multiplier, params.dry_base, params.dry_allowed_length, params.dry_penalty_last_n, c_breakers.data(), c_breakers.size()));
                     }
                     break;
                 case COMMON_SAMPLER_TYPE_TOP_K:
@@ -365,7 +412,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
                     samplers.push_back(llama_sampler_init_infill(vocab));
                     break;
                 case COMMON_SAMPLER_TYPE_PENALTIES:
-                    samplers.push_back(llama_sampler_init_penalties(params.penalty_last_n, params.penalty_repeat, params.penalty_freq, params.penalty_present));
+                    samplers.push_back(llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), params.penalty_last_n, params.penalty_repeat, params.penalty_freq, params.penalty_present));
                     break;
                 case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
                     // the `adaptive-p` sampler is like `dist` and `mirostat` in that it selects
@@ -411,17 +458,68 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         params.backend_sampling = false;
     }
 
+    uint32_t speculative_seed = llama_sampler_get_seed(chain);
+    if (speculative_seed == LLAMA_DEFAULT_SEED) {
+        speculative_seed = params.seed;
+    }
+    // Keep the verifier stream distinct from the target sampler stream even
+    // when both originate from the same request seed.
+    speculative_seed ^= 0x9e3779b9U;
+
     auto * result = new common_sampler {
         /* .params  = */ params,
+        /* .raw_argmax_exact = */ false,
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
         /* .chain   = */ chain,
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .speculative_seed = */ speculative_seed,
+        /* .speculative_rng  = */ std::mt19937(speculative_seed),
     };
 
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+    if (grmr == nullptr && rbudget == nullptr && n_suppress == 0 &&
+        params.temp <= 0.0f && params.dynatemp_range == 0.0f &&
+        params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f &&
+        params.penalty_present == 0.0f && params.dry_multiplier == 0.0f &&
+        params.xtc_probability == 0.0f && params.typ_p >= 1.0f &&
+        params.top_n_sigma < 0.0f && params.adaptive_target < 0.0f &&
+        params.mirostat == 0 && params.n_probs == 0 &&
+        params.logit_bias.empty()) {
+        bool has_greedy_selector = false;
+        bool supported = true;
+        for (const auto sampler : params.samplers) {
+            switch (sampler) {
+                case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                    has_greedy_selector = true;
+                    break;
+                case COMMON_SAMPLER_TYPE_PENALTIES:
+                case COMMON_SAMPLER_TYPE_DRY:
+                case COMMON_SAMPLER_TYPE_TOP_K:
+                case COMMON_SAMPLER_TYPE_TOP_P:
+                case COMMON_SAMPLER_TYPE_MIN_P:
+                case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                case COMMON_SAMPLER_TYPE_XTC:
+                case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                    break;
+                case COMMON_SAMPLER_TYPE_NONE:
+                case COMMON_SAMPLER_TYPE_INFILL:
+                case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
+                    supported = false;
+                    break;
+            }
+        }
+        result->raw_argmax_exact = supported && has_greedy_selector;
+    }
+
     return result;
+}
+
+bool common_sampler_raw_argmax_exact(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr && gsmpl->raw_argmax_exact;
 }
 
 void common_sampler_free(struct common_sampler * gsmpl) {
@@ -467,6 +565,17 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
 
     if (gsmpl->rbudget && is_generated) {
         llama_sampler_accept(gsmpl->rbudget, token);
+
+        // if done, replay end sequence which may contain a grammar trigger
+        const bool is_done = common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_DONE;
+        if (gsmpl->grmr && !accept_grammar && is_done) {
+            const llama_tokens * end_seq = common_reasoning_budget_get_end_match(gsmpl->rbudget);
+            if (end_seq) {
+                for (const llama_token end_token : *end_seq) {
+                    llama_sampler_accept(gsmpl->grmr, end_token);
+                }
+            }
+        }
     }
 
     if (gsmpl->grmr && accept_grammar) {
@@ -489,13 +598,36 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
         /* .params  = */ gsmpl->params,
+        /* .raw_argmax_exact = */ gsmpl->raw_argmax_exact,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .speculative_seed = */ gsmpl->speculative_seed,
+        /* .speculative_rng  = */ gsmpl->speculative_rng,
     };
+}
+
+void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+    if (!src || !dst || src == dst) {
+        return;
+    }
+
+    GGML_ASSERT((src->grmr == nullptr) == (dst->grmr == nullptr));
+    GGML_ASSERT((src->rbudget == nullptr) == (dst->rbudget == nullptr));
+
+    llama_sampler_copy(src->grmr,    dst->grmr);
+    llama_sampler_copy(src->rbudget, dst->rbudget);
+    llama_sampler_copy(src->chain,   dst->chain);
+
+    dst->params     = src->params;
+    dst->prev       = src->prev;
+    dst->cur        = src->cur;
+    dst->cur_p      = src->cur_p;
+    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->t_total_us = src->t_total_us;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -551,10 +683,12 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
-llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    llama_synchronize(ctx);
-
-    // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
+template <typename ResetLogits>
+static llama_token common_sampler_sample_impl(
+        struct common_sampler * gsmpl,
+        ResetLogits && reset_logits,
+        llama_token backend_sampled,
+        bool grammar_first) {
     const auto tm = gsmpl->tm();
 
     llama_token id = LLAMA_TOKEN_NULL;
@@ -564,12 +698,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    reset_logits();
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
-        id = llama_get_sampled_token_ith(ctx, idx);
+        id = backend_sampled;
 
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
@@ -618,7 +752,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
+    reset_logits();
 
     llama_sampler_apply(rbudget,  &cur_p);
 
@@ -635,15 +769,41 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
-    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    llama_synchronize(ctx);
 
+    // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
+    return common_sampler_sample_impl(
+        gsmpl,
+        [&]() { gsmpl->set_logits(ctx, idx); },
+        llama_get_sampled_token_ith(ctx, idx), grammar_first);
+}
+
+llama_token common_sampler_sample_from_logits(
+        struct common_sampler * gsmpl,
+        const float * logits,
+        size_t n_logits,
+        bool grammar_first) {
+    if (!gsmpl || !logits || n_logits == 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return common_sampler_sample_impl(
+        gsmpl,
+        [&]() { gsmpl->set_logits(logits, n_logits); },
+        LLAMA_TOKEN_NULL, grammar_first);
+}
+
+template <typename Sample>
+static std::vector<llama_token> common_sampler_sample_and_accept_n_impl(
+        struct common_sampler * gsmpl,
+        const llama_tokens & draft,
+        Sample && sample) {
     std::vector<llama_token> result;
-    result.reserve(idxs.size());
+    result.reserve(draft.size() + 1);
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = sample(i);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -655,7 +815,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = sample(i);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -665,6 +825,25 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return result;
 }
 
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    return common_sampler_sample_and_accept_n_impl(gsmpl, draft, [&](size_t i) {
+        return common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+    });
+}
+
+std::vector<llama_token> common_sampler_accept_draft(
+        struct common_sampler * gsmpl,
+        const llama_tokens & sampled,
+        const llama_tokens & draft) {
+    GGML_ASSERT(sampled.size() == draft.size() + 1 && "sampled.size() must be draft.size() + 1");
+
+    return common_sampler_sample_and_accept_n_impl(gsmpl, draft, [&](size_t i) {
+        return sampled[i];
+    });
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
     std::vector<int> idxs(draft.size() + 1);
     for (size_t i = 0; i < idxs.size(); ++i) {
@@ -672,6 +851,288 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+static double common_sampler_probability_sum(const llama_token_data_array * distribution) {
+    if (!distribution || distribution->size == 0) {
+        throw std::runtime_error("speculative distribution is empty");
+    }
+
+    double sum = 0.0;
+    for (size_t i = 0; i < distribution->size; ++i) {
+        const float probability = distribution->data[i].p;
+        if (!std::isfinite(probability) || probability < 0.0f) {
+            throw std::runtime_error("speculative distribution contains an invalid probability");
+        }
+        sum += probability;
+    }
+    if (!(sum > 0.0) || !std::isfinite(sum)) {
+        throw std::runtime_error("speculative distribution has zero mass");
+    }
+    return sum;
+}
+
+static double common_sampler_sparse_probability_sum(
+        const float * probabilities,
+        size_t        size) {
+    if (!probabilities || size == 0) {
+        throw std::runtime_error("sparse speculative distribution is empty");
+    }
+
+    double sum = 0.0;
+    for (size_t i = 0; i < size; ++i) {
+        if (!std::isfinite(probabilities[i]) || probabilities[i] < 0.0f) {
+            throw std::runtime_error("sparse speculative distribution contains an invalid probability");
+        }
+        sum += probabilities[i];
+    }
+    if (!(sum > 0.0) || !std::isfinite(sum)) {
+        throw std::runtime_error("sparse speculative distribution has zero mass");
+    }
+    return sum;
+}
+
+double common_sampler_speculative_acceptance_probability(
+        const llama_token_data_array * p,
+        llama_token                    proposed,
+        const int32_t *                q_ids,
+        const float *                  q_probs,
+        size_t                         q_size) {
+    if (!q_ids) {
+        throw std::runtime_error("sparse speculative distribution has no token IDs");
+    }
+
+    const double p_sum = common_sampler_probability_sum(p);
+    const double q_sum = common_sampler_sparse_probability_sum(q_probs, q_size);
+
+    double p_proposed = 0.0;
+    for (size_t i = 0; i < p->size; ++i) {
+        if (p->data[i].id == proposed) {
+            p_proposed = p->data[i].p / p_sum;
+            break;
+        }
+    }
+
+    double q_proposed = 0.0;
+    for (size_t i = 0; i < q_size; ++i) {
+        if (q_ids[i] == proposed) {
+            q_proposed = q_probs[i] / q_sum;
+            break;
+        }
+    }
+    if (!(q_proposed > 0.0)) {
+        throw std::runtime_error("proposed token has no sparse speculative probability");
+    }
+
+    return std::min(1.0, p_proposed / q_proposed);
+}
+
+llama_token common_sampler_speculative_sample_residual(
+        const llama_token_data_array * p,
+        const int32_t *                q_ids,
+        const float *                  q_probs,
+        size_t                         q_size,
+        double                         uniform_draw) {
+    if (!q_ids || !(uniform_draw >= 0.0 && uniform_draw < 1.0)) {
+        throw std::runtime_error("invalid sparse speculative residual input");
+    }
+
+    const double p_sum = common_sampler_probability_sum(p);
+    const double q_sum = common_sampler_sparse_probability_sum(q_probs, q_size);
+
+    std::unordered_map<llama_token, double> q_by_token;
+    q_by_token.reserve(q_size * 2);
+    for (size_t i = 0; i < q_size; ++i) {
+        if (!q_by_token.emplace(q_ids[i], q_probs[i] / q_sum).second) {
+            throw std::runtime_error("sparse speculative distribution contains duplicate token IDs");
+        }
+    }
+
+    const auto residual_weight = [&](const llama_token_data & candidate) {
+        const auto it = q_by_token.find(candidate.id);
+        const double q = it == q_by_token.end() ? 0.0 : it->second;
+        return std::max(0.0, candidate.p / p_sum - q);
+    };
+
+    double residual_sum = 0.0;
+    for (size_t i = 0; i < p->size; ++i) {
+        residual_sum += residual_weight(p->data[i]);
+    }
+    if (!(residual_sum > 0.0) || !std::isfinite(residual_sum)) {
+        throw std::runtime_error("speculative residual distribution is empty after rejection");
+    }
+
+    double threshold = uniform_draw * residual_sum;
+    llama_token fallback = LLAMA_TOKEN_NULL;
+    for (size_t i = 0; i < p->size; ++i) {
+        const double weight = residual_weight(p->data[i]);
+        if (weight > 0.0) {
+            fallback = p->data[i].id;
+        }
+        if (threshold < weight) {
+            return p->data[i].id;
+        }
+        threshold -= weight;
+    }
+
+    // Floating-point rounding can leave the threshold a few ulps above the
+    // cumulative sum. Return the final token with residual mass.
+    if (fallback != LLAMA_TOKEN_NULL) {
+        return fallback;
+    }
+    throw std::runtime_error("failed to sample speculative residual distribution");
+}
+
+llama_token common_sampler_proposal_row(
+        const llama_token_data_array & candidates,
+        float temp, float top_p, double uniform, float * q) {
+    if (!q || !candidates.data || candidates.size == 0 ||
+            !std::isfinite(temp) || temp <= 0 || !(top_p > 0 && top_p <= 1) ||
+            !(uniform >= 0 && uniform < 1)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const float max_logit = candidates.data[0].logit;
+    if (!std::isfinite(max_logit)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    double sum = 0;
+    for (size_t i = 0; i < candidates.size; ++i) {
+        const float logit = candidates.data[i].logit;
+        // Unmapped sidecar vocabulary entries have -inf logits (zero mass).
+        if (std::isnan(logit) || logit > max_logit) {
+            return LLAMA_TOKEN_NULL;
+        }
+        q[i] = std::exp((logit - max_logit) / temp);
+        sum += q[i];
+    }
+    double cumulative = 0;
+    size_t keep = candidates.size;
+    for (size_t i = 0; i < candidates.size; ++i) {
+        cumulative += q[i] / sum;
+        if (cumulative >= top_p) {
+            keep = i + 1;
+            break;
+        }
+    }
+    sum = 0;
+    for (size_t i = 0; i < keep; ++i) {
+        sum += q[i];
+    }
+    for (size_t i = 0; i < candidates.size; ++i) {
+        q[i] = i < keep ? q[i] / sum : 0;
+    }
+    for (size_t i = 0; i < keep; ++i) {
+        uniform -= q[i];
+        if (uniform < 0) {
+            return candidates.data[i].id;
+        }
+    }
+    return candidates.data[keep - 1].id;
+}
+
+bool common_sampler_sample_and_accept_n_q(
+        struct common_sampler *      gsmpl,
+        struct llama_context *       ctx,
+        const std::vector<int> &     idxs,
+        const llama_tokens &         draft,
+        int32_t                      top_k,
+        const std::vector<int32_t> & candidate_ids,
+        const std::vector<float> &   q_rows,
+        size_t                       q_covered,
+        std::vector<llama_token> &   result) {
+    if (!gsmpl || !ctx || idxs.size() != draft.size() + 1 ||
+            top_k <= 0 || q_covered == 0 || q_covered > draft.size() ||
+            q_covered > candidate_ids.size() / (size_t) top_k ||
+            q_rows.size() != candidate_ids.size() || candidate_ids.size() % top_k != 0) {
+        return false;
+    }
+
+    // These selectors update persistent adaptation state from the token they
+    // sampled inside apply(). Maximal coupling can choose a different token,
+    // so using their prepared distribution would corrupt that state. All
+    // ordinary truncation, penalty, XTC, grammar, and reasoning-budget paths
+    // update either before selection or from the subsequently accepted token.
+    if (gsmpl->params.mirostat != 0 ||
+            std::find(gsmpl->params.samplers.begin(), gsmpl->params.samplers.end(),
+                COMMON_SAMPLER_TYPE_ADAPTIVE_P) != gsmpl->params.samplers.end()) {
+        return false;
+    }
+
+    // Reject malformed q before advancing any sampler state. Duplicate IDs
+    // would make the sparse subtraction ambiguous, and every actually emitted
+    // draft token must have positive proposal mass in its row.
+    constexpr double q_sum_tol = 2e-4;
+    for (size_t row = 0; row < q_covered; ++row) {
+        double sum = 0.0;
+        bool found = false;
+        for (int32_t k = 0; k < top_k; ++k) {
+            const size_t i = row * (size_t) top_k + k;
+            const float q = q_rows[i];
+            if (candidate_ids[i] < 0 || !std::isfinite(q) || q < 0.0f) {
+                return false;
+            }
+            for (int32_t j = 0; j < k; ++j) {
+                if (candidate_ids[i] == candidate_ids[row * (size_t) top_k + j]) {
+                    return false;
+                }
+            }
+            sum += q;
+            found |= candidate_ids[i] == draft[row] && q > 0.0f;
+        }
+        if (!found || std::abs(sum - 1.0) > q_sum_tol) {
+            return false;
+        }
+    }
+
+    auto uniform = [&]() {
+        return std::generate_canonical<double, 53>(gsmpl->speculative_rng);
+    };
+
+    result.clear();
+    result.reserve(draft.size() + 1);
+
+    for (size_t row = 0; row < draft.size(); ++row) {
+        if (row >= q_covered) {
+            const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[row], true);
+            common_sampler_accept(gsmpl, id, true);
+            result.push_back(id);
+            if (id != draft[row]) {
+                return true;
+            }
+            continue;
+        }
+
+        // Run the real target sampler once. This both produces the fully
+        // transformed target distribution p (including grammar) and advances
+        // each configured sampler RNG once, just as non-speculative sampling
+        // would. The sampled token itself is only a discarded coupling draw.
+        common_sampler_sample(gsmpl, ctx, idxs[row], true);
+        const llama_token_data_array * p_data = common_sampler_get_candidates(gsmpl, false);
+        if (!p_data || p_data->size == 0) {
+            throw std::runtime_error("target sampler produced an empty speculative distribution");
+        }
+
+        const size_t q_off = row * (size_t) top_k;
+        const llama_token proposed = draft[row];
+        const double accept_p = common_sampler_speculative_acceptance_probability(
+                p_data, proposed, candidate_ids.data() + q_off, q_rows.data() + q_off, top_k);
+        llama_token id = proposed;
+        if (uniform() >= accept_p) {
+            id = common_sampler_speculative_sample_residual(
+                    p_data, candidate_ids.data() + q_off, q_rows.data() + q_off, top_k, uniform());
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        if (id != proposed) {
+            return true;
+        }
+    }
+
+    const llama_token bonus = common_sampler_sample(gsmpl, ctx, idxs[draft.size()], true);
+    common_sampler_accept(gsmpl, bonus, true);
+    result.push_back(bonus);
+    return true;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

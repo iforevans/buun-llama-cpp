@@ -10,7 +10,7 @@ function(llama_build source)
     endif()
 
     add_executable(${TEST_TARGET} ${TEST_SOURCES})
-    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common)
+    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common) # TODO: [TAG_TESTS_LLAMA_LINK]
     if (LLAMA_TESTS_INSTALL)
         install(TARGETS ${TEST_TARGET} RUNTIME)
     endif()
@@ -87,7 +87,7 @@ function(llama_build_and_test source)
     set(multiValueArgs ARGS)
     cmake_parse_arguments(LLAMA_TEST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
-    set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS} get-model.cpp)
+    set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS})
 
     if (NOT DEFINED LLAMA_TEST_LABEL)
         set(LLAMA_TEST_LABEL "main")
@@ -148,10 +148,197 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
-llama_build(test-recurrent-state-rollback.cpp get-model.cpp)
+llama_build_and_test(test-server-recurrent-expansion.cpp)
+target_include_directories(test-server-recurrent-expansion PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+
+llama_build_and_test(test-kv-cells.cpp)
+target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build(test-safetensors-registry.cpp)
+target_include_directories(test-safetensors-registry PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-safetensors-registry)
+llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+    llama_build_and_test(test-model-source-mmap.cpp)
+    llama_build_and_test(test-repack-cache.cpp)
+    target_include_directories(test-repack-cache PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
+    set_tests_properties(test-repack-cache PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    llama_build_and_test(test-safetensors-stream.cpp)
+    llama_build_and_test(test-safetensors-lazy.cpp)
+    llama_build_and_test(test-safetensors-repack-stream.cpp)
+    target_include_directories(test-safetensors-repack-stream PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_include_directories(test-safetensors-lazy PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    set_tests_properties(test-safetensors-lazy PROPERTIES SKIP_RETURN_CODE 77)
+    target_include_directories(test-safetensors-stream PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_include_directories(test-model-source-mmap PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+    set_tests_properties(test-model-source-mmap PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build_and_test(test-unicode.cpp)
+
+    llama_build(test-recurrent-state-rollback.cpp)
+    target_include_directories(test-recurrent-state-rollback PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build(test-vbr-swa-window.cpp)
+    target_include_directories(test-vbr-swa-window PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build(test-vbr-representation-epoch.cpp)
+    target_include_directories(test-vbr-representation-epoch PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-vbr-representation-identity.cpp)
+    target_include_directories(test-vbr-representation-identity PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    add_test(
+        NAME test-vbr-controller-identity-cpu
+        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --identity-cpu)
+    add_test(
+        NAME test-vbr-generation-tracker-cpu
+        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --generation-cpu)
+    add_test(
+        NAME test-vbr-operation-recovery-cpu
+        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --operation-cpu)
+
+    add_test(
+        NAME check-memory-tree-coverage
+        COMMAND ${CMAKE_COMMAND} -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/check-memory-tree-coverage.cmake)
+
+    llama_build_and_test(test-cache-accounting.cpp)
+    target_include_directories(test-cache-accounting PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(test-cache-budget.cpp)
+    target_include_directories(test-cache-budget PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(test-cache-authority.cpp)
+    target_include_directories(test-cache-authority PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(
+        test-vbr-artifact.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-vbr-proof.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-prompt-cache-payload.cpp)
+    target_include_directories(test-vbr-artifact PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    llama_build_and_test(test-vbr-artifact-adopt.cpp)
+    target_include_directories(test-vbr-artifact-adopt PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    set_property(TEST test-vbr-artifact-adopt APPEND PROPERTY LABELS vbr-cache)
+
+    llama_build_and_test(
+        test-vbr-artifact-capture.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-vbr-artifact-store.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-prompt-cache-payload.cpp)
+    target_include_directories(test-vbr-artifact-capture PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    llama_test_cmd(test-vbr-artifact
+        NAME test-vbr-capture-projection-scale
+        LABEL "vbr-cache;slow"
+        ARGS --capture-projection-bench)
+    llama_test_cmd(test-vbr-artifact-capture
+        NAME test-vbr-range-proof-scale
+        LABEL "vbr-cache;slow"
+        ARGS --range-pack-bench)
+    set_property(TEST test-vbr-artifact APPEND PROPERTY LABELS vbr-cache)
+    set_property(TEST test-vbr-artifact-capture APPEND PROPERTY LABELS vbr-cache)
+
+    llama_build_and_test(
+        test-cache-lease.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
+    target_include_directories(test-cache-lease PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
+    llama_build_and_test(
+        test-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
+    target_include_directories(test-cache-yield PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
+    llama_build_and_test(
+        test-retention-policy-corpus.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-retention-sidecar.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+    target_include_directories(test-retention-policy-corpus PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
+    llama_build_and_test(
+        test-cache-destruction-quote.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-retention-proof.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+    target_include_directories(test-cache-destruction-quote PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
+    llama_build_and_test(test-cache-plan-record.cpp)
+    target_include_directories(test-cache-plan-record PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(test-vbr-hard-seal.cpp)
+    target_include_directories(test-vbr-hard-seal PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(
+        test-cache-control.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-control.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-control-wire.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-retention-proof.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-vbr-proof.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-vbr-artifact-store.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-prompt-cache-payload.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-retention-sidecar.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
+    target_include_directories(test-cache-control PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    target_compile_definitions(test-cache-control PRIVATE
+        CACHE_CONTROL_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tests/fixtures/cache-control-v1.json")
+
+    llama_build_and_test(test-cache-plan-estimate.cpp)
+    target_include_directories(test-cache-plan-estimate PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(
+        test-cache-plan-authority.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+    target_include_directories(test-cache-plan-authority PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
+    llama_build_and_test(
+        test-cache-plan-preflight.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-preflight.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+    target_include_directories(test-cache-plan-preflight PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    target_compile_definitions(test-cache-plan-preflight PRIVATE
+        CACHE_PLAN_PREFLIGHT_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tests/fixtures/cache-plan-preflight-v1.json")
+
+    llama_build_and_test(
+        test-retention-sidecar.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-retention-sidecar.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+    target_include_directories(test-retention-sidecar PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    set_property(TEST test-retention-sidecar APPEND PROPERTY LABELS vbr-cache)
+    set_property(TEST test-vbr-controller-identity-cpu APPEND PROPERTY LABELS vbr-cache)
+    set_property(TEST test-vbr-generation-tracker-cpu APPEND PROPERTY LABELS vbr-cache)
+    set_property(TEST test-vbr-operation-recovery-cpu APPEND PROPERTY LABELS vbr-cache)
+
+    llama_build(test-dflash-tape-vs-plane.cpp)
+    target_include_directories(test-dflash-tape-vs-plane PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
@@ -161,11 +348,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
-    # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
-    if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
-        llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-        target_include_directories(test-json-schema-to-grammar PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    endif()
+    llama_build_and_test(test-json-schema-to-grammar.cpp)
 
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
@@ -194,7 +377,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
-    llama_build_and_test(test-llama-archs.cpp)
+    llama_build(test-llama-archs.cpp)
+    llama_build(test-lora-determinism.cpp)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -217,13 +401,91 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+
+    # test-vbr-representation-epoch requires an iSWA Gemma-4 fixture. test-llama-archs
+    # deliberately does not save Gemma-4 yet (its synthetic model/context support is
+    # incomplete), so registering this target against a generated non-iSWA model is
+    # a false gate. Hardware validation invokes the built binary with the canonical
+    # real Gemma-4 fixture explicitly.
+
+    set(LORA_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-lora-models/")
+    file(MAKE_DIRECTORY "${LORA_MODEL_DIR}")
+
+    llama_test(
+        test-llama-archs
+        NAME test-generate-lora-model
+        LABEL main
+        ARGS -a qwen35 -s 0 -o "${LORA_MODEL_DIR}"
+    )
+    set_tests_properties(test-generate-lora-model PROPERTIES
+        FIXTURES_SETUP generate-lora-model
+    )
+
+    llama_test(
+        test-lora-determinism
+        LABEL main
+        ARGS "${LORA_MODEL_DIR}/qwen35-dense.gguf" "${LORA_MODEL_DIR}"
+    )
+    set_tests_properties(test-lora-determinism PROPERTIES
+        FIXTURES_REQUIRED generate-lora-model
+    )
+
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-nemotron-h
+        LABEL main
+        ARGS -m "${MODEL_DIR}/nemotron_h-dense.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-nemotron-h PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-dsv4
+        LABEL main
+        ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-kimi-k3
+        LABEL main
+        ARGS -m "${MODEL_DIR}/kimi-k3-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-kimi-k3 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    foreach (MODEL qwen35-dense nemotron_h-dense deepseek4-moe kimi-k3-moe)
+        llama_test(
+            test-recurrent-state-rollback
+            NAME test-recurrent-state-pattern-${MODEL}
+            LABEL main
+            ARGS -m "${MODEL_DIR}/${MODEL}.gguf" --cache-pattern-fill)
+        set_tests_properties(test-recurrent-state-pattern-${MODEL} PROPERTIES
+            FIXTURES_REQUIRED generate-models)
+    endforeach()
+
+    # Test state save/load functionality across all architectures, using the generated dummy models
+    llama_test(
+        test-save-load-state
+        LABEL main
+        ARGS --models "${MODEL_DIR}" --fit off -ctk f16 -ctv f16
+    )
+    set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
+    llama_build(test-fusion.cpp)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
+llama_build_and_test(test-json-schema.cpp)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
+# debug tool for chat template differential analysis (not registered as a test, run it manually)
+llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
@@ -258,29 +520,322 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-llama-bench-vbr.cpp)
+llama_build_and_test(test-mtp-vocab-trim.cpp)
+if (MSVC)
+    target_compile_options(test-arg-parser PRIVATE /UNDEBUG)
+    target_compile_options(test-mtp-vocab-trim PRIVATE /UNDEBUG)
+else()
+    target_compile_options(test-arg-parser PRIVATE -UNDEBUG)
+    target_compile_options(test-mtp-vocab-trim PRIVATE -UNDEBUG)
+endif()
 llama_build_and_test(test-vbr-policy.cpp)
+llama_build_and_test(test-vbr-downward.cpp)
 llama_build_and_test(test-vbr-physical.cpp)
 llama_build_and_test(test-vbr-transaction.cpp)
 if (MSVC)
     target_compile_options(test-vbr-policy PRIVATE /UNDEBUG)
+    target_compile_options(test-vbr-downward PRIVATE /UNDEBUG)
     target_compile_options(test-vbr-physical PRIVATE /UNDEBUG)
     target_compile_options(test-vbr-transaction PRIVATE /UNDEBUG)
 else()
     target_compile_options(test-vbr-policy PRIVATE -UNDEBUG)
+    target_compile_options(test-vbr-downward PRIVATE -UNDEBUG)
     target_compile_options(test-vbr-physical PRIVATE -UNDEBUG)
     target_compile_options(test-vbr-transaction PRIVATE -UNDEBUG)
 endif()
+llama_build_and_test(test-model-resolution.cpp)
+add_executable(test-moe-metadata test-moe-metadata.cpp)
+target_link_libraries(test-moe-metadata PRIVATE llama)
+llama_test(test-moe-metadata)
+# the test serves its repos from an httplib server, and the library links it privately
+target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
-llama_build_and_test(test-backend-ops.cpp)
-
+# The full suite runs explicitly in ci/run.sh. Keep focused fork CTest cases below.
+# TODO: decouple the operator tool from libllama [TAG_TESTS_LLAMA_LINK].
+llama_build(test-backend-ops.cpp)
+# Metadata ABI gate needs no model or device backend.
+add_executable(test-mul-mat-params test-mul-mat-params.cpp)
+target_include_directories(test-mul-mat-params PRIVATE ../ggml/src)
+target_link_libraries(test-mul-mat-params PRIVATE ggml-base)
+llama_test(test-mul-mat-params)
+add_executable(test-fusion-check test-fusion-check.cpp)
+llama_test(test-fusion-check)
+if (TARGET ggml-cpu)
+    add_executable(test-expert-window-params test-expert-window-params.cpp)
+    target_link_libraries(test-expert-window-params PRIVATE ggml ggml-cpu)
+    llama_test(test-expert-window-params)
+endif()
+if (TARGET ggml-cuda AND GGML_CUDA_Q8_MMV_TEST_INSTRUMENTATION)
+    llama_test(test-backend-ops NAME test-cuda-q8-mmv-dispatch
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o MUL_MAT -p "type_a=q8_0.*m=257,n=1,k=5120")
+    set_property(TEST test-cuda-q8-mmv-dispatch PROPERTY
+        ENVIRONMENT "GGML_TEST_Q8_0_MMV_EXPECT_PATH=auto")
+endif()
+llama_build_and_test(test-cuda-q8-mmv-selector.cpp)
+llama_build_and_test(test-backend-expert-transfer.cpp)
+target_include_directories(test-backend-expert-transfer PRIVATE ../ggml/src)
+llama_build_and_test(test-exl3-cpu.cpp)
+llama_build_and_test(test-cuda-graph-key.cpp)
+llama_build_and_test(test-cuda-rdna2-vmm-policy.cpp)
+if ((TARGET ggml-cuda OR TARGET ggml-hip) AND NOT GGML_BACKEND_DL)
+    llama_test(test-exl3-cpu NAME test-exl3-cpu-cache ARGS --cache)
+    set_property(TEST test-exl3-cpu-cache PROPERTY SKIP_RETURN_CODE 77)
+    llama_test(test-exl3-cpu NAME test-exl3-gpu-oracle ARGS --gpu)
+    set_property(TEST test-exl3-gpu-oracle PROPERTY SKIP_RETURN_CODE 77)
+    if (TARGET ggml-cuda)
+        set(EXL3_TEST_BACKEND ggml-cuda)
+    else()
+        set(EXL3_TEST_BACKEND ggml-hip)
+    endif()
+    if (TARGET ggml-hip)
+        # Match the backend's native-HIP or Windows/legacy-hipcc CXX build path.
+        get_target_property(EXL3_HIP_SOURCE_DIR ggml-hip SOURCE_DIR)
+        get_directory_property(EXL3_HIP_CXX DIRECTORY "${EXL3_HIP_SOURCE_DIR}" DEFINITION CXX_IS_HIPCC)
+        if (EXL3_HIP_CXX)
+            set(EXL3_GPU_LANGUAGE CXX)
+            find_package(hip REQUIRED)
+        else()
+            set(EXL3_GPU_LANGUAGE HIP)
+            enable_language(HIP)
+        endif()
+        set_source_files_properties(test-exl3-byte-dot.cu PROPERTIES LANGUAGE ${EXL3_GPU_LANGUAGE})
+    else()
+        enable_language(CUDA)
+    endif()
+    llama_build_and_test(test-exl3-byte-dot.cu)
+    target_include_directories(test-exl3-byte-dot PRIVATE ../ggml/src ../ggml/src/ggml-cuda)
+    if (TARGET ggml-hip)
+        target_compile_definitions(test-exl3-byte-dot PRIVATE GGML_USE_HIP)
+        target_link_libraries(test-exl3-byte-dot PRIVATE ggml-hip)
+        set_target_properties(test-exl3-byte-dot PROPERTIES ${EXL3_GPU_LANGUAGE}_STANDARD 17)
+        if (EXL3_GPU_LANGUAGE STREQUAL "CXX")
+            target_link_libraries(test-exl3-byte-dot PRIVATE hip::device)
+        endif()
+    else()
+        set_target_properties(test-exl3-byte-dot PROPERTIES CUDA_STANDARD 17)
+    endif()
+    set_tests_properties(test-exl3-byte-dot PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build(test-exl3-dense-batch.cpp)
+    target_link_libraries(test-exl3-dense-batch PRIVATE ${EXL3_TEST_BACKEND})
+    foreach(mode -1 1 2)
+        llama_test(test-exl3-dense-batch NAME test-exl3-dense-batch-${mode})
+        set_tests_properties(test-exl3-dense-batch-${mode} PROPERTIES
+            SKIP_RETURN_CODE 77 ENVIRONMENT "GGML_EXL3_INT8=${mode}")
+    endforeach()
+    llama_build(test-exl3-residual-policy.cpp)
+    target_link_libraries(test-exl3-residual-policy PRIVATE ${EXL3_TEST_BACKEND})
+    foreach(mode -1 0 1 2)
+        llama_test(test-exl3-residual-policy NAME test-exl3-residual-policy-${mode})
+        set_tests_properties(test-exl3-residual-policy-${mode} PROPERTIES
+            SKIP_RETURN_CODE 77 ENVIRONMENT "GGML_EXL3_INT8=${mode}")
+    endforeach()
+endif()
 if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+    enable_language(CUDA)
+    # Small scale-aware cases exercise generic fallbacks without the expensive
+    # CPU reference of production-sized dynamic FP8 GEMMs.
+    llama_test(test-backend-ops NAME test-cuda-native-quant-fallbacks
+        ARGS test -b CUDA0
+        -o MUL_MAT_STATIC_I8,MUL_MAT_DYNAMIC_I4,MUL_MAT_DYNAMIC_W4A8_FP8,MUL_MAT_STATIC_FP8,MUL_MAT_CHANNEL_FP8,MUL_MAT_BLOCK_FP8
+        -p "^k=(32|128|256),n=[0-9]+(,m=(1|3|8)(,|$)|,scale=)")
+    llama_build(test-exl3-cache-large-pool.cpp)
+    target_link_libraries(test-exl3-cache-large-pool PRIVATE ggml-cuda CUDA::cudart)
+    llama_test(test-exl3-cache-large-pool LABEL "backend")
+    set_tests_properties(test-exl3-cache-large-pool PROPERTIES
+        LABELS "backend;large-memory" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+    llama_build(test-exl3-tensor-split.cpp)
+    target_link_libraries(test-exl3-tensor-split PRIVATE ggml-cuda)
+    foreach(axis RANGE 0 2)
+        llama_test(test-exl3-tensor-split NAME test-exl3-shard-bytes-${axis} ARGS ${axis} 1)
+        set_tests_properties(test-exl3-shard-bytes-${axis} PROPERTIES SKIP_RETURN_CODE 77)
+    endforeach()
+    llama_test(test-exl3-tensor-split NAME test-exl3-shard-bytes-segmented ARGS 0 2)
+    set_tests_properties(test-exl3-shard-bytes-segmented PROPERTIES SKIP_RETURN_CODE 77)
+    llama_test(test-exl3-tensor-split NAME test-exl3-shard-bytes-repeated ARGS 0 -2)
+    set_tests_properties(test-exl3-shard-bytes-repeated PROPERTIES SKIP_RETURN_CODE 77)
+    foreach(segments 1 2 -2)
+        llama_test(test-exl3-tensor-split NAME test-exl3-shard-async-${segments} ARGS 0 ${segments} 4 2 async)
+        set_tests_properties(test-exl3-shard-async-${segments} PROPERTIES SKIP_RETURN_CODE 77)
+    endforeach()
+    foreach(axis RANGE 0 2)
+        foreach(tokens 1 9 64)
+            llama_test(test-exl3-tensor-split NAME test-exl3-shard-matrix-${axis}-${tokens} ARGS matrix ${axis} ${tokens})
+            set_tests_properties(test-exl3-shard-matrix-${axis}-${tokens} PROPERTIES
+                SKIP_RETURN_CODE 77 ENVIRONMENT "GGML_CUDA_AR1_BF16=0")
+        endforeach()
+    endforeach()
+    foreach(tokens 1024 1025)
+        llama_test(test-exl3-tensor-split NAME test-exl3-expert-boundary-${tokens} ARGS matrix 2 ${tokens})
+        set_tests_properties(test-exl3-expert-boundary-${tokens} PROPERTIES
+            SKIP_RETURN_CODE 77 ENVIRONMENT "GGML_CUDA_AR1_BF16=0")
+    endforeach()
+    foreach(tokens 1 64)
+        llama_test(test-exl3-tensor-split NAME test-exl3-expert-up-${tokens}
+            ARGS matrix 2 ${tokens} 3 2 2560 640 512 10 0)
+        llama_test(test-exl3-tensor-split NAME test-exl3-expert-down-${tokens}
+            ARGS matrix 2 ${tokens} 3 2 640 2560 512 10 1)
+        set_tests_properties(test-exl3-expert-up-${tokens} test-exl3-expert-down-${tokens} PROPERTIES
+            SKIP_RETURN_CODE 77 ENVIRONMENT "GGML_CUDA_AR1_BF16=0")
+    endforeach()
+
+endif()
+if ((TARGET ggml-hip OR (TARGET ggml-cuda AND GGML_CUDA_TURBO_FA)) AND NOT GGML_BACKEND_DL)
+    llama_build(test-cuda-tcq-asym-codebooks.cpp)
+    llama_test(test-cuda-tcq-asym-codebooks LABEL "main;backend")
+    set_tests_properties(test-cuda-tcq-asym-codebooks PROPERTIES
+        ENVIRONMENT "GGML_TURBO_MMA_FUSED=1"
+        SKIP_RETURN_CODE 77)
+endif()
+if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+    llama_build(test-cuda-hc-combine-match.cpp)
+    target_link_libraries(test-cuda-hc-combine-match PRIVATE ggml-cuda)
+    llama_test(test-cuda-hc-combine-match LABEL "main;backend")
+    llama_build(test-cuda-hc-stream-mean-match.cpp)
+    target_link_libraries(test-cuda-hc-stream-mean-match PRIVATE ggml-cuda)
+    llama_test(test-cuda-hc-stream-mean-match LABEL "main;backend")
+    llama_build(test-cuda-hc-stream-mean-zero.cpp)
+    llama_test(test-cuda-hc-stream-mean-zero NAME test-cuda-hc-stream-mean-zero-enabled LABEL "main;backend")
+    llama_test(test-cuda-hc-stream-mean-zero NAME test-cuda-hc-stream-mean-zero-disabled LABEL "main;backend")
+    set_property(TEST test-cuda-hc-stream-mean-zero-disabled PROPERTY ENVIRONMENT "GGML_CUDA_DISABLE_FUSION=1")
+    set_tests_properties(test-cuda-hc-stream-mean-zero-enabled test-cuda-hc-stream-mean-zero-disabled
+        PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build(test-cuda-hc-grouped-rms-match.cpp)
+    target_link_libraries(test-cuda-hc-grouped-rms-match PRIVATE ggml-cuda)
+    llama_test(test-cuda-hc-grouped-rms-match LABEL "main;backend")
+    llama_build(test-cuda-hc-grouped-rms-special.cpp)
+    llama_test(test-cuda-hc-grouped-rms-special LABEL "main;backend")
+    set_tests_properties(test-cuda-hc-grouped-rms-special PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build(test-cuda-mmvq-post-silu-match.cpp)
+    target_link_libraries(test-cuda-mmvq-post-silu-match PRIVATE ggml-cuda)
+    llama_test(test-cuda-mmvq-post-silu-match LABEL "main;backend")
+    llama_build(test-cuda-mmvq-post-silu-special.cpp)
+    llama_test(test-cuda-mmvq-post-silu-special LABEL "main;backend")
+    set_tests_properties(test-cuda-mmvq-post-silu-special PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+if (TARGET ggml-cuda AND GGML_CUDA_HC_COMBINE_TEST_INSTRUMENTATION)
+    llama_test(test-backend-ops NAME test-cuda-hc-combine-dispatch
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o HC_COMBINE_FUSION -p "n_embd=127,hc=4,nt=5,variant=7")
+    set_property(TEST test-cuda-hc-combine-dispatch PROPERTY
+        ENVIRONMENT "GGML_TEST_HC_COMBINE_EXPECT_DISPATCH=enabled")
+    llama_test(test-backend-ops NAME test-cuda-hc-combine-fusion-disabled
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o HC_COMBINE_FUSION -p "n_embd=257,hc=4,nt=17,variant=0")
+    set_property(TEST test-cuda-hc-combine-fusion-disabled PROPERTY
+        ENVIRONMENT "GGML_TEST_HC_COMBINE_EXPECT_DISPATCH=disabled;GGML_CUDA_DISABLE_FUSION=1")
+endif()
+if (TARGET ggml-cuda AND GGML_CUDA_HC_STREAM_MEAN_TEST_INSTRUMENTATION)
+    llama_test(test-backend-ops NAME test-cuda-hc-stream-mean-dispatch
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o HC_STREAM_MEAN_FUSION -p "n_embd=257,nt=17,variant=0")
+    set_property(TEST test-cuda-hc-stream-mean-dispatch PROPERTY
+        ENVIRONMENT "GGML_TEST_HC_STREAM_MEAN_EXPECT_DISPATCH=enabled")
+    llama_test(test-backend-ops NAME test-cuda-hc-stream-mean-fusion-disabled
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o HC_STREAM_MEAN_FUSION -p "n_embd=257,nt=17,variant=0")
+    set_property(TEST test-cuda-hc-stream-mean-fusion-disabled PROPERTY
+        ENVIRONMENT "GGML_TEST_HC_STREAM_MEAN_EXPECT_DISPATCH=disabled;GGML_CUDA_DISABLE_FUSION=1")
+endif()
+if (TARGET ggml-cuda AND GGML_CUDA_HC_GROUPED_RMS_TEST_INSTRUMENTATION)
+    llama_test(test-backend-ops NAME test-cuda-hc-grouped-rms-dispatch
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o HC_GROUPED_RMS_FUSION -p "n_embd=257,hc=4,nt=17,variant=0")
+    set_property(TEST test-cuda-hc-grouped-rms-dispatch PROPERTY
+        ENVIRONMENT "GGML_TEST_HC_GROUPED_RMS_EXPECT_DISPATCH=enabled")
+    llama_test(test-backend-ops NAME test-cuda-hc-grouped-rms-disabled
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o HC_GROUPED_RMS_FUSION -p "n_embd=257,hc=4,nt=17,variant=0")
+    set_property(TEST test-cuda-hc-grouped-rms-disabled PROPERTY
+        ENVIRONMENT "GGML_TEST_HC_GROUPED_RMS_EXPECT_DISPATCH=disabled;GGML_CUDA_DISABLE_FUSION=1")
+endif()
+if (TARGET ggml-cuda AND GGML_CUDA_Q8_POST_SILU_TEST_INSTRUMENTATION)
+    llama_test(test-backend-ops NAME test-cuda-q8-post-silu-dispatch
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o MMVQ_POST_SILU_FUSION -p "m=257,k=5120,variant=0")
+    set_property(TEST test-cuda-q8-post-silu-dispatch PROPERTY
+        ENVIRONMENT "GGML_TEST_Q8_POST_SILU_EXPECT_DISPATCH=enabled")
+    llama_test(test-backend-ops NAME test-cuda-q8-post-silu-disabled
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o MMVQ_POST_SILU_FUSION -p "m=257,k=5120,variant=0")
+    set_property(TEST test-cuda-q8-post-silu-disabled PROPERTY
+        ENVIRONMENT "GGML_TEST_Q8_POST_SILU_EXPECT_DISPATCH=disabled;GGML_CUDA_DISABLE_FUSION=1")
+    llama_test(test-backend-ops NAME test-cuda-q8-post-silu-force-mmq-refused
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o MMVQ_POST_SILU_FUSION -p "m=127,k=5120,variant=3")
+    set_property(TEST test-cuda-q8-post-silu-force-mmq-refused PROPERTY
+        ENVIRONMENT "GGML_TEST_Q8_POST_SILU_EXPECT_DISPATCH=disabled")
+    llama_test(test-backend-ops NAME test-cuda-q8-post-silu-padded-view-refused
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o MMVQ_POST_SILU_FUSION -p "m=127,k=5088,variant=4")
+    set_property(TEST test-cuda-q8-post-silu-padded-view-refused PROPERTY
+        ENVIRONMENT "GGML_TEST_Q8_POST_SILU_EXPECT_DISPATCH=disabled")
+    llama_test(test-backend-ops NAME test-cuda-q8-post-silu-small-k-refused
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o MMVQ_POST_SILU_FUSION -p "m=127,k=512,variant=5")
+    set_property(TEST test-cuda-q8-post-silu-small-k-refused PROPERTY
+        ENVIRONMENT "GGML_TEST_Q8_POST_SILU_EXPECT_DISPATCH=disabled")
+endif()
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    llama_build(test-moe-cache.cpp)
+    llama_test(test-moe-cache LABEL "main;backend")
+    set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 120)
+    llama_build_and_test(test-cuda-moe-cache-flat-hits-selector.cpp)
+    if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+        find_package(CUDAToolkit REQUIRED)
+        llama_build(test-cuda-moe-cache-flat-hits.cpp)
+        target_link_libraries(test-cuda-moe-cache-flat-hits PRIVATE ggml-cuda CUDA::cudart)
+        llama_test(test-cuda-moe-cache-flat-hits LABEL "main;backend")
+        set_property(TEST test-cuda-moe-cache-flat-hits PROPERTY ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
+        set_tests_properties(test-cuda-moe-cache-flat-hits PROPERTIES TIMEOUT 120)
+        if (GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION)
+            target_compile_definitions(test-cuda-moe-cache-flat-hits
+                PRIVATE GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION)
+        endif()
+    endif()
+    if (TARGET ggml-cuda AND GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION)
+        llama_test(test-moe-cache NAME test-moe-cache-flat-hits-baseline LABEL "main;backend")
+        set_property(TEST test-moe-cache-flat-hits-baseline PROPERTY
+            ENVIRONMENT "GGML_TEST_MOE_CACHE_FLAT_HITS_EXPECT_BASELINE=1;CUDA_VISIBLE_DEVICES=0")
+        set_tests_properties(test-moe-cache-flat-hits-baseline PROPERTIES TIMEOUT 180)
+    endif()
+endif()
+
+llama_build_and_test(test-moe-cache-fit.cpp)
+llama_build_and_test(test-auto-memory-policy.cpp)
+llama_build_and_test(test-kv-cell-position-index.cpp)
+
+if (TARGET ggml-hip)
+    find_package(hip REQUIRED)
+    add_executable(test-hip-runtime test-hip-runtime.cpp)
+    target_link_libraries(test-hip-runtime PRIVATE hip::host)
+    llama_test(test-hip-runtime LABEL "backend")
+    llama_test(test-hip-runtime NAME test-hip-runtime-no-pinned LABEL "backend")
+    set_tests_properties(test-hip-runtime test-hip-runtime-no-pinned PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(test-hip-runtime-no-pinned PROPERTIES ENVIRONMENT "GGML_CUDA_NO_PINNED=1")
+endif()
+
+if ((TARGET ggml-cuda OR TARGET ggml-hip) AND NOT GGML_BACKEND_DL)
     llama_build(test-vbr-vmm.cpp)
-    target_link_libraries(test-vbr-vmm PRIVATE ggml-cuda)
+    if (TARGET ggml-cuda)
+        target_link_libraries(test-vbr-vmm PRIVATE ggml-cuda)
+    else()
+        target_link_libraries(test-vbr-vmm PRIVATE ggml-hip)
+    endif()
     llama_test(test-vbr-vmm LABEL "backend")
+endif()
+
+# the tensor API kernels come from a separate metallib - check they produce correct results
+# ref: https://github.com/ggml-org/llama.cpp/issues/27473
+if (GGML_METAL AND NOT GGML_METAL_EMBED_LIBRARY)
+    llama_test(test-backend-ops NAME test-backend-ops-metallib-tensor
+               ARGS test -b MTL0 -o MUL_MAT -p type_a=q6_K)
+    set_tests_properties(test-backend-ops-metallib-tensor PROPERTIES ENVIRONMENT GGML_METAL_TENSOR_ENABLE=1)
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
@@ -292,9 +847,9 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-# Test state save/load functionality
-llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
+if (APPLE)
+    llama_build(test-rset-release.cpp)
+endif()
 
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
@@ -310,6 +865,9 @@ set(LLAMA_TEST_NAME test-mtmd-c-api)
 llama_build_and_test(test-mtmd-c-api.c)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
 unset(LLAMA_TEST_NAME)
+
+llama_build_and_test(test-mtmd-impl.cpp)
+target_link_libraries(test-mtmd-impl PRIVATE mtmd)
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)
@@ -343,6 +901,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+    llama_build_and_test(test-backend-meta-replay.cpp)
+    set_tests_properties(test-backend-meta-replay PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

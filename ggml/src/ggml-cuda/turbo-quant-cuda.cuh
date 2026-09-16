@@ -1474,10 +1474,10 @@ static inline void turbo_tcq_load_kv_encode() {
         fprintf(stderr, "TCQ encode: K/V-split codebooks (K=%s V=%s) hotswap=%d\n", kp?kp:"compiled", vp?vp:"compiled", hot);
 }
 
-// TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis
-// 512 threads per block (one per trellis state), one block per 128-element group
+// TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis.
+// One block per 128-element group; block width is selected at the launch site.
 // Double-buffered cost arrays + global memory backtrace (128 syncs/group, was 384)
-template<typename idx_t>
+template<int nt, typename idx_t>
 // minBlocks=2: the 128-step Viterbi is __syncthreads-latency-bound; a second resident block
 // per SM hides the sync stalls (pp512 tax vs turbo4 was ~4% with minBlocks=1).
 // Viterbi-encode block width. The kernel does 128 sequential s_barrier-synced ACS steps, so the
@@ -1495,7 +1495,7 @@ template<typename idx_t>
 #define TCQ3_ENC_NT 512   // NVIDIA: author-tuned optimum (128 regresses on the 3090)
 #endif
 #endif
-static __global__ void __launch_bounds__(TCQ3_ENC_NT) k_set_rows_turbo3_tcq(
+static __global__ void __launch_bounds__(nt) k_set_rows_turbo3_tcq(
         const float * __restrict__ src0, const idx_t * __restrict__ src1,
         block_turbo3_tcq * __restrict__ dst, const int64_t ne_total_groups,
         uint8_t * __restrict__ bt_buf,
@@ -1508,6 +1508,8 @@ static __global__ void __launch_bounds__(TCQ3_ENC_NT) k_set_rows_turbo3_tcq(
         const int64_t s1,  const int64_t s2,  const int64_t s3,
         const uint3 ne00_fd, const uint3 ne01_fd, const uint3 ne02_fd,
         const uint3 ne11_fd, const uint3 ne12_fd) {
+
+    static_assert(nt == 128 || nt == 256 || nt == 512, "unsupported TCQ3 encoder width");
 
     const int64_t group = blockIdx.x;
     if (group >= ne_total_groups) return;
@@ -1635,7 +1637,7 @@ static __global__ void __launch_bounds__(TCQ3_ENC_NT) k_set_rows_turbo3_tcq(
     //     -> 29.8 — the ~6-op shuffle chain sits on the step's critical path and costs more
     //     than the barrier it removes. 512 threads with a 2-warp min phase is the local optimum.
     uint8_t * bt = use_shared_bt ? bt_shared : bt_buf + (int64_t)blockIdx.x * (128 * 64);
-    for (int s = sid; s < 512; s += TCQ3_ENC_NT) cost[s] = 0.0f;  // 512 states, TCQ3_ENC_NT threads
+    for (int s = sid; s < 512; s += nt) cost[s] = 0.0f;  // 512 states, nt threads
     __syncthreads();
 
     for (int t = 0; t < 128; t++) {
@@ -1667,10 +1669,10 @@ static __global__ void __launch_bounds__(TCQ3_ENC_NT) k_set_rows_turbo3_tcq(
         }
         __syncthreads();
 
-        // 128-thread remap: each thread writes its 512/TCQ3_ENC_NT states (states sharing low-6 bits
-        // = same predecessor min; only the codebook value differs). Bit-exact vs the 512-thread version.
+        // Narrow-block remap: each thread writes its 512/nt states (states sharing low-6 bits
+        // = same predecessor min; only the codebook value differs).
         const float * cb_enc = innerq_is_k ? d_turbo3_tcq_codebook : d_turbo3_tcq_codebook_v;
-        for (int s = sid; s < 512; s += TCQ3_ENC_NT) {
+        for (int s = sid; s < 512; s += nt) {
             float dist = xt - cb_enc[s];
             dist = dist * dist;
             cost_wr[s] = pred_min_cost[s & 0x3F] + dist;
@@ -1679,12 +1681,18 @@ static __global__ void __launch_bounds__(TCQ3_ENC_NT) k_set_rows_turbo3_tcq(
     }
     // After 128 steps (even count): final costs are in cost[] (step 127 writes to cost)
 
-    // Warp argmin over 512 costs. 128-thread remap: each thread reduces its states first,
-    // then TCQ3_ENC_NT/32 warp-minima are block-reduced (was 16 warps for 512 threads).
-    {
+    // HIP's legacy encoder uses a 128-lane final-state reduction. Preserve that order
+    // when RDNA4 uses a wider forward pass so equal-cost path selection stays identical.
+    // CUDA and other backends retain their existing launch-width reduction.
+#if defined(GGML_USE_HIP)
+    constexpr int reduce_nt = 128;
+#else
+    constexpr int reduce_nt = nt;
+#endif
+    if (sid < reduce_nt) {
         float my_cost = 3.4028234663852886e38f;
         int my_idx = 0;
-        for (int s = sid; s < 512; s += TCQ3_ENC_NT) {
+        for (int s = sid; s < 512; s += reduce_nt) {
             float c = cost[s];
             if (c < my_cost) { my_cost = c; my_idx = s; }
         }
@@ -1701,7 +1709,7 @@ static __global__ void __launch_bounds__(TCQ3_ENC_NT) k_set_rows_turbo3_tcq(
     }
     __syncthreads();
     if (sid < 32) {
-        constexpr int NWARPS = TCQ3_ENC_NT / 32;
+        constexpr int NWARPS = reduce_nt / 32;
         float best = (sid < NWARPS) ? warp_min_cost[sid] : 3.4028234663852886e38f;
         int best_idx = (sid < NWARPS) ? warp_min_idx[sid] : 0;
 #pragma unroll
@@ -2367,8 +2375,6 @@ static inline void turbo1_tcq_load_kv_encode() {
     if (do_k && kp && load_file(kp, buf)) { cudaMemcpyToSymbol(d_turbo1_tcq_codebook,   buf, 256*sizeof(float)); mk[dev] = nk; }
     if (do_v && vp && load_file(vp, buf)) { cudaMemcpyToSymbol(d_turbo1_tcq_codebook_v, buf, 256*sizeof(float)); mv[dev] = nv; }
     init[dev] = true;
-    if (first)
-        fprintf(stderr, "TCQ1 encode: K/V codebooks (K=%s V=%s) hotswap=%d\n", kp?kp:"baked-in", vp?vp:"baked-in", hot);
 }
 
 // 1-bit TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis (k=1, L=8).

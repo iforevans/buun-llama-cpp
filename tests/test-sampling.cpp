@@ -1,5 +1,9 @@
 #include "ggml.h"
 #include "llama.h"
+#include "sampling.h"
+#include "speculative.h"
+
+#include <random>
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -7,10 +11,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
-extern struct llama_sampler * llama_sampler_init_dry_testing(int32_t context_size, float dry_multiplier, float dry_base, int32_t dry_allowed_length, int32_t dry_penalty_last_n, const std::vector<std::vector<llama_token>>& seq_breakers);
+extern struct llama_sampler * llama_sampler_init_dry_testing(float dry_multiplier, float dry_base, int32_t dry_allowed_length, int32_t dry_penalty_last_n, const std::vector<std::vector<llama_token>>& seq_breakers);
 
 static void dump(const llama_token_data_array * cur_p) {
     for (size_t i = 0; i < cur_p->size; i++) {
@@ -60,6 +66,35 @@ private:
 
     std::vector<llama_token_data> cur;
 };
+
+static llama_token sample_dist(llama_sampler * sampler, const std::vector<float> & logits) {
+    std::vector<llama_token_data> cur;
+    for (llama_token token_id = 0; token_id < (llama_token) logits.size(); ++token_id) {
+        cur.push_back({ token_id, logits[token_id], 0.0f });
+    }
+
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+    llama_sampler_apply(sampler, &cur_p);
+    GGML_ASSERT(cur_p.selected >= 0);
+    GGML_ASSERT((size_t) cur_p.selected < cur_p.size);
+    return cur_p.data[cur_p.selected].id;
+}
+
+static void test_dist_singleton_rng() {
+    llama_sampler * singleton = llama_sampler_init_dist(4242);
+    llama_sampler * control   = llama_sampler_init_dist(4242);
+
+    sample_dist(singleton, { 0.0f });
+    sample_dist(control,   { 0.0f, 0.0f });
+
+    const std::vector<float> logits(256, 0.0f);
+    for (int i = 0; i < 4; ++i) {
+        GGML_ASSERT(sample_dist(singleton, logits) == sample_dist(control, logits));
+    }
+
+    llama_sampler_free(singleton);
+    llama_sampler_free(control);
+}
 
 static void test_temp(const std::vector<float> & probs, const std::vector<float> & probs_expected, float temp) {
     sampler_tester tester(probs, probs_expected);
@@ -144,7 +179,7 @@ static void test_penalties(
 
     sampler_tester tester(probs, probs_expected);
 
-    auto * sampler = llama_sampler_init_penalties(last_tokens.size(), repeat_penalty, alpha_frequency, alpha_presence);
+    auto * sampler = llama_sampler_init_penalties((int32_t) probs.size(), (int32_t) last_tokens.size(), repeat_penalty, alpha_frequency, alpha_presence);
 
     for (size_t i = 0; i < last_tokens.size(); i++) {
         llama_sampler_accept(sampler, last_tokens[i]);
@@ -168,7 +203,7 @@ static void test_dry(
 
     sampler_tester tester(probs, expected_probs);
 
-    auto * sampler = llama_sampler_init_dry_testing(1024, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, seq_breakers);
+    auto * sampler = llama_sampler_init_dry_testing(dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, seq_breakers);
 
     for (size_t i = 0; i < last_tokens.size(); i++) {
         llama_sampler_accept(sampler, last_tokens[i]);
@@ -305,8 +340,173 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
+static llama_token_data_array make_distribution(
+        std::vector<llama_token_data> & storage,
+        const std::vector<float> &      probabilities) {
+    storage.clear();
+    storage.reserve(probabilities.size());
+    for (llama_token id = 0; id < (llama_token) probabilities.size(); ++id) {
+        storage.push_back({ id, 0.0f, probabilities[id] });
+    }
+    return { storage.data(), storage.size(), -1, false };
+}
+
+static void test_proposal_rows() {
+    std::vector<llama_token_data> data = {{7, std::log(0.6f), 0}, {9, std::log(0.3f), 0}, {3, std::log(0.1f), 0}};
+    llama_token_data_array row{data.data(), data.size(), -1, true};
+    float q[3];
+    GGML_ASSERT(common_sampler_proposal_row(row, 1, 1, 0, q) == 7);
+    GGML_ASSERT(std::abs(q[0] - 0.6f) < 1e-6 && std::abs(q[2] - 0.1f) < 1e-6);
+    GGML_ASSERT(common_sampler_proposal_row(row, 1, 0.8f, 0.99, q) == 9);
+    GGML_ASSERT(std::abs(q[0] - 2.0f/3) < 1e-6 && q[2] == 0);
+    GGML_ASSERT(common_sampler_proposal_row(row, 0.5f, 1, 0, q) == 7);
+    GGML_ASSERT(std::abs(q[0] - 36.0f/46) < 1e-6);
+    GGML_ASSERT(common_sampler_proposal_row(row, 1, 0.1f, 0.99, q) == 7 && q[0] == 1);
+    GGML_ASSERT(common_sampler_proposal_row(row, 0, 1, 0, q) == LLAMA_TOKEN_NULL);
+    GGML_ASSERT(common_sampler_proposal_row(row, 1, 1, 1, q) == LLAMA_TOKEN_NULL);
+    data[0].logit = NAN;
+    GGML_ASSERT(common_sampler_proposal_row(row, 1, 1, 0, q) == LLAMA_TOKEN_NULL);
+    data[0].logit = std::log(0.6f);
+
+    data[1].logit = data[2].logit = -INFINITY;
+    GGML_ASSERT(common_sampler_proposal_row(row, 1, 1, 0.999, q) == 7);
+    GGML_ASSERT(q[0] == 1 && q[1] == 0 && q[2] == 0);
+    data[0].logit = -INFINITY;
+    GGML_ASSERT(common_sampler_proposal_row(row, 1, 1, 0, q) == LLAMA_TOKEN_NULL);
+    data[0].logit = std::log(0.6f);
+    data[1].logit = std::log(0.3f);
+    data[2].logit = std::log(0.1f);
+
+    // Sample the production row builder, then verify with a different target p.
+    // The emitted distribution must be p, not q or the distribution of matches.
+    std::vector<llama_token_data> target = {{7, 0, 0.2f}, {9, 0, 0.5f}, {3, 0, 0.3f}};
+    llama_token_data_array p{target.data(), target.size(), -1, false};
+    const int32_t ids[] = {7, 9, 3};
+    std::mt19937 rng(1897);
+    auto uniform = [&]() { return std::generate_canonical<double, 53>(rng); };
+    int counts[3] = {};
+    constexpr int n = 100000;
+    for (int i = 0; i < n; ++i) {
+        llama_token token = common_sampler_proposal_row(row, 0.8f, 0.9f, uniform(), q);
+        if (uniform() >= common_sampler_speculative_acceptance_probability(&p, token, ids, q, 3)) {
+            token = common_sampler_speculative_sample_residual(&p, ids, q, 3, uniform());
+        }
+        for (int j = 0; j < 3; ++j) {
+            counts[j] += token == ids[j];
+        }
+    }
+    for (int j = 0; j < 3; ++j) {
+        GGML_ASSERT(std::abs(double(counts[j])/n - target[j].p) < 0.006);
+    }
+
+    common_speculative_proposal proposal;
+    proposal.selected = {7, 9, 3};
+    proposal.q_covered_tokens = 3;
+    proposal.seq_id = 2;
+    proposal.exact_q = true;
+    GGML_ASSERT(proposal.matching_prefix_size(2, {7, 9, 3}) == 3);
+    GGML_ASSERT(proposal.matching_prefix_size(2, {7}) == 1);
+    GGML_ASSERT(proposal.matching_prefix_size(2, {7, 9, 3, 4}) == 3);
+    GGML_ASSERT(proposal.matching_prefix_size(2, {7, 4}) == 0);
+    GGML_ASSERT(proposal.matching_prefix_size(1, {7}) == 0);
+    GGML_ASSERT(proposal.matching_prefix_size(2, {}) == 0);
+    const size_t capacity = proposal.selected.capacity();
+    proposal.clear();
+    GGML_ASSERT(proposal.matching_prefix_size(2, {7}) == 0);
+    GGML_ASSERT(proposal.selected.capacity() == capacity);
+}
+
+static void test_speculative_coupling() {
+    std::vector<llama_token_data> storage;
+
+    {
+        auto p = make_distribution(storage, { 0.2f, 0.8f });
+        const int32_t q_ids[] = { 0, 1 };
+        const float q[] = { 0.2f, 0.8f };
+        GGML_ASSERT(common_sampler_speculative_acceptance_probability(&p, 0, q_ids, q, 2) == 1.0);
+        GGML_ASSERT(common_sampler_speculative_acceptance_probability(&p, 1, q_ids, q, 2) == 1.0);
+    }
+
+    {
+        auto p = make_distribution(storage, { 0.2f, 0.8f });
+        const int32_t q_ids[] = { 0, 1 };
+        const float q[] = { 0.4f, 0.6f };
+        GGML_ASSERT(std::abs(common_sampler_speculative_acceptance_probability(&p, 0, q_ids, q, 2) - 0.5) < 1e-6);
+        GGML_ASSERT(common_sampler_speculative_acceptance_probability(&p, 1, q_ids, q, 2) == 1.0);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 2, 0.0) == 1);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 2, 0.999999) == 1);
+    }
+
+    {
+        // The supports need not overlap. A rejected q-only proposal samples p.
+        auto p = make_distribution(storage, { 0.25f, 0.75f, 0.0f });
+        const int32_t q_ids[] = { 2 };
+        const float q[] = { 1.0f };
+        GGML_ASSERT(common_sampler_speculative_acceptance_probability(&p, 2, q_ids, q, 1) == 0.0);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 1, 0.0) == 0);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 1, 0.249999) == 0);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 1, 0.25) == 1);
+    }
+
+    {
+        // K=16 and sparse q IDs outside p exercise the same O(V + K) path.
+        auto p = make_distribution(storage, { 0.4f, 0.3f, 0.2f, 0.1f });
+        const int32_t q_ids[] = { 0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23 };
+        const float q[] = { 0.1f, 0.4f, 0.5f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        GGML_ASSERT(common_sampler_speculative_acceptance_probability(&p, 0, q_ids, q, 16) == 1.0);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 16, 0.0) == 0);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 16, 0.500001) == 2);
+        GGML_ASSERT(common_sampler_speculative_sample_residual(&p, q_ids, q, 16, 0.999999) == 3);
+    }
+
+    {
+        auto p = make_distribution(storage, { 0.5f, 0.5f });
+        const int32_t q_ids[] = { 0, 0 };
+        const float q[] = { 0.5f, 0.5f };
+        bool threw = false;
+        try {
+            common_sampler_speculative_sample_residual(&p, q_ids, q, 2, 0.5);
+        } catch (const std::runtime_error &) {
+            threw = true;
+        }
+        GGML_ASSERT(threw);
+    }
+
+    {
+        // A sampled, truncated draft distribution need not share the target's
+        // support. Verify the complete accept/residual mixture, not only each
+        // helper in isolation. Token 3 exists only in q and token 2 only in p.
+        auto p = make_distribution(storage, { 0.1f, 0.3f, 0.6f, 0.0f });
+        const int32_t q_ids[] = { 0, 1, 3 };
+        const float q[] = { 0.5f, 0.25f, 0.25f };
+        std::mt19937 rng(20260915);
+        std::discrete_distribution<int> propose(q, q + 3);
+        int counts[4] = {};
+        constexpr int n = 200000;
+        for (int i = 0; i < n; ++i) {
+            llama_token token = q_ids[propose(rng)];
+            const double accept = common_sampler_speculative_acceptance_probability(&p, token, q_ids, q, 3);
+            if (std::generate_canonical<double, 53>(rng) >= accept) {
+                token = common_sampler_speculative_sample_residual(
+                    &p, q_ids, q, 3, std::generate_canonical<double, 53>(rng));
+            }
+            GGML_ASSERT(token >= 0 && token < 4);
+            ++counts[token];
+        }
+        const double expected[] = { 0.1, 0.3, 0.6, 0.0 };
+        for (int i = 0; i < 4; ++i) {
+            GGML_ASSERT(std::abs(double(counts[i]) / n - expected[i]) < 0.005);
+        }
+        GGML_ASSERT(counts[3] == 0);
+    }
+}
+
 int main(void) {
     ggml_time_init();
+
+    test_speculative_coupling();
+    test_proposal_rows();
+    test_dist_singleton_rng();
 
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.0f, 0.0f, 0.0f, 1.0f}, 0.0f);

@@ -1,10 +1,16 @@
 #include "arg.h"
 #include "common.h"
 #include "download.h"
+#include "llama.h"
+#include "../src/llama-kv-cache.h"
+#include "../src/llama-kv-cache-iswa.h"
+#include "speculative.h"
 
 #include <cstdlib>
 #include <fstream>
 #include <cstdio>
+#include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -19,6 +25,304 @@
 
 static void test(void) {
     common_params params;
+
+    auto assert_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,
+                                   int32_t total, int32_t per_seq) {
+        const auto limits = common_speculative_get_output_limits(n_batch, n_parallel, n_draft);
+        assert(limits.total == total);
+        assert(limits.per_seq == per_seq);
+    };
+
+    assert_output_limits(16, 2,  3, 8, 4);
+    assert_output_limits(16, 2, -1, 2, 1);
+    assert_output_limits( 6, 2,  3, 6, 4);
+    assert_output_limits( 2, 1,  3, 2, 2);
+    assert_output_limits(
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max());
+
+    {
+        const auto implicit = common_speculative_mtp_context_params_resolve(
+            4096, 0, 2, false);
+        assert(implicit.n_ctx == 4096);
+        assert(implicit.n_seq_max == 2);
+        assert(implicit.kv_unified);
+
+        const auto explicit_split = common_speculative_mtp_context_params_resolve(
+            4096, 8192, 3, false);
+        assert(explicit_split.n_ctx == 8192);
+        assert(explicit_split.n_seq_max == 3);
+        assert(!explicit_split.kv_unified);
+
+        const auto explicit_unified = common_speculative_mtp_context_params_resolve(
+            4096, 8192, 4, true);
+        assert(explicit_unified.n_ctx == 8192);
+        assert(explicit_unified.n_seq_max == 4);
+        assert(explicit_unified.kv_unified);
+
+        common_params_speculative pure_mtp;
+        pure_mtp.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        pure_mtp.draft.ctx_dft = reinterpret_cast<llama_context *>(uintptr_t(1));
+        assert(common_speculative_mtp_context_available(pure_mtp));
+
+        common_params_speculative combined = pure_mtp;
+        combined.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
+        assert(!common_speculative_mtp_context_available(combined));
+        combined.draft.ctx_mtp = reinterpret_cast<llama_context *>(uintptr_t(2));
+        assert(common_speculative_mtp_context_available(combined));
+    }
+
+    {
+        common_params_speculative spec;
+        spec.synth_len = 3.4;
+
+        auto assert_invalid = [](const common_params_speculative & value, int32_t n_max) {
+            try {
+                common_speculative_synth_rates_resolve(&value, n_max);
+                assert(false);
+            } catch (const std::invalid_argument &) {
+            }
+        };
+
+        const auto rates = common_speculative_synth_rates_resolve(&spec, 4);
+        assert(rates.size() == 4);
+        assert(std::abs(rates[0] - 0.80581) < 1e-5);
+        assert(std::abs(rates[1] - 0.64933) < 1e-5);
+        assert(std::abs(rates[2] - 0.52323) < 1e-5);
+        assert(std::abs(rates[3] - 0.42163) < 1e-5);
+        assert(std::abs(1.0 + rates[0] + rates[1] + rates[2] + rates[3] - 3.4) < 1e-8);
+
+        spec.synth_len = 1.0;
+        assert(common_speculative_synth_rates_resolve(&spec, 4) == std::vector<double>({0.0, 0.0, 0.0, 0.0}));
+
+        spec.synth_len = 5.0;
+        assert(common_speculative_synth_rates_resolve(&spec, 4) == std::vector<double>({1.0, 1.0, 1.0, 1.0}));
+
+        spec.synth_len = 5.1;
+        assert_invalid(spec, 4);
+
+        spec.synth_len = std::numeric_limits<double>::quiet_NaN();
+        assert_invalid(spec, 4);
+
+        spec.synth_len = 0.0;
+        assert_invalid(spec, 4);
+
+        spec.synth_len = -1.0;
+        spec.synth_rates = {0.8, 0.6, 0.4};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, 0.6, 0.4, 0.2};
+        assert(common_speculative_synth_rates_resolve(&spec, 4) == spec.synth_rates);
+
+        spec.synth_rates = {0.8, 0.9, 0.4, 0.2};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, std::numeric_limits<double>::quiet_NaN(), 0.4, 0.2};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, 0.6, 0.4, -0.2};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, 0.6, 0.4, 0.2};
+        spec.synth_len = 3.0;
+        assert_invalid(spec, 4);
+    }
+
+    {
+        common_params base;
+        base.n_parallel = 4;
+        base.n_outputs_max_per_seq = 8;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.n_outputs_max == 4);
+        assert(draft.n_outputs_max_per_seq == 1);
+
+        base.vbr_entry = "t8";
+        base.vbr_entry_explicit = true;
+        base.vbr_cache_type_k = true;
+        base.vbr_cache_type_v = true;
+        base.vbr_cache_type_k_explicit = true;
+        base.vbr_cache_type_v_explicit = true;
+        base.vbr_budget_explicit = true;
+        base.vbr_min_bits = "t4";
+        base.vbr_min_bits_value = 4.125;
+        base.vbr_min_bits_explicit = true;
+        base.vbr_capacity_bits = 4.125;
+        base.vbr_vram_budget = "1G";
+        base.vbr_vram_budget_bytes = 1ull << 30;
+        base.vbr_vram_budget_explicit = true;
+        base.vbr_policy = "policy.json";
+        base.vbr_policy_explicit = true;
+        base.vbr_selected_family = "test";
+        base.vbr_selected_policy = "rung";
+        base.vbr_selected_schedule = "schedule";
+        base.vbr_selected_bpv = 4.125;
+        base.vbr_selected_kld = 0.1;
+        const auto vbr_draft = common_base_params_to_speculative(base);
+        assert(!vbr_draft.vbr_enabled());
+        assert(!vbr_draft.vbr_dynamic());
+        assert(vbr_draft.vbr_entry == "f16");
+        assert(!vbr_draft.vbr_entry_explicit);
+        assert(vbr_draft.vbr_min_bits == "auto");
+        assert(vbr_draft.vbr_min_bits_value == 0.0);
+        assert(vbr_draft.vbr_capacity_bits == 0.0);
+        assert(vbr_draft.vbr_vram_budget_bytes == 0);
+        assert(vbr_draft.vbr_selected_family.empty());
+        assert(!vbr_draft.vbr_cache_type_k_explicit);
+        assert(!vbr_draft.vbr_cache_type_v_explicit);
+        const auto vbr_draft_cparams = common_context_params_to_llama(vbr_draft);
+        assert(!vbr_draft_cparams.vbr_dynamic);
+        assert(vbr_draft_cparams.vbr_min_bits == 0.0);
+        assert(vbr_draft_cparams.vbr_vram_budget_bytes == 0);
+        assert(!vbr_draft_cparams.vbr_pin_k);
+        assert(!vbr_draft_cparams.vbr_pin_v);
+    }
+
+    {
+        const common_vbr_cache_choice unset_f16 = { GGML_TYPE_F16, false, false };
+        const common_vbr_cache_choice pinned_f16 = { GGML_TYPE_F16, false, true };
+        const common_vbr_cache_choice pinned_q8 = { GGML_TYPE_Q8_0, false, true };
+        const common_vbr_cache_choice vbr_alias = { GGML_TYPE_F16, true, true };
+
+        auto sides = common_vbr_resolve_sides(vbr_alias, unset_f16, false, true);
+        assert(sides.k && sides.v);
+
+        sides = common_vbr_resolve_sides(vbr_alias, pinned_q8, false, true);
+        assert(sides.k && !sides.v);
+
+        // A concrete comparison row in a matrix containing another `vbr` row stays concrete,
+        // even when global entry/floor knobs configure the alias row.
+        sides = common_vbr_resolve_sides(pinned_f16, unset_f16, true, true);
+        assert(!sides.k && !sides.v);
+
+        // Without a matrix alias, standalone VBR options arm only untouched sides.
+        sides = common_vbr_resolve_sides(pinned_q8, unset_f16, true, false);
+        assert(!sides.k && sides.v);
+        sides = common_vbr_resolve_sides(unset_f16, unset_f16, true, false);
+        assert(sides.k && sides.v);
+
+        assert(common_vbr_fit_price_type(GGML_TYPE_TURBO4_0, 8.125, false) == GGML_TYPE_TURBO4_0);
+        assert(common_vbr_fit_price_type(GGML_TYPE_TURBO8_0, 4.125, false) == GGML_TYPE_TURBO4_0);
+        assert(common_vbr_fit_price_type(GGML_TYPE_TURBO8_0, 4.125, true) == GGML_TYPE_TURBO8_0);
+        assert(common_vbr_fit_price_type(GGML_TYPE_Q8_0, 4.125, false) == GGML_TYPE_Q8_0);
+        assert(common_vbr_fit_price_type(
+            GGML_TYPE_F16, 4.5, false, LLAMA_VBR_CODEC_CLASSIC) == GGML_TYPE_Q4_0);
+        assert(common_vbr_fit_price_type(
+            GGML_TYPE_Q8_0, 8.5, false, LLAMA_VBR_CODEC_CLASSIC) == GGML_TYPE_Q8_0);
+        assert(std::abs(common_vbr_fit_kv_scale(6.04, 4.125, false) - 6.04/4.125) < 1e-12);
+        assert(common_vbr_fit_kv_scale(4.125, 4.125, false) == 1.0);
+        assert(common_vbr_fit_kv_scale(6.04, 4.125, true) == 1.0);
+        assert(llama_kv_cache::vbr_floor_reachable(10.0625, 8.0));  // t4 + pinned F16
+        assert(!llama_kv_cache::vbr_floor_reachable(4.875, 8.125)); // t8 + pinned t1
+
+        struct floor_child {
+            double result;
+            int calls = 0;
+            double memory_vbr_floor_bits_per_token(ggml_type, ggml_type, double) {
+                calls++;
+                return result;
+            }
+        } reachable { 1200.0 }, unreachable { -1.0 };
+        assert(llama_memory_vbr_floor_bits_children(
+                   reachable, unreachable, GGML_TYPE_F16, GGML_TYPE_F16, 8.0) < 0.0);
+        assert(reachable.calls == 1 && unreachable.calls == 1);
+        floor_child reachable_swa { 300.0 };
+        assert(llama_memory_vbr_floor_bits_children(
+                   reachable, reachable_swa, GGML_TYPE_F16, GGML_TYPE_F16, 8.0) == 1500.0);
+    }
+
+    {
+        common_params base;
+        base.cpuparams.n_threads = 6;
+        base.cpuparams.n_threads_explicit = false;
+        base.cpuparams_batch.n_threads = 6;
+        base.cpuparams_batch.n_threads_explicit = false;
+        base.speculative.draft.mparams.path = "draft.gguf";
+        base.speculative.draft.cpuparams.n_threads = 8;
+        base.speculative.draft.cpuparams.n_threads_explicit = true;
+        base.speculative.draft.cpuparams_batch.n_threads = 7;
+        base.speculative.draft.cpuparams_batch.n_threads_explicit = true;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.cpuparams.n_threads == 8);
+        assert(draft.cpuparams.n_threads_explicit);
+        assert(draft.cpuparams_batch.n_threads == 7);
+        assert(draft.cpuparams_batch.n_threads_explicit);
+    }
+
+    {
+        // Parameter projection only: these opaque device identities are never dereferenced.
+        const auto dev0 = reinterpret_cast<ggml_backend_dev_t>(uintptr_t(1));
+        const auto dev1 = reinterpret_cast<ggml_backend_dev_t>(uintptr_t(2));
+        common_params base;
+        base.devices = { dev0, dev1, nullptr };
+        base.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+        base.speculative.draft.mparams.path = "draft.gguf";
+
+        const auto inherited = common_base_params_to_speculative(base);
+        assert(inherited.devices == base.devices);
+        assert(inherited.split_mode == LLAMA_SPLIT_MODE_TENSOR);
+
+        base.speculative.draft.devices = { dev1, nullptr };
+        const auto pinned = common_base_params_to_speculative(base);
+        assert(pinned.devices == base.speculative.draft.devices);
+        assert(pinned.split_mode == LLAMA_SPLIT_MODE_LAYER);
+        assert(base.split_mode == LLAMA_SPLIT_MODE_TENSOR);
+
+        base.speculative.draft.devices = { dev1, dev0, nullptr };
+        const auto multi = common_base_params_to_speculative(base);
+        assert(multi.devices == base.speculative.draft.devices);
+        assert(multi.split_mode == LLAMA_SPLIT_MODE_TENSOR);
+
+        base.speculative.draft.devices = { nullptr };
+        const auto cpu = common_base_params_to_speculative(base);
+        assert(cpu.devices == base.speculative.draft.devices);
+        assert(cpu.split_mode == LLAMA_SPLIT_MODE_TENSOR);
+    }
+
+    {
+        common_params_speculative spec;
+        spec.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        assert(!spec.has_non_mtp_model_drafter());
+        assert(!spec.has_external_mtp_sidecar());
+        assert(spec.uses_mtp_as_primary_drafter());
+        assert(spec.uses_native_mtp_as_primary_drafter());
+
+        // Model-free helpers do not change an external MTP sidecar's role.
+        spec.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+        assert(!spec.has_non_mtp_model_drafter());
+        assert(!spec.has_external_mtp_sidecar());
+        assert(spec.uses_mtp_as_primary_drafter());
+        assert(spec.uses_native_mtp_as_primary_drafter());
+
+        spec.draft.mparams.path = "mtp-sidecar.gguf";
+        assert(spec.has_external_mtp_sidecar());
+        assert(spec.uses_mtp_as_primary_drafter());
+        assert(!spec.uses_native_mtp_as_primary_drafter());
+        llama_model_params sidecar_mparams = llama_model_default_params();
+        llama_model * const target_sentinel = reinterpret_cast<llama_model *>(uintptr_t{1});
+        common_speculative_configure_draft_model_parent(spec, sidecar_mparams, target_sentinel);
+        assert(sidecar_mparams.model_shared == target_sentinel);
+
+        for (const auto type : {
+                COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
+                COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,
+                COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,
+                COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,
+                COMMON_SPECULATIVE_TYPE_DFLASH }) {
+            spec.types = { type, COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            assert(spec.has_non_mtp_model_drafter());
+            assert(!spec.has_external_mtp_sidecar());
+            assert(!spec.uses_mtp_as_primary_drafter());
+            assert(!spec.uses_native_mtp_as_primary_drafter());
+            llama_model_params combined_mparams = llama_model_default_params();
+            common_speculative_configure_draft_model_parent(spec, combined_mparams, target_sentinel);
+            assert(combined_mparams.model_shared == nullptr);
+        }
+    }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
     for (int ex = 0; ex < LLAMA_EXAMPLE_COUNT; ex++) {
@@ -132,14 +436,48 @@ static void test(void) {
     argv = {"binary_name", "-sm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    {
+        common_params penalty_params;
+        assert(penalty_params.sampling.penalty_last_n == 64);
+        assert(penalty_params.sampling.dry_penalty_last_n == 64);
+
+        argv = {"binary_name", "--repeat-last-n", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), penalty_params, LLAMA_EXAMPLE_COMMON));
+
+        argv = {"binary_name", "--dry-penalty-last-n", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), penalty_params, LLAMA_EXAMPLE_COMMON));
+
+        argv = {"binary_name", "--repeat-penalty", "0"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), penalty_params, LLAMA_EXAMPLE_COMMON));
+
+        argv = {"binary_name", "--repeat-penalty", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), penalty_params, LLAMA_EXAMPLE_COMMON));
+
+        argv = {"binary_name", "--repeat-penalty", "nan"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), penalty_params, LLAMA_EXAMPLE_COMMON));
+
+        argv = {"binary_name", "--repeat-penalty", "inf"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), penalty_params, LLAMA_EXAMPLE_COMMON));
+
+        argv = {"binary_name", "--repeat-penalty", "-inf"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), penalty_params, LLAMA_EXAMPLE_COMMON));
+
+        const char * penalty_options[] = {"--frequency-penalty", "--presence-penalty"};
+        const char * nonfinite_values[] = {"nan", "inf", "-inf"};
+        for (const char * option : penalty_options) {
+            for (const char * value : nonfinite_values) {
+                argv = {"binary_name", option, value};
+                assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), penalty_params, LLAMA_EXAMPLE_COMMON));
+            }
+        }
+    }
+
     // non-existence arg in specific example (--draft cannot be used outside llama-speculative)
     argv = {"binary_name", "--draft", "123"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_EMBEDDING));
 
-    // negated arg
-    argv = {"binary_name", "--no-mmap"};
+    argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
-
 
     printf("test-arg-parser: test valid usage\n\n");
 
@@ -165,6 +503,76 @@ static void test(void) {
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
+    assert(params.speculative.draft.n_max_set);
+
+    {
+        common_params draft_temp_params;
+        assert(draft_temp_params.speculative.sample_temp == 0.0f);
+        assert(!draft_temp_params.speculative.sample_temp_set);
+
+        argv = {"binary_name", "--spec-draft-temp", "0"};
+        assert(true == common_params_parse(
+                argv.size(), list_str_to_char(argv).data(), draft_temp_params, LLAMA_EXAMPLE_SERVER));
+        assert(draft_temp_params.speculative.sample_temp == 0.0f);
+        assert(draft_temp_params.speculative.sample_temp_set);
+    }
+
+    {
+        common_params default_params;
+        assert(!default_params.speculative.draft.n_max_set);
+        assert(default_params.speculative.draft.mtp_vocab_size == 0);
+    }
+
+    argv = {"binary_name", "--spec-mtp-vocab-size", "32768"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.draft.mtp_vocab_size == 32768);
+
+    argv = {"binary_name", "--spec-mtp-vocab-size", "0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.draft.mtp_vocab_size == 0);
+
+    argv = {"binary_name", "--spec-mtp-vocab-size", "16384"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    {
+        common_params synth_params;
+        argv = {"binary_name", "--spec-synth-len", "3.4"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+        assert(synth_params.speculative.synth_len == 3.4);
+    }
+
+    {
+        common_params synth_params;
+        argv = {"binary_name", "--spec-synth-rates", "0.8,0.6,0.2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+        assert(synth_params.speculative.synth_rates == std::vector<double>({0.8, 0.6, 0.2}));
+    }
+
+    {
+        common_params synth_params;
+        argv = {"binary_name", "--spec-synth-len", "3.4x"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+    }
+
+    argv = {"binary_name", "-lm", "none"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
+
+    argv = {"binary_name", "-lm", "mmap"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MMAP);
+
+    argv = {"binary_name", "-lm", "mlock"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MLOCK);
+
+    argv = {"binary_name", "-lm", "mmap+mlock"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK);
+
+    argv = {"binary_name", "-lm", "dio"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
 
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
@@ -190,8 +598,142 @@ static void test(void) {
         assert(!vbr_default.vbr_cache_type_k_explicit);
         assert(!vbr_default.vbr_cache_type_v_explicit);
         assert(vbr_default.vbr_dynamic());
+        assert(vbr_default.vbr_codec_auto);
+        assert(!vbr_default.vbr_codec_explicit);
         assert(vbr_default.vbr_min_bits_value == 4.125);
         assert(vbr_default.vbr_capacity_bits == 4.125);
+        assert(!vbr_default.vbr_prompt_cache_explicit);
+        assert(common_vbr_prompt_cache_mode_for(vbr_default) ==
+               common_vbr_prompt_cache_mode::enabled_automatic);
+
+        common_params vbr_cache_disabled;
+        argv = {"binary_name", "-m", "model.gguf", "--cache-ram", "0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_cache_disabled, LLAMA_EXAMPLE_SERVER));
+        assert(common_vbr_prompt_cache_mode_for(vbr_cache_disabled) ==
+               common_vbr_prompt_cache_mode::disabled_cache_ram);
+
+        common_params vbr_cache_explicit_off;
+        argv = {"binary_name", "-m", "model.gguf", "--no-vbr-prompt-cache"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_cache_explicit_off, LLAMA_EXAMPLE_SERVER));
+        assert(vbr_cache_explicit_off.vbr_prompt_cache_explicit);
+        assert(!vbr_cache_explicit_off.vbr_prompt_cache);
+        assert(common_vbr_prompt_cache_mode_for(vbr_cache_explicit_off) ==
+               common_vbr_prompt_cache_mode::disabled_explicit);
+
+        common_params vbr_cache_explicit_on;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-prompt-cache"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_cache_explicit_on, LLAMA_EXAMPLE_SERVER));
+        assert(vbr_cache_explicit_on.vbr_prompt_cache_explicit);
+        assert(vbr_cache_explicit_on.vbr_prompt_cache);
+        assert(common_vbr_prompt_cache_mode_for(vbr_cache_explicit_on) ==
+               common_vbr_prompt_cache_mode::enabled_explicit);
+
+        common_params implicit_cpu = vbr_default;
+        assert(common_params_apply_vbr_cpu_fallback(implicit_cpu, false) ==
+               common_vbr_cpu_fallback_result::applied);
+        assert(!implicit_cpu.vbr_enabled());
+        assert(implicit_cpu.cache_type_k == GGML_TYPE_F16);
+        assert(implicit_cpu.cache_type_v == GGML_TYPE_F16);
+        assert(implicit_cpu.vbr_min_bits_value == 0.0);
+        assert(implicit_cpu.vbr_capacity_bits == 0.0);
+        const auto implicit_cpu_context =
+            common_context_params_to_llama(implicit_cpu);
+        assert(!implicit_cpu_context.vbr_dynamic);
+        assert(implicit_cpu_context.vbr_min_bits == 0.0);
+        common_params implicit_zero_layers = vbr_default;
+        implicit_zero_layers.n_gpu_layers = 0;
+        assert(common_params_apply_vbr_cpu_fallback(
+                   implicit_zero_layers, true) ==
+               common_vbr_cpu_fallback_result::applied);
+        common_params implicit_host_kv = vbr_default;
+        implicit_host_kv.no_kv_offload = true;
+        assert(common_params_apply_vbr_cpu_fallback(
+                   implicit_host_kv, true) ==
+               common_vbr_cpu_fallback_result::applied);
+
+        common_params explicit_entry_cpu;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-entry", "t8", "-ngl", "0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), explicit_entry_cpu, LLAMA_EXAMPLE_COMMON));
+        assert(common_params_apply_vbr_cpu_fallback(explicit_entry_cpu, false) ==
+               common_vbr_cpu_fallback_result::explicit_vbr);
+        assert(explicit_entry_cpu.vbr_dynamic());
+        assert(explicit_entry_cpu.cache_type_k == GGML_TYPE_TURBO8_0);
+        assert(explicit_entry_cpu.cache_type_v == GGML_TYPE_TURBO8_0);
+        common_params explicit_entry_coupled = explicit_entry_cpu;
+        explicit_entry_coupled.cache_type_k = GGML_TYPE_Q8_0;
+        explicit_entry_coupled.cache_type_k_explicit = true;
+        explicit_entry_coupled.vbr_cache_type_k = false;
+        llama_context_params explicit_entry_cparams = common_context_params_to_llama(explicit_entry_coupled);
+        bool coupled_conflict = false;
+        try {
+            common_vbr_resolve_coupled_cache_types(explicit_entry_coupled, explicit_entry_cparams);
+        } catch (const std::invalid_argument &) {
+            coupled_conflict = true;
+        }
+        assert(coupled_conflict);
+
+        common_params implicit_coupled_mirror;
+        implicit_coupled_mirror.cache_type_k = GGML_TYPE_Q8_0;
+        implicit_coupled_mirror.cache_type_k_explicit = true;
+        implicit_coupled_mirror.vbr_cache_type_k = false;
+        llama_context_params implicit_coupled_cparams = common_context_params_to_llama(implicit_coupled_mirror);
+        assert(common_vbr_resolve_coupled_cache_types(implicit_coupled_mirror, implicit_coupled_cparams));
+        assert(implicit_coupled_mirror.cache_type_k == GGML_TYPE_Q8_0);
+        assert(implicit_coupled_mirror.cache_type_v == GGML_TYPE_Q8_0);
+        assert(implicit_coupled_cparams.type_k == GGML_TYPE_Q8_0);
+        assert(implicit_coupled_cparams.type_v == GGML_TYPE_Q8_0);
+        assert(!implicit_coupled_mirror.vbr_enabled());
+        assert(!implicit_coupled_cparams.vbr_dynamic);
+
+        common_params implicit_f16_mirror;
+        implicit_f16_mirror.cache_type_k = GGML_TYPE_F16;
+        implicit_f16_mirror.cache_type_k_explicit = true;
+        implicit_f16_mirror.vbr_cache_type_k = false;
+        llama_context_params implicit_f16_cparams = common_context_params_to_llama(implicit_f16_mirror);
+        assert(common_vbr_resolve_coupled_cache_types(implicit_f16_mirror, implicit_f16_cparams));
+        assert(implicit_f16_mirror.cache_type_k == GGML_TYPE_F16);
+        assert(implicit_f16_mirror.cache_type_v == GGML_TYPE_F16);
+        assert(!implicit_f16_mirror.vbr_enabled());
+        assert(!implicit_f16_cparams.vbr_dynamic);
+
+        common_params explicit_vbr_side;
+        explicit_vbr_side.cache_type_k_explicit = true;
+        explicit_vbr_side.vbr_cache_type_k = true;
+        explicit_vbr_side.vbr_cache_type_k_explicit = true;
+        llama_context_params explicit_vbr_cparams = common_context_params_to_llama(explicit_vbr_side);
+        assert(!common_vbr_resolve_coupled_cache_types(explicit_vbr_side, explicit_vbr_cparams));
+        assert(explicit_vbr_cparams.vbr_dynamic);
+
+        for (const bool static_k : { false, true }) {
+            common_params contradictory;
+            contradictory.cache_type_k_explicit = true;
+            contradictory.cache_type_v_explicit = true;
+            contradictory.vbr_cache_type_k = !static_k;
+            contradictory.vbr_cache_type_v = static_k;
+            contradictory.vbr_cache_type_k_explicit = !static_k;
+            contradictory.vbr_cache_type_v_explicit = static_k;
+            llama_context_params contradictory_cparams = common_context_params_to_llama(contradictory);
+            bool rejected = false;
+            try {
+                common_vbr_resolve_coupled_cache_types(contradictory, contradictory_cparams);
+            } catch (const std::invalid_argument &) {
+                rejected = true;
+            }
+            assert(rejected);
+        }
+
+        // A side the user set to an explicit non-VBR type keeps that type when
+        // the OTHER (implicit-vbr) side falls back — intent preservation.
+        common_params mixed_explicit_k;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "q8_0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mixed_explicit_k, LLAMA_EXAMPLE_COMMON));
+        assert(!mixed_explicit_k.vbr_cache_type_k);
+        assert(mixed_explicit_k.vbr_cache_type_v); // V still implicit vbr
+        assert(common_params_apply_vbr_cpu_fallback(mixed_explicit_k, false) ==
+               common_vbr_cpu_fallback_result::applied);
+        assert(mixed_explicit_k.cache_type_k == GGML_TYPE_Q8_0);
+        assert(mixed_explicit_k.cache_type_v == GGML_TYPE_F16);
+        assert(!mixed_explicit_k.vbr_enabled());
 
         // A concrete cache type opts out of the implicit VBR default.
         common_params vbr_opt_out;
@@ -199,7 +741,11 @@ static void test(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_opt_out, LLAMA_EXAMPLE_COMMON));
         assert(!vbr_opt_out.vbr_cache_type_k);
         assert(!vbr_opt_out.vbr_cache_type_v);
+        assert(vbr_opt_out.cache_type_k_explicit);
+        assert(vbr_opt_out.cache_type_v_explicit);
         assert(!vbr_opt_out.vbr_enabled());
+        assert(common_vbr_prompt_cache_mode_for(vbr_opt_out) ==
+               common_vbr_prompt_cache_mode::disabled_static);
 
         // Explicit VBR preserves the historical full ladder: the cache STARTS at F16 (full quality
         // until budget pressure; the measured fp16->t8 band degrades first) and the runtime
@@ -218,6 +764,12 @@ static void test(void) {
         assert(vbr_params.vbr_dynamic());
         assert(vbr_params.vbr_min_bits_value == 0.0);
         assert(vbr_params.vbr_capacity_bits == 1.25); // capacity advertised at the default t1 floor
+        common_params explicit_cpu = vbr_params;
+        assert(common_params_apply_vbr_cpu_fallback(explicit_cpu, false) ==
+               common_vbr_cpu_fallback_result::explicit_vbr);
+        assert(explicit_cpu.vbr_dynamic());
+        assert(explicit_cpu.vbr_cache_type_k_explicit);
+        assert(explicit_cpu.vbr_cache_type_v_explicit);
 #ifndef _WIN32
         assert(getenv("VBR_VMM") == nullptr);
         assert(getenv("VBR_MODE") == nullptr);
@@ -225,8 +777,8 @@ static void test(void) {
         assert(getenv("VBR_MIN_BITS") == nullptr);
 #endif
 
-        // --vbr-floor is a LITERAL aggregate floor (no snap-up to the next tier); the entry type
-        // stays turbo8 regardless
+        // --vbr-floor is a LITERAL aggregate floor (no snap-up to the next tier); the default
+        // entry type remains F16.
         common_params vbr_t2_floor;
         argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "-ctv", "vbr", "--vbr-min-bits", "2.25"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_t2_floor, LLAMA_EXAMPLE_COMMON));
@@ -234,6 +786,123 @@ static void test(void) {
         assert(vbr_t2_floor.vbr_min_bits == "2.25");
         assert(vbr_t2_floor.vbr_min_bits_value == 2.25);
         assert(vbr_t2_floor.vbr_capacity_bits == 2.25);
+
+        // --vbr-entry is the upper endpoint of the dynamic ladder. It deliberately allows a
+        // bandwidth-first start while leaving the default quality-first F16 behavior unchanged.
+        common_params vbr_t8_entry;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-entry", "t8", "--vbr-floor", "t4"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_t8_entry, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_t8_entry.vbr_dynamic());
+        assert(vbr_t8_entry.vbr_entry == "t8");
+        assert(vbr_t8_entry.vbr_entry_explicit);
+        assert(vbr_t8_entry.cache_type_k == GGML_TYPE_TURBO8_0);
+        assert(vbr_t8_entry.cache_type_v == GGML_TYPE_TURBO8_0);
+        assert(vbr_t8_entry.vbr_min_bits_value == 4.125);
+
+        common_params vbr_t2_entry_default_floor;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-entry", "t2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_t2_entry_default_floor, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_t2_entry_default_floor.cache_type_k == GGML_TYPE_TURBO2_TCQ);
+        assert(vbr_t2_entry_default_floor.cache_type_v == GGML_TYPE_TURBO2_TCQ);
+        assert(vbr_t2_entry_default_floor.vbr_min_bits_value == 2.25);
+
+        common_params vbr_default_entry;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-floor", "t4"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_default_entry, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_default_entry.vbr_entry == "f16");
+        assert(!vbr_default_entry.vbr_entry_explicit);
+        assert(vbr_default_entry.cache_type_k == GGML_TYPE_F16);
+        assert(vbr_default_entry.cache_type_v == GGML_TYPE_F16);
+
+        common_params vbr_entry_below_floor;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-entry", "t8", "--vbr-floor", "f16"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_entry_below_floor, LLAMA_EXAMPLE_COMMON));
+
+        // A literal floor is aggregate across K and V. With one pinned F16 side, an 8 bpv
+        // aggregate floor is valid even though the movable side enters at t4.
+        common_params vbr_mixed_floor;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "-ctv", "f16",
+                "--vbr-entry", "t4", "--vbr-floor", "8"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_mixed_floor, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_mixed_floor.cache_type_k == GGML_TYPE_TURBO4_0);
+        assert(vbr_mixed_floor.cache_type_v == GGML_TYPE_F16);
+        assert(vbr_mixed_floor.vbr_pin_v());
+        assert(vbr_mixed_floor.vbr_min_bits_value == 8.0);
+
+        common_params vbr_uppercase_dynamic;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-budget", "DYNAMIC", "--vbr-entry", "t2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_uppercase_dynamic, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_uppercase_dynamic.vbr_budget == "dynamic");
+        assert(vbr_uppercase_dynamic.vbr_min_bits_value == 2.25);
+
+        common_params vbr_bad_entry;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-entry", "q8_0"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_bad_entry, LLAMA_EXAMPLE_COMMON));
+
+        common_params vbr_classic;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-codec", "classic"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_classic, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_classic.vbr_codec == LLAMA_VBR_CODEC_CLASSIC);
+        assert(!vbr_classic.vbr_codec_auto);
+        assert(vbr_classic.vbr_codec_explicit);
+        assert(vbr_classic.cache_type_k == GGML_TYPE_F16);
+        assert(vbr_classic.cache_type_v == GGML_TYPE_F16);
+        assert(vbr_classic.vbr_min_bits_value == 4.5);
+        assert(vbr_classic.vbr_capacity_bits == 4.5);
+        assert(vbr_classic.vbr_selected_family == "dynamic-classic");
+        assert(common_context_params_to_llama(vbr_classic).vbr_codec == LLAMA_VBR_CODEC_CLASSIC);
+        common_params vbr_classic_cpu = vbr_classic;
+        assert(common_params_apply_vbr_cpu_fallback(vbr_classic_cpu, false) ==
+               common_vbr_cpu_fallback_result::explicit_vbr);
+        assert(vbr_classic_cpu.vbr_codec == LLAMA_VBR_CODEC_CLASSIC);
+
+        common_params vbr_auto;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-codec", "auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_auto, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_auto.vbr_codec == LLAMA_VBR_CODEC_TURBO); // provisional until model inspection
+        assert(vbr_auto.vbr_codec_auto);
+        assert(vbr_auto.vbr_codec_explicit);
+
+        common_params vbr_turbo;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-codec", "turbo"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_turbo, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_turbo.vbr_codec == LLAMA_VBR_CODEC_TURBO);
+        assert(!vbr_turbo.vbr_codec_auto);
+        assert(vbr_turbo.vbr_codec_explicit);
+
+        common_params vbr_classic_q8;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-codec", "classic",
+                "--vbr-entry", "q8", "--vbr-floor", "q4"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_classic_q8, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_classic_q8.cache_type_k == GGML_TYPE_Q8_0);
+        assert(vbr_classic_q8.cache_type_v == GGML_TYPE_Q8_0);
+        assert(vbr_classic_q8.vbr_entry == "q8_0");
+        assert(vbr_classic_q8.vbr_min_bits_value == 4.5);
+
+        common_params vbr_classic_literal_floor;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-codec", "classic", "--vbr-floor", "8"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_classic_literal_floor, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_classic_literal_floor.vbr_min_bits_value == 8.0); // literal, not q8_0's 8.5 bpv
+
+        common_params vbr_classic_policy;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-codec", "classic", "--vbr-policy", "classic-policy.json"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_classic_policy, LLAMA_EXAMPLE_COMMON));
+
+#ifndef _WIN32
+        setenv("VBR_LAYER_SCHEDULE", "0-0:k:t4", 1);
+        common_params vbr_classic_schedule;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-codec", "classic"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_classic_schedule, LLAMA_EXAMPLE_COMMON));
+        unsetenv("VBR_LAYER_SCHEDULE");
+#endif
+
+        common_params vbr_classic_cross_family;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-codec", "classic", "--vbr-entry", "t8"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_classic_cross_family, LLAMA_EXAMPLE_COMMON));
+
+        common_params vbr_entry_fixed_conflict;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-entry", "t8", "--vbr-budget", "t4"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_entry_fixed_conflict, LLAMA_EXAMPLE_COMMON));
 
         common_params vbr_literal_floor;
         argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-floor", "2"};
@@ -253,7 +922,7 @@ static void test(void) {
         assert(vbr_fractional_floor.vbr_min_bits_value == 2.75);
         assert(vbr_fractional_floor.vbr_capacity_bits == 2.75);
 
-        // dynamic floors outside the degrade ladder [t1, t8] clamp with a warning
+        // Dynamic floors below the ladder clamp; the default F16 entry permits an F16 floor.
         common_params vbr_low_floor;
         argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-floor", "0.5"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_low_floor, LLAMA_EXAMPLE_COMMON));
@@ -281,6 +950,35 @@ static void test(void) {
         assert(vbr_pin_v.cache_type_k == GGML_TYPE_F16);
         assert(vbr_pin_v.cache_type_v == GGML_TYPE_Q8_0);
 
+        // An explicit F16 side is a pin, not an untouched default. This must work both with
+        // the side-specific spelling and when -ct establishes F16 before one side selects VBR.
+        common_params vbr_pin_k_f16;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "f16", "-ctv", "vbr"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_pin_k_f16, LLAMA_EXAMPLE_COMMON));
+        assert(!vbr_pin_k_f16.vbr_cache_type_k);
+        assert(vbr_pin_k_f16.vbr_cache_type_v);
+        assert(vbr_pin_k_f16.cache_type_k == GGML_TYPE_F16);
+        assert(vbr_pin_k_f16.cache_type_k_explicit);
+        assert(vbr_pin_k_f16.vbr_pin_k());
+
+        common_params vbr_pin_k_f16_shorthand;
+        argv = {"binary_name", "-m", "model.gguf", "-ct", "f16", "-ctv", "vbr"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_pin_k_f16_shorthand, LLAMA_EXAMPLE_COMMON));
+        assert(!vbr_pin_k_f16_shorthand.vbr_cache_type_k);
+        assert(vbr_pin_k_f16_shorthand.vbr_cache_type_v);
+        assert(vbr_pin_k_f16_shorthand.cache_type_k == GGML_TYPE_F16);
+        assert(vbr_pin_k_f16_shorthand.cache_type_k_explicit);
+        assert(vbr_pin_k_f16_shorthand.vbr_pin_k());
+
+        common_params vbr_pin_v_f16;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "-ctv", "f16"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_pin_v_f16, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_pin_v_f16.vbr_cache_type_k);
+        assert(!vbr_pin_v_f16.vbr_cache_type_v);
+        assert(vbr_pin_v_f16.cache_type_v == GGML_TYPE_F16);
+        assert(vbr_pin_v_f16.cache_type_v_explicit);
+        assert(vbr_pin_v_f16.vbr_pin_v());
+
         // --vbr-vram alone implies -ctk/-ctv vbr (dynamic)
         common_params vbr_vram_budget;
         argv = {"binary_name", "-m", "model.gguf", "--vbr-vram", "24G"};
@@ -291,6 +989,11 @@ static void test(void) {
         assert(vbr_vram_budget.vbr_vram_budget_bytes == 25769803776ull);
         assert(vbr_vram_budget.vbr_dynamic());
         assert(vbr_vram_budget.vbr_min_bits_value == 4.125);
+
+        // Explicitly opting both sides out cannot be silently undone by a VBR sizing flag.
+        common_params vbr_f16_conflict;
+        argv = {"binary_name", "-m", "model.gguf", "-ct", "f16", "--vbr-vram", "24G"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_f16_conflict, LLAMA_EXAMPLE_COMMON));
 
         // A fixed --vbr-budget is an explicit static codec choice and does not inherit the
         // implicit dynamic t4 floor.
@@ -391,6 +1094,144 @@ static void test(void) {
 #endif
     }
 
+    printf("test-arg-parser: test MoE cache and repack modes\n\n");
+
+    {
+        common_params mode_params;
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO);
+        assert(mode_params.moe_cache.mode_explicit == false);
+        assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_UNSPECIFIED);
+    }
+
+    const std::vector<std::vector<std::string>> invalid_moe_cache_args = {
+        {"binary_name", "--moe-cache"},
+        {"binary_name", "--moe-cache", "invalid"},
+        {"binary_name", "--moe-cache", "-1"},
+        {"binary_name", "--moe-cache", "1048577"},
+        {"binary_name", "--moe-cache", "256x"},
+        {"binary_name", "--moe-cache", "999999999999999999999999"},
+        {"binary_name", "--moe-cache-expert-parallel", "-1"},
+        {"binary_name", "--moe-cache-expert-parallel", "9"},
+        {"binary_name", "--moe-cache-expert-parallel", "invalid"},
+        {"binary_name", "--moe-cache-cpu-overlap"},
+        {"binary_name", "--moe-cache-cpu-overlap", "-1"},
+        {"binary_name", "--moe-cache-cpu-overlap", "9"},
+        {"binary_name", "--moe-cache-cpu-overlap", "2x"},
+    };
+    for (auto invalid_argv : invalid_moe_cache_args) {
+        common_params mode_params;
+        assert(false == common_params_parse(
+                invalid_argv.size(), list_str_to_char(invalid_argv).data(),
+                mode_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    for (const std::string value : {"auto", "0", "2", "8"}) {
+        common_params mode_params;
+        assert(common_context_params_to_llama(mode_params).moe_cache_cpu_overlap == -2);
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache-cpu-overlap", value};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        const int expected = value == "auto" ? -1 : std::stoi(value);
+        assert(mode_params.moe_cache.cpu_overlap == expected);
+        assert(common_context_params_to_llama(mode_params).moe_cache_cpu_overlap == expected);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf",
+                "--moe-cache-expert-parallel", "auto"};
+        assert(true == common_params_parse(
+                argv.size(), list_str_to_char(argv).data(),
+                mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.expert_parallel == -1);
+        assert(common_context_params_to_llama(mode_params).moe_cache_expert_parallel == -1);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf",
+                "--moe-cache-expert-parallel", "3"};
+        assert(true == common_params_parse(
+                argv.size(), list_str_to_char(argv).data(),
+                mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.expert_parallel == 3);
+        assert(common_context_params_to_llama(mode_params).moe_cache_expert_parallel == 3);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO);
+        assert(mode_params.moe_cache.budget_mib == 0);
+        assert(mode_params.moe_cache.mode_explicit == true);
+        assert(mode_params.no_extra_bufts == false);
+        const llama_context_params cparams = common_context_params_to_llama(mode_params);
+        assert(cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_AUTO);
+        assert(cparams.moe_cache_budget_mib == 0);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "on", "--repack"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON);
+        assert(mode_params.moe_cache.budget_mib == 0);
+        assert(mode_params.no_extra_bufts == true);
+        assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_ON);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--repack", "--moe-cache", "256"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON);
+        assert(mode_params.moe_cache.budget_mib == 256);
+        assert(mode_params.no_extra_bufts == true);
+        const llama_context_params cparams = common_context_params_to_llama(mode_params);
+        assert(cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_ON);
+        assert(cparams.moe_cache_budget_mib == 256);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "1048576"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON);
+        assert(mode_params.moe_cache.budget_mib == 1048576);
+        assert(mode_params.no_extra_bufts == true);
+        assert(common_context_params_to_llama(mode_params).moe_cache_budget_mib == 1048576);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "256", "--moe-cache", "auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO);
+        assert(mode_params.moe_cache.budget_mib == 0);
+        assert(mode_params.no_extra_bufts == false);
+        assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_AUTO);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "off", "--repack"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF);
+        assert(mode_params.moe_cache.budget_mib == 0);
+        assert(mode_params.no_extra_bufts == false);
+        assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_OFF);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF);
+        assert(mode_params.moe_cache.budget_mib == 0);
+        assert(mode_params.no_extra_bufts == false);
+        assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_OFF);
+    }
+
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32
     printf("test-arg-parser: skip on windows build\n");
@@ -408,13 +1249,76 @@ static void test(void) {
     assert(params.model.path == "blah.gguf");
     assert(params.cpuparams.n_threads == 1010);
 
+    setenv("LLAMA_ARG_LOAD_MODE", "blah", true);
+    argv = {"binary_name"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    setenv("LLAMA_ARG_LOAD_MODE", "mmap", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MMAP);
+
+    setenv("LLAMA_ARG_LOAD_MODE", "mlock", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MLOCK);
+
+    unsetenv("LLAMA_ARG_LOAD_MODE");
+    setenv("LLAMA_ARG_MOE_CACHE", "invalid", true);
+    argv = {"binary_name"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    setenv("LLAMA_ARG_MOE_CACHE", "on", true);
+    {
+        common_params mode_params;
+        argv = {"binary_name"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON);
+        assert(mode_params.moe_cache.mode_explicit == true);
+        assert(mode_params.no_extra_bufts == true);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "--moe-cache", "off"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF);
+        assert(mode_params.moe_cache.mode_explicit == true);
+        assert(mode_params.no_extra_bufts == false);
+        assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_OFF);
+    }
+    unsetenv("LLAMA_ARG_MOE_CACHE");
+
+    setenv("LLAMA_ARG_MOE_CACHE_CPU_OVERLAP", "2", true);
+    for (bool explicit_auto : {false, true}) {
+        common_params overlap_params;
+        argv = {"binary_name"};
+        if (explicit_auto) {
+            argv.push_back("--moe-cache-cpu-overlap");
+            argv.push_back("auto");
+        }
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), overlap_params, LLAMA_EXAMPLE_COMMON));
+        assert(common_context_params_to_llama(overlap_params).moe_cache_cpu_overlap == (explicit_auto ? -1 : 2));
+    }
+    unsetenv("LLAMA_ARG_MOE_CACHE_CPU_OVERLAP");
+
+    setenv("LLAMA_ARG_LOAD_MODE", "mmap+mlock", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK);
+
+    setenv("LLAMA_ARG_LOAD_MODE", "dio", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
     printf("test-arg-parser: test negated environment variables\n\n");
 
-    setenv("LLAMA_ARG_MMAP", "0", true);
+    setenv("LLAMA_ARG_LOAD_MODE", "none", true);
     setenv("LLAMA_ARG_NO_PERF", "1", true); // legacy format
     argv = {"binary_name"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
-    assert(params.use_mmap == false);
+    assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
     assert(params.no_perf == true);
 
     printf("test-arg-parser: test environment variables being overwritten\n\n");

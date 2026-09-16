@@ -19,6 +19,11 @@ struct mm_ids_helper_store {
 };
 static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_helper_store");
 
+// the generic path passes 0, which needs no padding since it never groups lanes by token
+template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
+template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
+template <>      struct mm_ids_pow2<0> { static constexpr int value = 1; };
+
 // Helper function for mul_mat_id, converts ids to a more convenient format.
 // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
 // ids_dst describes the same mapping but for the dst tensor.
@@ -32,6 +37,9 @@ static __global__ void mm_ids_helper(
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     const int expert = blockIdx.x;
 
+    // token slots per warp lane group, padded to a power of 2 so a warp divides evenly
+    constexpr int neu_padded = mm_ids_pow2<n_expert_used_template>::value;
+
     extern __shared__ char data_mm_ids_helper[];
     mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
 
@@ -43,7 +51,10 @@ static __global__ void mm_ids_helper(
         for (int it = 0; it < n_tokens; ++it) {
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
-                const int expert_used = ids[it*si1 + iex];
+                int expert_used = ids[it*si1 + iex];
+                if (expert_used < 0) {
+                    expert_used = INT_MAX; // expert-parallel window: routed elsewhere, never matches
+                }
                 nex_prev += expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
@@ -60,14 +71,17 @@ static __global__ void mm_ids_helper(
         }
     } else {
         // Implementation optimized for specific numbers of experts used:
-        static_assert(n_expert_used == 6 || warp_size % n_expert_used == 0, "bad n_expert_used");
-        const int neu_padded = n_expert_used == 6 ? 8 : n_expert_used; // Padded to next higher power of 2.
+        // a warp holds a whole number of token slots, so the slot count is padded to a power of 2
+        static_assert(neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
         for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
             const int it = it0 + threadIdx.x / neu_padded;
 
             const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
-            const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
+            int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
+            if (expert_used < 0) {
+                expert_used = INT_MAX; // expert-parallel window: routed elsewhere, never matches
+            }
             const int iex_used = expert_used == expert ? iex : -1;
             nex_prev += expert_used < expert;
 
@@ -93,6 +107,7 @@ static __global__ void mm_ids_helper(
         }
     }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
+    ggml_cuda_syncwarp();
 
     for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
         const mm_ids_helper_store store_it = store[itc];
@@ -136,6 +151,10 @@ static void launch_mm_ids_helper(
     const dim3 block_size(warp_size, 1, 1);
     const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
     GGML_ASSERT(nbytes_shared <= smpbo);
+    // Slots routed to another device (expert-parallel window) produce no compact row, so the maps are not fully
+    // written: the inverse map marks such slots -1, and the forward map's unused tail points at row 0 so the
+    // consumers that walk all n_tokens*n_expert_used rows (the activation quantizers) gather a valid row.
+    CUDA_CHECK(cudaMemsetAsync(ids_src1, write_inverse ? 0xFF : 0, (size_t) n_tokens*n_expert_used_var*sizeof(int32_t), stream));
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
@@ -155,6 +174,9 @@ void ggml_cuda_launch_mm_ids_helper(
             break;
         case  8:
             launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            break;
+        case 10:
+            launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
         case 16:
             launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);

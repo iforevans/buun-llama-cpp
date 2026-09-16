@@ -56,7 +56,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     fattn_kernel_t fattn_kernel;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false, type_K, type_V>;
 
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
@@ -76,7 +76,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
 #endif // !defined(GGML_USE_MUSA)
     } else {
         constexpr bool use_logit_softcap = true;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false, type_K, type_V>;
 
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
@@ -184,7 +184,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
 
     // need_f16_K=false, need_f16_V=false: raw turbo data passes through to kernel.
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, false, warp_size_host);
 }
 
 
@@ -192,18 +192,18 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     template void ggml_cuda_flash_attn_ext_mma_turbo_case                                            \
     <DKQ, DV, ncols1, ncols2, tK, tV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)            \
 
-// Matched K/V at D=128 and D=256. ncols2 ≤ 8.
-#define DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV, ncols, tK, tV)           \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/1, 1, tK, tV); \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/2, 2, tK, tV); \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/4, 4, tK, tV); \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/8, 8, tK, tV); \
-
+// Fused Turbo attention handles at most four query tokens. These are the nine
+// tile shapes selected by the NVIDIA and RDNA decode paths.
 #define DECL_FATTN_MMA_TURBO_ALL(DKQ, DV, tK, tV) \
-    DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV,  8, tK, tV) \
-    DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV, 16, tK, tV) \
-    DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV, 32, tK, tV) \
-    DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV, 64, tK, tV) \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  8, 1, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  4, 2, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  2, 4, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  1, 8, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, 16, 1, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  8, 2, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  4, 4, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  2, 8, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  4, 8, tK, tV); \
 
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO4_0)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO4_0)
@@ -211,11 +211,11 @@ DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO8_0)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO8_0)
 // Asymmetric "q6 sweet spot" (6.124 bpw): turbo8 K + turbo4 V, D=256 only.
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO4_0)
-// Asymmetric ADJACENT-TIER pairs for the dynamic VBR degrade ladder, D=256 only. The controller
-// moves K and V of a layer independently, but bands complete before the next begins, so a live
-// mixed layer only ever holds an adjacent-tier pair (t8/t4, t4/t3, t3/t2, t2/t1 — either side).
-// Without a fused instance those layers fall to the materialize path for the whole band transit
-// (measured -13-15% tg32 @ d8192 when uniform).
+// Asymmetric pairs for the dynamic VBR degrade ladder, D=256 only. The priced degrade orders
+// move K and V of a layer independently and are NOT banded — a live mixed layer can straddle up
+// to 4 rungs (q27 holds K=t8:V=t3 across a multi-step cursor range; g31 holds K=t8:V=t1 across
+// long ranges). Only the ADJACENT-tier subset gets fused instances (compile-time budget); wider
+// straddles fall to the materialize path (measured -13-15% tg32 @ d8192 when uniform).
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO8_0)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO3_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO4_0)

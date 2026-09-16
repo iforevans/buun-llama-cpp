@@ -8,11 +8,32 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "../../src/llama-sha256.h"
 
 #include <random>
 #include <sstream>
 #include <fstream>
 #include <limits>
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <type_traits>
+#include <chrono>
+#include <thread>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#   define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#else
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+#endif
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -50,12 +71,43 @@ json format_error_response(const std::string & message, const enum error_type ty
             type_str = "exceed_context_size_error";
             code = 400;
             break;
+        case ERROR_TYPE_HARD_LEASE_BLOCKED:
+            type_str = "hard_lease_blocked";
+            code = 503;
+            break;
     }
     return json {
         {"code", code},
         {"message", message},
         {"type", type_str},
     };
+}
+
+//
+// server_slot_stats
+//
+
+json server_slot_stats::to_json() const {
+    json base = {
+        {"cache_n",                n_prompt_cached},
+
+        {"prompt_n",               n_prompt_processed},
+        {"prompt_ms",              t_prompt_ms()},
+        {"prompt_per_token_ms",    t_prompt_per_token_ms()},
+        {"prompt_per_second",      n_prompt_tps()},
+
+        {"predicted_n",            n_gen},
+        {"predicted_ms",           t_gen_ms()},
+        {"predicted_per_token_ms", t_gen_per_token_ms()},
+        {"predicted_per_second",   n_gen_tps()},
+    };
+
+    if (n_draft_tokens > 0) {
+        base["draft_n"]          = n_draft_tokens;
+        base["draft_n_accepted"] = n_draft_accepted;
+    }
+
+    return base;
 }
 
 //
@@ -156,6 +208,68 @@ bool are_lora_equal(
     return true;
 }
 
+std::string lora_config_identity(const std::vector<common_adapter_lora_info> & loras) {
+    // Collect the ACTIVE adapters as (content digest, scale bits) and sort into the same canonical
+    // order libllama applies them in (by digest, then scale bits) so the identity is independent of
+    // request order. Inactive (scale 0, incl. -0) adapters do not affect execution and are excluded.
+    std::vector<std::pair<std::array<uint8_t, 32>, uint32_t>> entries;
+    entries.reserve(loras.size());
+
+    for (const auto & la : loras) {
+        if (la.ptr == nullptr || la.scale == 0.0f) {
+            continue;
+        }
+
+        std::array<uint8_t, 32> digest{};
+        llama_adapter_meta_digest(la.ptr, digest.data());
+
+        uint32_t scale_bits;
+        static_assert(sizeof(scale_bits) == sizeof(la.scale), "unexpected float size");
+        std::memcpy(&scale_bits, &la.scale, sizeof(scale_bits)); // -0 excluded above, no normalize needed
+
+        entries.emplace_back(digest, scale_bits);
+    }
+
+    std::sort(entries.begin(), entries.end());
+
+    // The identity is a pure comparison key (never logged or parsed), and the entries are
+    // fixed-width and sorted, so their raw concatenation is unambiguous. Prefix the active count so
+    // an empty set (base adapters only) is still a distinct, well-defined identity.
+    std::string key = std::to_string(entries.size());
+    key.reserve(key.size() + entries.size() * (32 + sizeof(uint32_t)));
+
+    for (const auto & e : entries) {
+        key.append(reinterpret_cast<const char *>(e.first.data()), e.first.size());
+        key.append(reinterpret_cast<const char *>(&e.second), sizeof(e.second));
+    }
+
+    return key;
+}
+
+bool server_fault(const char * tag) {
+    // parse LLAMA_SERVER_FAULT once; empty/unset disables all injection
+    static const std::string faults = []() {
+        const char * env = std::getenv("LLAMA_SERVER_FAULT");
+        return env ? std::string(env) : std::string();
+    }();
+
+    if (faults.empty() || tag == nullptr || tag[0] == '\0') {
+        return false;
+    }
+
+    // match `tag` as a whole comma-delimited token so "load_fail" does not match "load_fail_xyz"
+    const std::string t = tag;
+    for (size_t pos = faults.find(t); pos != std::string::npos; pos = faults.find(t, pos + t.size())) {
+        const bool left  = (pos == 0)                  || faults[pos - 1]        == ',';
+        const bool right = (pos + t.size() == faults.size()) || faults[pos + t.size()] == ',';
+        if (left && right) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_info> & loras) {
     std::vector<size_t> enabled_ids;
     for (size_t i = 0; i < loras.size(); ++i) {
@@ -234,6 +348,102 @@ static inline raw_buffer base64_decode(const std::string & encoded_string) {
 //
 // server_tokens implementation
 //
+
+namespace {
+
+constexpr uint32_t SERVER_TOKENS_STATE_VERSION = 1;
+
+uint32_t server_tokens_state_u32(size_t value) {
+    if (value > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("Server tokens state is too large");
+    }
+    return value;
+}
+
+class server_tokens_state_writer {
+public:
+    template <typename T>
+    void write(T value) {
+        static_assert(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
+        const auto * ptr = reinterpret_cast<const char *>(&value);
+        data.insert(data.end(), ptr, ptr + sizeof(value));
+    }
+
+    template <typename T>
+    void write(const std::vector<T> & values) {
+        static_assert(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
+        write(server_tokens_state_u32(values.size()));
+        if (values.empty()) {
+            return;
+        }
+        const auto * ptr = reinterpret_cast<const char *>(values.data());
+        data.insert(data.end(), ptr, ptr + values.size() * sizeof(T));
+    }
+
+    void write_media_chunk(const mtmd_input_chunk * chunk) {
+        size_t chunk_size = 0;
+        if (mtmd_input_chunk_save(chunk, nullptr, 0, &chunk_size) != 0 || chunk_size == 0) {
+            throw std::runtime_error("Cannot serialize media chunk in server tokens");
+        }
+        std::vector<char> chunk_data(server_tokens_state_u32(chunk_size));
+        if (mtmd_input_chunk_save(chunk, chunk_data.data(), chunk_data.size(), nullptr) != 0) {
+            throw std::runtime_error("Cannot serialize media chunk in server tokens");
+        }
+        write(chunk_data);
+    }
+
+    std::vector<char> take() {
+        data.resize((data.size() + sizeof(llama_token) - 1) / sizeof(llama_token) * sizeof(llama_token), 0);
+        return std::move(data);
+    }
+
+private:
+    std::vector<char> data;
+};
+
+class server_tokens_state_reader {
+public:
+    server_tokens_state_reader(const char * data, size_t size) : data(data), size(size) {}
+
+    template <typename T>
+    T read() {
+        static_assert(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
+        if (size - pos < sizeof(T)) {
+            throw std::runtime_error("Unexpected end of server tokens state");
+        }
+        T value;
+        std::memcpy(&value, data + pos, sizeof(value));
+        pos += sizeof(value);
+        return value;
+    }
+
+    template <typename T>
+    std::vector<T> read_vector() {
+        static_assert(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
+        const uint32_t n_values = read<uint32_t>();
+        // reject before resizing, so that a small corrupted payload cannot request a huge allocation
+        if (n_values > remaining() / sizeof(T)) {
+            throw std::runtime_error("Unexpected end of server tokens state");
+        }
+        std::vector<T> values(n_values);
+        if (n_values > 0) {
+            std::memcpy(values.data(), data + pos, values.size() * sizeof(T));
+            pos += values.size() * sizeof(T);
+        }
+        return values;
+    }
+
+    size_t remaining() const {
+        return size - pos;
+    }
+
+private:
+    const char * data;
+    size_t size;
+    size_t pos = 0;
+};
+
+} // namespace
 
 server_tokens::server_tokens(mtmd::input_chunks & mtmd_chunks, bool has_mtmd) : has_mtmd(has_mtmd) {
     for (size_t i = 0; i < mtmd_chunks.size(); ++i) {
@@ -317,6 +527,46 @@ size_t server_tokens::size_up_to_pos(llama_pos max_pos) const {
     return idx;
 }
 
+bool server_tokens::media_content_identity(int64_t n_tokens, std::string & out) const {
+    if (n_tokens < 0 || n_tokens > (int64_t) tokens.size()) {
+        return false;
+    }
+
+    // Length-prefix every variable-width value so the comparison key is
+    // unambiguous even if a future mtmd content id contains punctuation. The
+    // key is process-local checkpoint metadata, not a portable file format.
+    out = "server-media-prefix-v1";
+
+    size_t n_chunks = 0;
+    for (const auto & entry : map_idx_to_media) {
+        const size_t start = entry.first;
+        if (start >= (size_t) n_tokens) {
+            break;
+        }
+
+        const auto & chunk = entry.second;
+        const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
+        const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
+        const char * id = mtmd_input_chunk_get_id(chunk.get());
+
+        // A frontier in the middle of a media chunk has no coherent media
+        // prefix. Empty ids are likewise unverifiable; get_common_prefix
+        // already treats them as divergence.
+        if (start + n_tok > (size_t) n_tokens || id == nullptr || id[0] == '\0') {
+            out.clear();
+            return false;
+        }
+
+        const size_t id_len = std::strlen(id);
+        out += string_format("|%zu:%zu:%d:%zu:", start, n_tok, n_pos, id_len);
+        out.append(id, id_len);
+        n_chunks++;
+    }
+
+    out += string_format("|chunks:%zu", n_chunks);
+    return true;
+}
+
 std::string server_tokens::str() const {
     std::ostringstream oss;
     oss << "tokens: ";
@@ -358,6 +608,7 @@ void server_tokens::push_back(llama_token tok) {
         throw std::runtime_error("Invalid token");
     }
     tokens.emplace_back(tok);
+    invalidate_retention_token_digest();
 }
 
 void server_tokens::push_back(const mtmd_input_chunk * chunk) {
@@ -371,6 +622,7 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
         }
         mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
         map_idx_to_media[start_idx] = std::move(new_chunk);
+        invalidate_retention_token_digest();
     } else if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         size_t n_tokens;
         const auto * text_tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
@@ -379,6 +631,23 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
         }
     } else {
         GGML_ABORT("Invalid chunk type");
+    }
+}
+
+void server_tokens::push_back_placeholder(const mtmd_input_chunk * chunk) {
+    auto type = mtmd_input_chunk_get_type(chunk);
+    if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+        GGML_ASSERT(has_mtmd);
+        mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_get_placeholder(chunk));
+        GGML_ASSERT(new_chunk != nullptr && "failed to create placeholder chunk");
+        const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        size_t start_idx = tokens.size();
+        for (size_t i = 0; i < n_tokens; ++i) {
+            tokens.emplace_back(LLAMA_TOKEN_NULL);
+        }
+        map_idx_to_media[start_idx] = std::move(new_chunk);
+    } else {
+        push_back(chunk);
     }
 }
 
@@ -401,11 +670,132 @@ void server_tokens::push_back(server_tokens & tokens) {
 
 void server_tokens::insert(const llama_tokens & inp_tokens) {
     tokens.insert(tokens.end(), inp_tokens.begin(), inp_tokens.end());
+    invalidate_retention_token_digest();
 }
 
 const llama_tokens & server_tokens::get_tokens() const {
     GGML_ASSERT(!has_mtmd);
     return tokens;
+}
+
+const llama_tokens & server_tokens::retention_token_ids() const {
+    return tokens;
+}
+
+bool server_tokens::retention_token_digest(
+        std::array<uint8_t, 32> & out) const noexcept {
+    if (!retention_token_digest_valid) {
+        llama_sha256_writer hash;
+        static constexpr char digest_domain[] =
+            "buun.server.retention-token-identity/v1";
+        hash.string(digest_domain, sizeof(digest_domain) - 1);
+        hash.u64(tokens.size());
+        for (llama_token token : tokens) {
+            hash.u32(uint32_t(token));
+        }
+        retention_token_digest_cache = hash.finish();
+        retention_token_digest_valid = true;
+    }
+    out = retention_token_digest_cache;
+    return true;
+}
+
+bool server_tokens::retention_token_prefix_digest(
+        size_t coverage_tokens,
+        std::array<uint8_t, 32> & out) const noexcept {
+    out = {};
+    if (coverage_tokens == 0 || coverage_tokens > tokens.size() ||
+        coverage_tokens > size_t(INT64_MAX)) {
+        return false;
+    }
+    try {
+        std::string media_identity;
+        if (!media_content_identity(
+                int64_t(coverage_tokens), media_identity)) {
+            return false;
+        }
+        llama_sha256_writer hash;
+        static constexpr char digest_domain[] =
+            "buun.server.retention-token-prefix-identity/v1";
+        hash.string(digest_domain, sizeof(digest_domain) - 1);
+        hash.u64(coverage_tokens);
+        for (size_t i = 0; i < coverage_tokens; ++i) {
+            hash.u32(uint32_t(tokens[i]));
+        }
+        hash.string(media_identity.data(), media_identity.size());
+        out = hash.finish();
+        return true;
+    } catch (...) {
+        out = {};
+        return false;
+    }
+}
+
+std::vector<char> server_tokens::serialize() const {
+    static_assert(sizeof(llama_token) == sizeof(uint32_t), "unexpected llama_token size");
+
+    server_tokens_state_writer writer;
+    writer.write((llama_token) LLAMA_TOKEN_NULL);
+    writer.write(SERVER_TOKENS_STATE_VERSION);
+    writer.write(tokens);
+
+    std::vector<uint32_t> media_keys;
+    media_keys.reserve(map_idx_to_media.size());
+    for (const auto & item : map_idx_to_media) {
+        media_keys.push_back(server_tokens_state_u32(item.first));
+    }
+    writer.write(media_keys);
+
+    for (const auto & item : map_idx_to_media) {
+        writer.write_media_chunk(item.second.get());
+    }
+
+    return writer.take();
+}
+
+server_tokens server_tokens::deserialize(const llama_tokens & packed, bool has_mtmd) {
+    static_assert(sizeof(llama_token) == sizeof(uint32_t), "unexpected llama_token size");
+
+    if (packed.empty() || packed[0] != LLAMA_TOKEN_NULL) {
+        // plain token list, as written by older versions
+        return server_tokens(packed, has_mtmd);
+    }
+
+    server_tokens_state_reader reader(reinterpret_cast<const char *>(packed.data()), packed.size() * sizeof(llama_token));
+    reader.read<llama_token>(); // format marker
+    if (reader.read<uint32_t>() != SERVER_TOKENS_STATE_VERSION) {
+        throw std::runtime_error("Unsupported server tokens state version");
+    }
+
+    const llama_tokens tokens = reader.read_vector<llama_token>();
+
+    // the media start indices, followed by the media chunks in the same order
+    const std::vector<uint32_t> media_keys = reader.read_vector<uint32_t>();
+    if (!media_keys.empty() && !has_mtmd) {
+        throw std::runtime_error("Cannot restore media tokens without an mmproj");
+    }
+
+    server_tokens result(tokens, has_mtmd);
+
+    for (const uint32_t key : media_keys) {
+        const size_t start_idx = key;
+        const std::vector<char> chunk_data = reader.read_vector<char>();
+        if (chunk_data.empty()) {
+            throw std::runtime_error("Cannot load media chunk from server tokens state");
+        }
+
+        mtmd::input_chunk_ptr chunk(mtmd_input_chunk_load(chunk_data.data(), chunk_data.size()));
+        if (!chunk) {
+            throw std::runtime_error("Cannot load media chunk from server tokens state");
+        }
+        result.map_idx_to_media[start_idx] = std::move(chunk);
+    }
+
+    if (reader.remaining() >= sizeof(llama_token)) {
+        throw std::runtime_error("Trailing data in server tokens state");
+    }
+
+    return result;
 }
 
 llama_tokens server_tokens::get_text_tokens() const {
@@ -422,6 +812,7 @@ llama_tokens server_tokens::get_text_tokens() const {
 void server_tokens::set_token(llama_pos pos, llama_token id) {
     GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
     tokens[pos] = id;
+    invalidate_retention_token_digest();
 }
 
 void server_tokens::keep_first(size_t n) {
@@ -454,7 +845,10 @@ void server_tokens::keep_first(size_t n) {
             }
         }
     }
-    tokens.resize(n);
+    if (tokens.size() != n) {
+        tokens.resize(n);
+        invalidate_retention_token_digest();
+    }
 }
 
 std::string server_tokens::detokenize(const llama_context * ctx, bool special) const {
@@ -493,13 +887,18 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
 
             GGML_ASSERT(a_chunk && b_chunk);
 
-            const std::string id_ai = mtmd_input_chunk_get_id(a_chunk.get());
-            const std::string id_bi = mtmd_input_chunk_get_id(b_chunk.get());
+            // compare via C strings to keep this prefix scan allocation-free: it runs inside the
+            // exception-sensitive prompt-cache save/load paths where an OOM mid-scan must not leave
+            // the cache partially mutated (mtmd_input_chunk_get_id returns the id's c_str()).
+            const char * id_ai = mtmd_input_chunk_get_id(a_chunk.get());
+            const char * id_bi = mtmd_input_chunk_get_id(b_chunk.get());
 
             const size_t n_tok_a = mtmd_input_chunk_get_n_tokens(a_chunk.get());
             const size_t n_tok_b = mtmd_input_chunk_get_n_tokens(b_chunk.get());
 
-            if (id_ai == id_bi && n_tok_a == n_tok_b) {
+            // An empty chunk id means unidentified media. Equal shapes do not
+            // establish equal content, so unknown ids always end the prefix.
+            if (id_ai && id_ai[0] != '\0' && id_bi && std::strcmp(id_ai, id_bi) == 0 && n_tok_a == n_tok_b) {
                 GGML_ASSERT(n_tok_a > 0 && "Invalid media chunk"); // should never happen
                 i += n_tok_a - 1; // will be +1 by the for loop
                 continue;
@@ -530,14 +929,28 @@ bool server_tokens::validate(const struct llama_context * ctx) const {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    size_t n_media = 0;
 
     for (size_t i = 0; i < tokens.size(); ++i) {
         const auto & t = tokens[i];
         if (t == LLAMA_TOKEN_NULL) {
             try {
                 const auto & chunk = find_chunk(i);
-                size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk.get());
-                i += n_tokens - 1; // will be +1 by the for loop
+                if (mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+                    return false;
+                }
+                const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk.get());
+                const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
+                if (n_tokens == 0 || n_pos <= 0 || n_tokens > tokens.size() - i) {
+                    return false;
+                }
+                for (size_t j = i; j < i + n_tokens; ++j) {
+                    if (tokens[j] != LLAMA_TOKEN_NULL) {
+                        return false;
+                    }
+                }
+                ++n_media;
+                i += n_tokens - 1;
             } catch (const std::exception & e) {
                 return false;
             }
@@ -545,19 +958,77 @@ bool server_tokens::validate(const struct llama_context * ctx) const {
             return false;
         }
     }
-    return true;
+    return n_media == map_idx_to_media.size();
 }
 
 server_tokens server_tokens::clone() const {
     server_tokens res;
     res.has_mtmd = has_mtmd;
     res.tokens   = tokens;
+    res.retention_token_digest_cache = retention_token_digest_cache;
+    res.retention_token_digest_valid = retention_token_digest_valid;
     for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
         size_t idx = it->first;
         const mtmd::input_chunk_ptr & chunk = it->second;
         res.map_idx_to_media[idx] = mtmd::input_chunk_ptr(mtmd_input_chunk_copy(chunk.get()));
     }
     return res;
+}
+
+server_tokens server_tokens::clone_text_prefix(size_t n) const {
+    if (has_media() || n > tokens.size()) {
+        throw std::invalid_argument("server_tokens text prefix is unavailable");
+    }
+    server_tokens res;
+    res.has_mtmd = has_mtmd;
+    res.tokens.assign(tokens.begin(), tokens.begin() + n);
+    return res;
+}
+
+server_tokens server_tokens::clone_cached_prefix(size_t n) const {
+    if (!has_media()) { return clone_text_prefix(n); }
+    std::string identity;
+    if (n > tokens.size() || !media_content_identity(n, identity)) {
+        throw std::invalid_argument("server_tokens cached prefix is unavailable");
+    }
+    server_tokens res;
+    res.has_mtmd = has_mtmd;
+    res.tokens.assign(tokens.begin(), tokens.begin() + n);
+    for (const auto & entry : map_idx_to_media) {
+        if (entry.first >= n) { break; }
+        mtmd::input_chunk_ptr chunk(mtmd_input_chunk_get_placeholder(entry.second.get()));
+        if (!chunk) { throw std::runtime_error("media prefix placeholder failed"); }
+        res.map_idx_to_media.emplace(entry.first, std::move(chunk));
+    }
+    return res;
+}
+
+std::vector<llama_pos> server_tokens::prefix_row_positions(size_t n) const {
+    std::string identity;
+    if (n > tokens.size() || !media_content_identity(n, identity)) {
+        throw std::invalid_argument("server_tokens prefix positions are unavailable");
+    }
+    std::vector<llama_pos> rows;
+    rows.reserve(n);
+    llama_pos pos = 0;
+    for (size_t i = 0; i < n;) {
+        if (tokens[i] != LLAMA_TOKEN_NULL) {
+            rows.push_back(pos++);
+            ++i;
+            continue;
+        }
+        const auto & chunk = find_chunk(i);
+        const size_t count = mtmd_input_chunk_get_n_tokens(chunk.get());
+        const auto * image = mtmd_input_chunk_get_tokens_image(chunk.get());
+        for (size_t j = 0; j < count; ++j) {
+            // Same primary positions as mtmd_helper_decode_image_chunk. Audio
+            // uses the sequential 1D mapping even with M-RoPE enabled.
+            rows.push_back(image ? mtmd_image_tokens_get_decoder_pos(image, pos, j).t : pos + j);
+        }
+        i += count;
+        pos += mtmd_input_chunk_get_n_pos(chunk.get());
+    }
+    return rows;
 }
 
 //
@@ -687,12 +1158,17 @@ size_t validate_utf8(const std::string& text) {
     return len;
 }
 
-server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & prompt, const std::vector<raw_buffer> & files, bool is_placeholder) {
+server_tokens process_mtmd_prompt(
+        mtmd_context * mctx,
+        const std::string & prompt,
+        const std::vector<raw_buffer> & files,
+        const mtmd_helper_init_opt & init_opt,
+        bool is_placeholder) {
     // these will be freed upon going out of scope
     mtmd::bitmaps bitmaps;
     std::vector<mtmd_helper::video_ptr> videos;
     for (auto & file : files) {
-        auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder);
+        auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
         if (!out.bitmap) {
             throw std::runtime_error("Failed to load image or audio file");
         }
@@ -733,7 +1209,7 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & promp
  * - "prompt": [12, 34, "string", 56, 78]
  * - "prompt": { "prompt_string": "string", "multimodal_data": [ "base64" ] }
  */
-static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt, bool add_special, bool parse_special) {
+static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt, bool add_special, bool parse_special, const mtmd_helper_init_opt & init_opt) {
     constexpr char JSON_STRING_PROMPT_KEY[] = "prompt_string";
     constexpr char JSON_MTMD_DATA_KEY[] = "multimodal_data";
     const bool has_mtmd = mctx != nullptr;
@@ -756,7 +1232,7 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_co
             for (const auto & entry : json_prompt.at(JSON_MTMD_DATA_KEY)) {
                 files.push_back(base64_decode(entry));
             }
-            return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files);
+            return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files, init_opt);
         } else {
             // Not multimodal, but contains a subobject.
             llama_tokens tmp = tokenize_mixed(vocab, json_prompt.at(JSON_STRING_PROMPT_KEY), add_special, parse_special);
@@ -767,15 +1243,15 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_co
    }
 }
 
-std::vector<server_tokens> tokenize_input_prompts(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt, bool add_special, bool parse_special) {
+std::vector<server_tokens> tokenize_input_prompts(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt, bool add_special, bool parse_special, const mtmd_helper_init_opt & init_opt) {
     std::vector<server_tokens> result;
     if (json_prompt.is_array() && !json_is_array_and_contains_numbers(json_prompt)) {
         result.reserve(json_prompt.size());
         for (const auto & p : json_prompt) {
-            result.push_back(tokenize_input_subprompt(vocab, mctx, p,add_special, parse_special));
+            result.push_back(tokenize_input_subprompt(vocab, mctx, p, add_special, parse_special, init_opt));
         }
     } else {
-        result.push_back(tokenize_input_subprompt(vocab, mctx, json_prompt, add_special, parse_special));
+        result.push_back(tokenize_input_subprompt(vocab, mctx, json_prompt, add_special, parse_special, init_opt));
     }
     if (result.empty()) {
         throw std::runtime_error("\"prompt\" must not be empty");
@@ -834,8 +1310,7 @@ json oaicompat_completion_params_parse(const json & body) {
 static void handle_media(
         std::vector<raw_buffer> & out_files,
         const std::string & url,
-        const std::string & media_path,
-        bool accept_base64_uri) {
+        const std::string & media_path) {
     if (!media_path.empty()) {
         // should already be enforced by arg.cpp, but checking just in case
         GGML_ASSERT(media_path.back() == DIRECTORY_SEPARATOR);
@@ -876,15 +1351,17 @@ static void handle_media(
         data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         out_files.push_back(data);
 
-    } else if (accept_base64_uri && string_starts_with(url, "data:")) {
-        // try to decode base64 image
+    } else if (string_starts_with(url, "data:")) {
+        // try to decode base64 image, video, or audio
         std::vector<std::string> parts = string_split<std::string>(url, /*separator*/ ',');
         if (parts.size() != 2) {
-            throw std::runtime_error("Invalid uri-encoded base64 value");
-        } else if (!string_starts_with(parts[0], "data:image/")) {
-            throw std::runtime_error("Invalid uri format: " + parts[0]);
+            throw std::invalid_argument("Invalid uri-encoded base64 value");
+        } else if (!string_starts_with(parts[0], "data:image/")
+                && !string_starts_with(parts[0], "data:video/")
+                && !string_starts_with(parts[0], "data:audio/")) {
+            throw std::invalid_argument("Invalid uri format: " + parts[0]);
         } else if (!string_ends_with(parts[0], "base64")) {
-            throw std::runtime_error("uri must be base64 encoded");
+            throw std::invalid_argument("uri must be base64 encoded");
         } else {
             auto base64_data = parts[1];
             auto decoded_data = base64_decode(base64_data);
@@ -952,6 +1429,11 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    // An explicitly empty schema requests any object; an absent schema stays absent.
+    if (json_schema.is_object() && json_schema.empty()) {
+        json_schema["type"] = "object";
+    }
+
     // get input files
     if (!body.contains("messages")) {
         throw std::invalid_argument("'messages' is required");
@@ -991,7 +1473,7 @@ json oaicompat_chat_params_parse(
 
                 json image_url = json_value(p, "image_url", json::object());
                 std::string url = json_value(image_url, "url", std::string());
-                handle_media(out_files, url, opt.media_path, true);
+                handle_media(out_files, url, opt.media_path);
 
                 p["type"] = "media_marker";
                 p["text"] = get_media_marker();
@@ -1006,7 +1488,7 @@ json oaicompat_chat_params_parse(
                 json input_audio = json_value(p, "input_audio", json::object());
                 std::string url  = json_value(input_audio, "data",
                                         json_value(input_audio, "url", std::string()));
-                handle_media(out_files, url, opt.media_path, false);
+                handle_media(out_files, url, opt.media_path);
 
                 p["type"] = "media_marker";
                 p["text"] = get_media_marker();
@@ -1020,7 +1502,7 @@ json oaicompat_chat_params_parse(
                 json input_video = json_value(p, "input_video", json::object());
                 std::string url  = json_value(input_video, "data",
                                         json_value(input_video, "url", std::string()));
-                handle_media(out_files, url, opt.media_path, false);
+                handle_media(out_files, url, opt.media_path);
 
                 p["type"] = "media_marker";
                 p["text"] = get_media_marker();
@@ -1057,6 +1539,12 @@ json oaicompat_chat_params_parse(
     if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && inputs.add_generation_prompt) {
         throw std::invalid_argument("Cannot set both add_generation_prompt and continue_final_message to true.");
     }
+    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE
+        && !inputs.messages.empty()
+        && inputs.messages.back().role == "assistant"
+        && !inputs.messages.back().tool_calls.empty()) {
+        throw std::invalid_argument("Cannot continue an assistant message that contains tool calls.");
+    }
     inputs.reasoning_format = opt.reasoning_format;
     if (body.contains("reasoning_format")) {
         inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
@@ -1086,27 +1574,15 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
-    // if the assistant message appears at the end of list, we do not add end-of-turn token
-    // for ex. this can be useful to modify the reasoning process in reasoning models
-    bool prefill_assistant_message = !inputs.messages.empty() && inputs.messages.back().role == "assistant" && opt.prefill_assistant;
-    common_chat_msg last_message;
-    if (prefill_assistant_message) {
-        last_message = inputs.messages.back();
-        inputs.messages.pop_back();
-
-        /* sanity check, max one assistant message at the end of the list */
-        if (!inputs.messages.empty() && inputs.messages.back().role == "assistant"){
-            throw std::invalid_argument("Cannot have 2 or more assistant messages at the end of the list.");
+    // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
+    if (body.contains("reasoning_effort")) {
+        auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
+        if (reasoning_effort == "none") {
+            inputs.enable_thinking = false;
+            inputs.chat_template_kwargs.erase("reasoning_effort");
+        } else if (!reasoning_effort.empty()) {
+            inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         }
-
-        inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
-
-        // Upstream guarded against assistant prefill + enable_thinking with a
-        // blanket error, but harnesses that track thinking tokens themselves
-        // (hermes, etc.) drive prefill-to-continue for thinking-only responses
-        // and need both on at once. Experimental fork: allow it.
-
-        inputs.add_generation_prompt = true;
     }
 
     inputs.force_pure_content = opt.force_pure_content;
@@ -1146,10 +1622,10 @@ json oaicompat_chat_params_parse(
             reasoning_budget = opt.reasoning_budget;
         }
 
-        if (!chat_params.thinking_end_tag.empty()) {
+        if (!chat_params.thinking_end_tags.empty()) {
             llama_params["reasoning_budget_tokens"] = reasoning_budget;
             llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
-            llama_params["reasoning_budget_end_tag"] = chat_params.thinking_end_tag;
+            llama_params["reasoning_budget_end_tags"] = chat_params.thinking_end_tags;
             llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
             llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
         }
@@ -1276,25 +1752,9 @@ json format_response_rerank(
 // other utils
 //
 
-std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top) {
-    std::vector<llama_token_data> cur;
-
-    const auto * logits = llama_get_logits_ith(ctx, idx);
-    const llama_token * sampled_ids = llama_get_sampled_candidates_ith(ctx, idx);
-
-    const int n_logits = llama_get_sampled_logits_count_ith(ctx, idx);
-
-    cur.resize(n_logits);
-    if (sampled_ids) {
-        for (int i = 0; i < n_logits; i++) {
-            cur[i] = llama_token_data{sampled_ids[i], logits[i], 0.0f};
-        }
-    } else {
-        for (llama_token token_id = 0; token_id < n_logits; token_id++) {
-            cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
-        }
-    }
-
+static std::vector<llama_token_data> token_probabilities_finish(
+        std::vector<llama_token_data> cur,
+        size_t n_top) {
     // sort tokens by logits (partial: only the leading `n_top` need ordering)
     if (n_top > cur.size()) {
         n_top = cur.size();
@@ -1328,8 +1788,33 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
     return cur;
 }
 
+std::vector<llama_token_data> get_token_probabilities(const float * logits, size_t n_logits, size_t n_top) {
+    std::vector<llama_token_data> cur(n_logits);
+    for (size_t token_id = 0; token_id < n_logits; token_id++) {
+        cur[token_id] = llama_token_data{llama_token(token_id), logits[token_id], 0.0f};
+    }
+    return token_probabilities_finish(std::move(cur), n_top);
+}
+
+std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top) {
+    const auto * logits = llama_get_logits_ith(ctx, idx);
+    const llama_token * sampled_ids = llama_get_sampled_candidates_ith(ctx, idx);
+    const int n_logits = llama_get_sampled_logits_count_ith(ctx, idx);
+    std::vector<llama_token_data> cur((size_t(n_logits)));
+    if (sampled_ids) {
+        for (int i = 0; i < n_logits; i++) {
+            cur[size_t(i)] = llama_token_data{sampled_ids[i], logits[i], 0.0f};
+        }
+    } else {
+        for (llama_token token_id = 0; token_id < n_logits; token_id++) {
+            cur[size_t(token_id)] = llama_token_data{token_id, logits[token_id], 0.0f};
+        }
+    }
+    return token_probabilities_finish(std::move(cur), n_top);
+}
+
 std::string safe_json_to_str(const json & data) {
-    return data.dump(-1, ' ', false, json::error_handler_t::replace);
+    return data.dump_safe();
 }
 
 // TODO: reuse llama_detokenize
@@ -1570,7 +2055,8 @@ server_tokens format_prompt_rerank(
         const struct llama_vocab * vocab,
         mtmd_context * mctx,
         const std::string & query,
-        const std::string & doc) {
+        const std::string & doc,
+        const mtmd_helper_init_opt & init_opt) {
     server_tokens result = {};
 
     const char * rerank_prompt = llama_model_chat_template(model, "rerank");
@@ -1579,12 +2065,12 @@ server_tokens format_prompt_rerank(
         std::string prompt = rerank_prompt;
         string_replace_all(prompt, "{query}"   , query);
         string_replace_all(prompt, "{document}", doc  );
-        server_tokens tokens = tokenize_input_subprompt(vocab, mctx, prompt, false, true);
+        server_tokens tokens = tokenize_input_subprompt(vocab, mctx, prompt, false, true, init_opt);
         result.push_back(tokens);
     } else {
         // Get EOS token - use SEP token as fallback if EOS is not available
-        server_tokens query_tokens = tokenize_input_subprompt(vocab, mctx, query, false, false);
-        server_tokens doc_tokens   = tokenize_input_subprompt(vocab, mctx, doc,   false, false);
+        server_tokens query_tokens = tokenize_input_subprompt(vocab, mctx, query, false, false, init_opt);
+        server_tokens doc_tokens   = tokenize_input_subprompt(vocab, mctx, doc,   false, false, init_opt);
         llama_token eos_token = llama_vocab_eos(vocab);
         if (eos_token == LLAMA_TOKEN_NULL) {
             eos_token = llama_vocab_sep(vocab);
@@ -1607,4 +2093,259 @@ server_tokens format_prompt_rerank(
     }
 
     return result;
+}
+
+// ---- cache receipt (§7.7) ----
+// Self-contained SHA-256 (FIPS 180-4). The receipt is an untrusted hint; the
+// key prevents cross-tenant prompt-content inference, not forgery. Kept local
+// so the API surface has no TLS-backend-conditional dependency.
+namespace {
+
+struct sha256_ctx {
+    uint32_t h[8];
+    uint64_t len = 0;
+    uint8_t  buf[64];
+    size_t   buf_len = 0;
+};
+
+static const uint32_t sha256_k[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+};
+
+static inline uint32_t rotr32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+
+static void sha256_init(sha256_ctx & c) {
+    static const uint32_t iv[8] = {
+        0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19,
+    };
+    memcpy(c.h, iv, sizeof(iv));
+    c.len = 0;
+    c.buf_len = 0;
+}
+
+static void sha256_block(sha256_ctx & c, const uint8_t * p) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; ++i) {
+        w[i] = (uint32_t) p[4*i] << 24 | (uint32_t) p[4*i+1] << 16 |
+               (uint32_t) p[4*i+2] << 8 | (uint32_t) p[4*i+3];
+    }
+    for (int i = 16; i < 64; ++i) {
+        const uint32_t s0 = rotr32(w[i-15], 7) ^ rotr32(w[i-15], 18) ^ (w[i-15] >> 3);
+        const uint32_t s1 = rotr32(w[i-2], 17) ^ rotr32(w[i-2], 19) ^ (w[i-2] >> 10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint32_t a=c.h[0],b=c.h[1],d0=c.h[2],d=c.h[3],e=c.h[4],f=c.h[5],g=c.h[6],h=c.h[7];
+    for (int i = 0; i < 64; ++i) {
+        const uint32_t S1 = rotr32(e,6) ^ rotr32(e,11) ^ rotr32(e,25);
+        const uint32_t ch = (e & f) ^ (~e & g);
+        const uint32_t t1 = h + S1 + ch + sha256_k[i] + w[i];
+        const uint32_t S0 = rotr32(a,2) ^ rotr32(a,13) ^ rotr32(a,22);
+        const uint32_t mj = (a & b) ^ (a & d0) ^ (b & d0);
+        const uint32_t t2 = S0 + mj;
+        h=g; g=f; f=e; e=d+t1; d=d0; d0=b; b=a; a=t1+t2;
+    }
+    c.h[0]+=a; c.h[1]+=b; c.h[2]+=d0; c.h[3]+=d; c.h[4]+=e; c.h[5]+=f; c.h[6]+=g; c.h[7]+=h;
+}
+
+static void sha256_update(sha256_ctx & c, const void * data, size_t n) {
+    const uint8_t * p = (const uint8_t *) data;
+    c.len += n;
+    while (n > 0) {
+        const size_t take = std::min(n, (size_t) 64 - c.buf_len);
+        memcpy(c.buf + c.buf_len, p, take);
+        c.buf_len += take; p += take; n -= take;
+        if (c.buf_len == 64) {
+            sha256_block(c, c.buf);
+            c.buf_len = 0;
+        }
+    }
+}
+
+static void sha256_final(sha256_ctx & c, uint8_t out[32]) {
+    const uint64_t bits = c.len * 8;
+    const uint8_t pad = 0x80;
+    sha256_update(c, &pad, 1);
+    const uint8_t zero = 0;
+    while (c.buf_len != 56) {
+        sha256_update(c, &zero, 1);
+    }
+    uint8_t lb[8];
+    for (int i = 0; i < 8; ++i) {
+        lb[i] = (uint8_t) (bits >> (56 - 8*i));
+    }
+    sha256_update(c, lb, 8);
+    for (int i = 0; i < 8; ++i) {
+        out[4*i]   = (uint8_t) (c.h[i] >> 24);
+        out[4*i+1] = (uint8_t) (c.h[i] >> 16);
+        out[4*i+2] = (uint8_t) (c.h[i] >> 8);
+        out[4*i+3] = (uint8_t) (c.h[i]);
+    }
+}
+
+} // namespace
+
+std::vector<std::string> cache_receipt_chain(
+        const std::vector<llama_token> & tokens,
+        uint32_t                          block_tokens,
+        const std::string &               key) {
+    std::vector<std::string> chain;
+    if (block_tokens == 0) {
+        return chain;
+    }
+    uint8_t prev[32] = {0};
+    static const char hexd[] = "0123456789abcdef";
+    for (size_t off = 0; off < tokens.size(); off += block_tokens) {
+        const size_t n = std::min((size_t) block_tokens, tokens.size() - off);
+        sha256_ctx c;
+        sha256_init(c);
+        sha256_update(c, key.data(), key.size());
+        sha256_update(c, prev, sizeof(prev));
+        sha256_update(c, tokens.data() + off, n * sizeof(llama_token));
+        sha256_final(c, prev);
+        std::string hex;
+        hex.reserve(16);
+        for (int i = 0; i < 8; ++i) {   // trunc64: first 8 bytes as hex
+            hex.push_back(hexd[prev[i] >> 4]);
+            hex.push_back(hexd[prev[i] & 0xf]);
+        }
+        chain.push_back(std::move(hex));
+    }
+    return chain;
+}
+
+//
+// server_subproc
+//
+
+bool server_subproc::has_output() {
+    if (out_handle >= 0) {
+        return true;
+    }
+    FILE * f = sproc.stdout_file(); // combined stdout/stderr
+    if (!f) {
+        return false;
+    }
+#ifdef _WIN32
+    HANDLE h = (HANDLE) _get_osfhandle(_fileno(f));
+    if (h != INVALID_HANDLE_VALUE) {
+        out_handle = (intptr_t) h;
+    }
+#else
+    int fd = fileno(f);
+    if (fd >= 0) {
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        out_handle = fd;
+    }
+#endif
+    return out_handle >= 0;
+}
+
+int server_subproc::read_output(char * buf, size_t len) {
+    if (!has_output()) {
+        return -1;
+    }
+#ifdef _WIN32
+    HANDLE h     = (HANDLE) out_handle;
+    DWORD  avail = 0;
+    if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) {
+        return -1; // pipe broken, child gone
+    }
+    if (avail == 0) {
+        return 0;
+    }
+    DWORD to_read = avail < (DWORD) len ? avail : (DWORD) len;
+    DWORD got     = 0;
+    if (!ReadFile(h, buf, to_read, &got, NULL) || got == 0) {
+        return -1;
+    }
+    return (int) got;
+#else
+    while (true) {
+        ssize_t r = read((int) out_handle, buf, len);
+        if (r > 0) {
+            return (int) r;
+        }
+        if (r == 0) {
+            return -1; // EOF
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+        return -1;
+    }
+#endif
+}
+
+server_subproc::waiter::waiter() {
+#ifndef _WIN32
+    int fds[2];
+    GGML_ASSERT(pipe(fds) == 0);
+    for (int fd : fds) {
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    }
+    wake_fd[0] = fds[0];
+    wake_fd[1] = fds[1];
+#endif
+}
+
+server_subproc::waiter::~waiter() {
+#ifndef _WIN32
+    close((int) wake_fd[0]);
+    close((int) wake_fd[1]);
+#endif
+}
+
+void server_subproc::waiter::wake() {
+#ifndef _WIN32
+    char c = 1;
+    (void) !write((int) wake_fd[1], &c, 1);
+#endif
+}
+
+void server_subproc::waiter::wait(const std::vector<server_subproc *> & procs, std::vector<bool> & ready, int64_t timeout_ms) {
+    ready.assign(procs.size(), false);
+#ifdef _WIN32
+    // no waitable wait exists for anonymous pipes, so poll them in 50 ms steps
+    bool any = false;
+    for (size_t i = 0; i < procs.size(); i++) {
+        DWORD avail = 0;
+        if (!procs[i]->has_output() || !PeekNamedPipe((HANDLE) procs[i]->out_handle, NULL, 0, NULL, &avail, NULL) || avail > 0) {
+            ready[i] = true; // data or broken pipe, read_output() tells which
+            any = true;
+        }
+    }
+    if (!any) {
+        int64_t step = timeout_ms < 0 ? 50 : std::min<int64_t>(timeout_ms, 50);
+        std::this_thread::sleep_for(std::chrono::milliseconds(step));
+    }
+#else
+    std::vector<pollfd> pfds;
+    pfds.reserve(procs.size() + 1);
+    pfds.push_back({ (int) wake_fd[0], POLLIN, 0 });
+    for (auto * p : procs) {
+        pfds.push_back({ p->has_output() ? (int) p->out_handle : -1, POLLIN, 0 }); // poll() skips negative fds
+    }
+    int timeout = timeout_ms < 0 ? -1 : (int) std::min<int64_t>(timeout_ms, std::numeric_limits<int>::max());
+    int r = poll(pfds.data(), pfds.size(), timeout);
+    if (r < 0 && errno != EINTR) {
+        LOG_ERR("%s: poll() failed: %s\n", __func__, strerror(errno));
+    }
+    if (pfds[0].revents) {
+        char buf[64];
+        while (read((int) wake_fd[0], buf, sizeof(buf)) > 0) {}
+    }
+    for (size_t i = 0; i < procs.size(); i++) {
+        ready[i] = pfds[i + 1].fd < 0 || pfds[i + 1].revents != 0;
+    }
+#endif
 }

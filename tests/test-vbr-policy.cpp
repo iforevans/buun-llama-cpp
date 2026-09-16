@@ -78,16 +78,16 @@ static std::vector<size_t> reference_mutating_order(std::vector<child> children)
 static void test_root_first_stable_tie() {
     // The caller supplies root first.  In the successor's SWA-root topology that is SWA, so SWA
     // must win every exact proportional-progress tie without an allocator-dependent tiebreak.
-    child swa_root = { 0, 100, { gain(25, 0), gain(25, 1), gain(50, 2) } };
-    child base_peer = { 0, 200, { gain(50, 0), gain(50, 1), gain(100, 2) } };
+    child swa_root = { 0, 100, { gain(25, 0), gain(25, 1), gain(50, 2) }, {} };
+    child base_peer = { 0, 200, { gain(50, 0), gain(50, 1), gain(100, 2) }, {} };
     const std::vector<size_t> got = drain({ swa_root, base_peer });
     const std::vector<size_t> expected = { 0, 1, 0, 1, 0, 1 };
     assert(got == expected);
 }
 
 static void test_negative_initial_progress_is_clamped_only_for_ranking() {
-    child root = { -50, 50, { gain(50, 0), gain(50, 1) } };
-    child peer = {   0, 50, { gain(25, 0), gain(25, 1) } };
+    child root = { -50, 50, { gain(50, 0), gain(50, 1) }, {} };
+    child peer = {   0, 50, { gain(25, 0), gain(25, 1) }, {} };
     // Both initially rank as zero, so root wins.  Its signed progress becomes zero, producing
     // another exact tie that root wins again.  Only then can peer advance.
     const std::vector<size_t> got = drain({ root, peer });
@@ -97,8 +97,8 @@ static void test_negative_initial_progress_is_clamped_only_for_ranking() {
 
 static void test_shortest_prefix_callback_runs_after_each_real_step() {
     shortest_prefix_stream stream({
-        { 0, 100, { gain(25, 0), gain(25, 1), gain(50, 2) } },
-        { 0, 100, { gain(25, 0), gain(25, 1), gain(50, 2) } },
+        { 0, 100, { gain(25, 0), gain(25, 1), gain(50, 2) }, {} },
+        { 0, 100, { gain(25, 0), gain(25, 1), gain(50, 2) }, {} },
     });
     std::vector<selection> prefix;
     size_t prices = 0;
@@ -130,13 +130,13 @@ static void test_checked_page_padded_logical_progress() {
 
 static void test_checked_progress_overflow_and_invalid_gain() {
     shortest_prefix_stream overflow({
-        { std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::max(), { gain(1) } },
+        { std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::max(), { gain(1) }, {} },
     });
     selection s;
     assert(overflow.next(s) == result::overflow);
     assert(overflow.selected().empty());
 
-    shortest_prefix_stream invalid({ { 0, 1, { gain(-1) } } });
+    shortest_prefix_stream invalid({ { 0, 1, { gain(-1) }, {} } });
     assert(invalid.next(s) == result::invalid);
 }
 
@@ -199,8 +199,8 @@ static void test_allocator_history_contamination_reproduction() {
     assert(contaminated_first_pick(60, 0) == 1);
     assert(contaminated_first_pick(0, 60) == 0);
 
-    const child root = { 0, 100, { gain(50) } };
-    const child peer = { 0, 100, { gain(50) } };
+    const child root = { 0, 100, { gain(50) }, {} };
+    const child peer = { 0, 100, { gain(50) }, {} };
     const auto history_a = drain({ root, peer });
     const auto history_b = drain({ root, peer });
     assert(history_a == history_b);
@@ -208,8 +208,8 @@ static void test_allocator_history_contamination_reproduction() {
 }
 
 static void test_nonpositive_terminal_child_is_ineligible() {
-    child ineligible = { -100, 0, { gain(100) } };
-    child root = { 0, 10, { gain(10) } };
+    child ineligible = { -100, 0, { gain(100) }, {} };
+    child root = { 0, 10, { gain(10) }, {} };
     const auto got = drain({ root, ineligible });
     assert(got.size() == 1 && got[0] == 0);
 }
