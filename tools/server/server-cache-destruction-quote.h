@@ -92,6 +92,7 @@ server_cache_destruction_quote_single_artifact(
 void server_cache_destruction_select_quote(
     common_cache_plan_record & rec,
     common_cache_plan_destruction_counters & counters,
+    int32_t selected_candidate,
     common_cache_plan_destruction_effect_set permitted_effects = 0) noexcept;
 
 // The lifecycle-off projection lives beside the production selector so its

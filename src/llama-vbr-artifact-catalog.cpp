@@ -346,6 +346,7 @@ Digest projected_digest(
     hash.u64(unit.snapshot().generation.repr_gen);
     hash.u32(uint32_t(unit.snapshot().generation.current_type));
     hash.u32(uint32_t(unit.snapshot().generation.last_source_type));
+    hash.u32(uint32_t(unit.snapshot().generation.effective_type));
     hash.u32(uint32_t(descriptor.side));
     hash.u32(uint32_t(descriptor.layout));
     hash.u64(descriptor.lineage_uuid.hi);
@@ -358,6 +359,7 @@ Digest projected_digest(
         descriptor.representation.reference_digest.size());
     hash.u32(descriptor.representation.source_loss_history);
     hash.u32(descriptor.representation.checkpoint_codec_hops);
+    hash.u32(uint32_t(descriptor.representation.effective_type));
     hash.u32(descriptor.n_stream);
     hash.u32(descriptor.unified ? 1 : 0);
     hash.u32(descriptor.rank);
@@ -480,6 +482,7 @@ bool normalize_projected_package(
             if (sealed.repr_gen != live.repr_gen ||
                 sealed.current_type != live.current_type ||
                 sealed.last_source_type != live.last_source_type ||
+                sealed.effective_type != live.effective_type ||
                 sealed.domain != live.domain ||
                 sealed.promote_hops != live.promote_hops ||
                 sealed.last_transition != live.last_transition) {

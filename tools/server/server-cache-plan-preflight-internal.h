@@ -23,8 +23,6 @@ private:
 struct server_cache_plan_preflight_semantics {
     bool completion_semantics = false;
     bool host_lookup_enabled = false;
-    common_cache_plan_recovery_citation recovery_citation =
-        common_cache_plan_recovery_citation::unavailable;
 };
 
 // The preflight task enum is deliberately not a completion. This pure door

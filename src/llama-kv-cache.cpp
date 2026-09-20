@@ -4072,9 +4072,42 @@ uint32_t llama_kv_cache::vbr_watermark_cells(uint32_t extra_tokens) const {
     uint32_t wm = 0;
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
-        wm = std::max(wm, std::min(cells.size(), GGML_PAD(cells.used_max_p1() + extra_tokens, n_pad_cur)));
+        const uint64_t projected = uint64_t(cells.used_max_p1()) + extra_tokens;
+        wm = std::max(wm, uint32_t(std::min(uint64_t(cells.size()), GGML_PAD(projected, n_pad_cur))));
     }
     return wm;
+}
+
+uint32_t llama_kv_cache::vbr_import_watermark_cells(
+        uint32_t incoming_cells, uint32_t prefix_cells, uint32_t source_watermark,
+        llama_seq_id destination) const {
+    if (other) { return other->vbr_import_watermark_cells(incoming_cells, prefix_cells, source_watermark, destination); }
+    if (destination < 0 || size_t(destination) >= seq_to_stream.size()) { return 0; }
+    const auto & cells = v_cells[seq_to_stream[destination]];
+    if (cells.get_used() == 0) {
+        if (source_watermark == 0) { return vbr_watermark_cells(incoming_cells); }
+        // Whole imports preserve source physical placements, including holes
+        // left by earlier provisional replacements. Prefix projections pass
+        // their compacted high-water instead. The suffix resumes after it.
+        const uint64_t suffix = incoming_cells > prefix_cells ? incoming_cells-prefix_cells : 0;
+        return vbr_watermark_cells(uint32_t(std::min(uint64_t(UINT32_MAX), source_watermark+suffix)));
+    }
+    uint32_t incumbent = 0;
+    // Price growth beyond the rows being replaced, retaining foreign rows and
+    // physical holes. Unknown ownership gets no reclaim credit. Shared rows
+    // remain forbidden by the later occupied-replacement guard.
+    if (!vbr_ownership_ || !vbr_ownership_->rank_below(
+            seq_to_stream[destination], destination, std::numeric_limits<llama_pos>::max(), incumbent)) {
+        incumbent = 0;
+    }
+    // The guard prefers provisional free cells, leaving the incumbent's old
+    // physical range behind the resumed head. Credit reuse only when the
+    // guard must recycle the incumbent (and the prefix fits those rows).
+    if (source_watermark != 0 &&
+        (prefix_cells <= cells.size()-cells.get_used() || prefix_cells > incumbent)) {
+        incumbent = 0;
+    }
+    return vbr_watermark_cells(incoming_cells > incumbent ? uint32_t(incoming_cells-incumbent) : 0);
 }
 
 // multi-pool helpers: any pool VMM-backed / pool owning a tensor (by buffer) / any pool projected
@@ -5109,12 +5142,12 @@ static uint64_t vbr_policy_endpoint_bytes(
 }
 
 bool llama_kv_cache::vbr_policy_priced_steps(
-        std::vector<ggml_type> & sim, size_t start_cursor,
+        std::vector<ggml_type> & sim, size_t start_cursor, size_t end_cursor,
         int demanded_device, uint32_t watermark, bool fixed_watermark,
         bool fail_closed, llama_vbr_policy::child & out,
         vbr_hard_seal_consult_session * seal_session) const {
     int64_t terminal = out.initial_progress;
-    for (size_t i = start_cursor; i < vbr_demand_limit(); ++i) {
+    for (size_t i = start_cursor; i < std::min(end_cursor, vbr_degrade_order_.size()); ++i) {
         size_t slot = 0;
         const ggml_tensor * canonical = nullptr;
         ggml_type type_b = GGML_TYPE_COUNT;
@@ -5218,7 +5251,7 @@ llama_vbr_policy::child llama_kv_cache::vbr_policy_child_stream(
 
     vbr_hard_seal_consult_session seal_session;
     GGML_ASSERT(vbr_policy_priced_steps(
-        sim, vbr_degrade_cursor_, demanded_device, wm_next,
+        sim, vbr_degrade_cursor_, vbr_demand_limit(), demanded_device, wm_next,
         false, false, out,
         vbr_hard_seal_guard_ ? &seal_session : nullptr));
     return out;
@@ -5875,7 +5908,7 @@ bool llama_kv_cache::vbr_downward_policy_input(
         }
         auto sim = source_types;
         if (!vbr_policy_priced_steps(
-                sim, size_t(source_cursor), demanded_device,
+                sim, size_t(source_cursor), vbr_demand_limit(), demanded_device,
                 projected_wm_cells, true, true, output.policy)) {
             return false;
         }
@@ -5909,10 +5942,12 @@ bool llama_kv_cache::vbr_import_destination_input(
         // Destination negotiation is tree-wide and may span several devices.
         // Summing logical gain across every pool preserves the controller's
         // canonical per-child ladder while giving the tree interleaver one
-        // honest progress denominator.
+        // honest progress denominator. This is local allocation pressure, not
+        // peer-demand consent: use the configured aggregate floor, including
+        // when the user left that floor implicit.
         vbr_hard_seal_consult_session seal_session;
         if (!vbr_policy_priced_steps(
-            sim, vbr_degrade_cursor_, /* demanded_device = */ -1,
+            sim, vbr_degrade_cursor_, vbr_degrade_limit_, /* demanded_device = */ -1,
             projected_wm_cells, true, true, output.policy,
             vbr_hard_seal_guard_ ? &seal_session : nullptr)) {
             return false;
@@ -5965,15 +6000,12 @@ bool llama_kv_cache::vbr_import_bind_target_unit(
                 [output.logical_unit_id] != target_type) {
             return false;
         }
-        vbr_capture_stability_token policy;
-        if (!vbr_capture_policy_snapshot(policy)) {
-            return false;
-        }
         const bool movable = vbr_unit_movable(source_type, is_v);
         vbr_downward_recipe recipe;
+        // The authenticated canonical projection authorizes this unit's
+        // destination. An aggregate bpv floor is not a uniform per-unit tier.
         const auto relation = vbr_downward_resolve_recipe(
-            source_type, target_type,
-            static_cast<ggml_type>(policy.floor_type), movable, recipe);
+            source_type, target_type, target_type, movable, recipe);
         if (relation != vbr_downward_recipe_status::resolved &&
             relation != vbr_downward_recipe_status::equal_tier &&
             relation != vbr_downward_recipe_status::upward_forbidden) {
@@ -6063,7 +6095,6 @@ bool llama_kv_cache::vbr_import_bind_target_unit(
         if (downward) {
             output.downward_supported = true;
             output.downward_movable = movable;
-            output.controller_floor_type = policy.floor_type;
             output.downward_type = target_type;
             output.downward_domain = vbr_downward_tier_domain(target_type);
             output.downward_recipe_id = VBR_DOWNWARD_RECIPE_ID;
@@ -6313,18 +6344,9 @@ bool llama_kv_cache::vbr_upward_transform_import(
                       vbr_upward_mean_action::none))) {
             return false;
         }
-        if (source_domain == vbr_repr_domain::tapped) {
-            if (plan.descriptor.promote_hops >= 2 ||
-                plan.target_promote_hops !=
-                    uint8_t(plan.descriptor.promote_hops + 1) ||
-                plan.target_last_source_type !=
-                    plan.descriptor.current_type) {
-                return false;
-            }
-        } else if (source_domain != vbr_repr_domain::full ||
-                   plan.target_promote_hops != 0 ||
-                   plan.target_last_source_type !=
-                       plan.selected_target_type) {
+        if (plan.descriptor.promote_hops >= 2 ||
+            plan.target_promote_hops != uint8_t(plan.descriptor.promote_hops + 1) ||
+            plan.target_last_source_type != plan.descriptor.current_type) {
             return false;
         }
         const size_t ikv = plan.logical_unit_id/2;
@@ -7136,6 +7158,7 @@ bool vbr_capture_generation_equal(
            lhs.publish_seq == rhs.publish_seq &&
            lhs.current_type == rhs.current_type &&
            lhs.last_source_type == rhs.last_source_type &&
+           lhs.effective_type == rhs.effective_type &&
            lhs.domain == rhs.domain &&
            lhs.promote_hops == rhs.promote_hops &&
            lhs.last_transition == rhs.last_transition &&
@@ -7503,20 +7526,8 @@ bool llama_kv_cache::vbr_capture_stability_matches(
     }
     try {
         for (const auto & expected : token.units) {
-            if (tracker->unit_generation(expected.logical_unit).publish_seq !=
-                    expected.generation.publish_seq ||
-                !(tracker->unit_generation(expected.logical_unit).repr_gen ==
-                      expected.generation.repr_gen &&
-                  tracker->unit_generation(expected.logical_unit).current_type ==
-                      expected.generation.current_type &&
-                  tracker->unit_generation(expected.logical_unit).last_source_type ==
-                      expected.generation.last_source_type &&
-                  tracker->unit_generation(expected.logical_unit).domain ==
-                      expected.generation.domain &&
-                  tracker->unit_generation(expected.logical_unit).promote_hops ==
-                      expected.generation.promote_hops &&
-                  tracker->unit_generation(expected.logical_unit).last_transition ==
-                      expected.generation.last_transition)) {
+            const auto current = tracker->unit_generation(expected.logical_unit);
+            if (!vbr_capture_generation_equal(current, expected.generation)) {
                 return false;
             }
             const auto & extents = vbr_units_of(
@@ -7645,6 +7656,7 @@ bool llama_kv_cache::vbr_capture_generation_record(
                     generation.domain,
                     generation.promote_hops,
                     generation.last_transition,
+                    generation.effective_type,
                 });
             }
             output.streams.push_back(std::move(captured_stream));
@@ -8506,7 +8518,8 @@ void llama_kv_cache::vbr_full_reset() {
                         unit,
                         before.current_type,
                         target,
-                        vbr_repr_domain::full,
+                        tensor != nullptr && !llama_vbr_codec_full_domain(vbr_params_.codec, tensor->type)
+                            ? vbr_repr_domain::tapped : vbr_repr_domain::full,
                         0,
                         vbr_repr_transition::full_reset,
                         vbr_mutation_registrant::full_reset,

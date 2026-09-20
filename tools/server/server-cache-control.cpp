@@ -1393,7 +1393,6 @@ const char * server_cache_control_status_name(
         case server_cache_control_status::subject_lost: return "subject_lost";
         case server_cache_control_status::orphaned: return "orphaned";
         case server_cache_control_status::already_released: return "already_released";
-        case server_cache_control_status::profile_unfitted: return "profile_unfitted";
         case server_cache_control_status::capacity_refused: return "capacity_refused";
         case server_cache_control_status::stale_capability: return "stale_capability";
         case server_cache_control_status::internal_fault: return "internal_fault";

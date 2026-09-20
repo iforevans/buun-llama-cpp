@@ -2,6 +2,7 @@
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "speculative-mtp-adaptive.h"
 
 #include <random>
 
@@ -501,9 +502,169 @@ static void test_speculative_coupling() {
     }
 }
 
+static void test_mtp_adaptive() {
+    common_speculative_mtp_adaptive state;
+    auto cycles = [&](int n, int accepted) {
+        for (int i = 0; i < n; ++i) {
+            state.accept(state.depth(), accepted, false);
+            GGML_ASSERT(state.depth() >= 2 && state.depth() <= 3);
+        }
+    };
+    cycles(64, 3); // high-match code retains the full depth
+    GGML_ASSERT(state.depth() == 3);
+    cycles(16, 0);
+    GGML_ASSERT(state.depth() == 2);
+    cycles(7, 2);
+    GGML_ASSERT(state.depth() == 2);
+    cycles(1, 2); // prose -> code, recover without waiting for another request
+    GGML_ASSERT(state.depth() == 3);
+    cycles(16, 3);
+    GGML_ASSERT(state.depth() == 3);
+
+    cycles(16, 2); // perfect first two rows but an unhelpful third
+    GGML_ASSERT(state.depth() == 2);
+    cycles(255, 2); // not a phase change: do not repeatedly probe every 8 cycles
+    GGML_ASSERT(state.depth() == 2);
+    cycles(1, 2); // bounded periodic recovery, even without a new streak
+    GGML_ASSERT(state.depth() == 3);
+    cycles(16, 0);
+    cycles(256, 0); // periodic recovery also works with no accepted proposals
+    GGML_ASSERT(state.depth() == 3);
+
+    for (int i = 0; i < 32; ++i) {
+        state.accept(2, 0, false); // clipped draft
+        state.accept(0, 0, false); // failed/duplicate carry refresh
+        state.accept(3, 0, true);  // another implementation
+        state.accept(3, 4, false); // invalid count
+    }
+    GGML_ASSERT(state.depth() == 3);
+    cycles(15, 0);
+    GGML_ASSERT(state.depth() == 3);
+    cycles(1, 0);
+    GGML_ASSERT(state.depth() == 2);
+    state.begin(); // learned depth survives, but a new request can recover
+    GGML_ASSERT(state.depth() == 2);
+    cycles(8, 2);
+    GGML_ASSERT(state.depth() == 3);
+
+    for (int matched = 7; matched <= 8; ++matched) {
+        state.reset();
+        cycles(matched, 3);
+        cycles(16 - matched, 0);
+        GGML_ASSERT(state.depth() == (matched == 7 ? 2 : 3));
+    }
+    for (int prefix = 11; prefix <= 12; ++prefix) {
+        state.reset();
+        cycles(prefix, 2);
+        cycles(16 - prefix, 0);
+        cycles(8, 2);
+        GGML_ASSERT(state.depth() == (prefix == 11 ? 3 : 2));
+    }
+    state.reset();
+    cycles(15, 0);
+    state.begin(); // partial probe cannot leak into the next request
+    cycles(1, 0);
+    GGML_ASSERT(state.depth() == 3);
+
+    state.reset();
+    cycles(16, 0);
+    for (int i = 0; i < 255; ++i) {
+        state.begin();
+        cycles(1, 0);
+        GGML_ASSERT(state.depth() == 2);
+    }
+    state.begin();
+    cycles(1, 0); // even one-token requests cannot postpone periodic recovery
+    GGML_ASSERT(state.depth() == 3);
+
+    common_speculative_mtp_adaptive slots[2];
+    for (int i = 0; i < 16; ++i) {
+        slots[0].accept(3, 0, false);
+        slots[1].accept(3, 3, false);
+    }
+    GGML_ASSERT(slots[0].depth() == 2 && slots[1].depth() == 3);
+    for (int i = 0; i < 8; ++i) {
+        // Same prefix clamp as MTP's CopySpec-composition integration.
+        const int drafted = slots[0].depth();
+        slots[0].accept(drafted, std::min(3, drafted), false);
+    }
+    GGML_ASSERT(slots[0].depth() == 3 && slots[1].depth() == 3);
+
+    for (int minimum = 0; minimum <= 3; ++minimum) {
+        state = common_speculative_mtp_adaptive(minimum);
+        for (int i = 0; i < 1024; ++i) {
+            if (i == 512) {
+                state.reset();
+            }
+            int drafted = state.depth();
+            if (drafted < minimum) {
+                drafted = 0; // production minimum-size boundary
+            }
+            GGML_ASSERT(drafted > 0);
+            state.accept(drafted, 0, false);
+            if (minimum == 3) {
+                GGML_ASSERT(state.depth() == 3);
+            }
+        }
+    }
+}
+
+static void test_copyspec_owner() {
+    // No model needed: unavailable model drafters are omitted, leaving CopySpec
+    // to exercise the same factory ownership and per-sequence lifecycle.
+    for (auto type : {COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH}) {
+        common_params_speculative params;
+        params.types = {COMMON_SPECULATIVE_TYPE_COPYSPEC, type};
+        params.copyspec_gamma = 2;
+        params.n_max = params.draft.n_max = 3;
+        common_speculative_ptr shared(common_speculative_init(params, uint32_t(2)));
+        common_speculative_ptr local(common_speculative_init(params, (llama_context *) nullptr));
+        GGML_ASSERT(shared && !local);
+
+        llama_tokens prompts[2] = {{10, 11, 12, 13, 14, 15, 16, 17},
+                                  {20, 21, 22, 23, 24, 25, 26, 27}};
+        llama_tokens prefixes[2] = {{10}, {20}};
+        llama_tokens drafts[2];
+        for (llama_seq_id seq = 0; seq < 2; ++seq) {
+            common_speculative_begin(shared.get(), seq, prompts[seq]);
+            auto & dp = common_speculative_get_draft_params(shared.get(), seq);
+            dp.drafting = true;
+            dp.n_max = 3;
+            dp.id_last = prompts[seq][1];
+            dp.prompt = &prefixes[seq];
+            dp.result = &drafts[seq];
+        }
+        // An inactive descriptor can outlive its result in the server. Even
+        // with valid storage here, it must not receive a CopySpec extension.
+        common_speculative_get_draft_params(shared.get(), 1).drafting = false;
+        drafts[1] = {22};
+        common_speculative_draft(shared.get());
+        GGML_ASSERT(drafts[1] == llama_tokens({22}));
+        for (llama_seq_id seq = 0; seq < 2; ++seq) {
+            drafts[seq].clear();
+            common_speculative_get_draft_params(shared.get(), seq).drafting = true;
+        }
+        common_speculative_draft(shared.get());
+        for (llama_seq_id seq = 0; seq < 2; ++seq) {
+            GGML_ASSERT(drafts[seq] == llama_tokens(prompts[seq].begin() + 2, prompts[seq].begin() + 5));
+            GGML_ASSERT(common_speculative_get_proposal(shared.get(), seq) == nullptr);
+            common_speculative_accept(shared.get(), seq, 3);
+        }
+    }
+
+    // Standalone CopySpec retains its legacy slot-local owner.
+    common_params_speculative params;
+    params.types = {COMMON_SPECULATIVE_TYPE_COPYSPEC};
+    common_speculative_ptr shared(common_speculative_init(params, uint32_t(2)));
+    common_speculative_ptr local(common_speculative_init(params, (llama_context *) nullptr));
+    GGML_ASSERT(!shared && local);
+}
+
 int main(void) {
+    test_mtp_adaptive();
     ggml_time_init();
 
+    test_copyspec_owner();
     test_speculative_coupling();
     test_proposal_rows();
     test_dist_singleton_rng();

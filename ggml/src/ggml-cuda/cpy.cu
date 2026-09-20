@@ -7,6 +7,81 @@
 
 typedef void (*cpy_kernel_t)(const char * cx, char * cdst);
 
+struct cpy_batch_item {
+    const char * src;
+    char * dst;
+    int64_t count;
+    int64_t src_ne[4], dst_ne[4];
+    size_t src_nb[4], dst_nb[4];
+    uint3 src_div[3], dst_div[3];
+};
+
+struct cpy_batch_args { cpy_batch_item items[16]; };
+
+template <bool FAST>
+static __global__ void cpy_batch_f32(cpy_batch_args args) {
+    const auto & item = args.items[blockIdx.y];
+    int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= item.count) return;
+    size_t so = 0, ds = 0;
+    if constexpr (FAST) {
+        uint32_t si = uint32_t(i), di = uint32_t(i);
+#pragma unroll
+        for (int d = 0; d < 3; ++d) {
+            const uint2 s = fast_div_modulo(si, item.src_div[d]);
+            const uint2 t = fast_div_modulo(di, item.dst_div[d]);
+            so += size_t(s.y) * item.src_nb[d];
+            ds += size_t(t.y) * item.dst_nb[d];
+            si = s.x; di = t.x;
+        }
+        so += size_t(si) * item.src_nb[3];
+        ds += size_t(di) * item.dst_nb[3];
+    } else {
+        int64_t si = i, di = i;
+#pragma unroll
+        for (int d = 0; d < 4; ++d) {
+            so += (si % item.src_ne[d]) * item.src_nb[d];
+            ds += (di % item.dst_ne[d]) * item.dst_nb[d];
+            si /= item.src_ne[d];
+            di /= item.dst_ne[d];
+        }
+    }
+    *reinterpret_cast<float *>(item.dst + ds) = *reinterpret_cast<const float *>(item.src + so);
+}
+
+void ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, const ggml_tensor * const * sources,
+        ggml_tensor * const * destinations, int count) {
+    GGML_ASSERT(count >= 2 && count <= 16);
+    cpy_batch_args args = {};
+    static_assert(sizeof(args) <= 4096, "copy launch parameters must fit older CUDA limits");
+    bool fast = true;
+    int64_t max_count = 0;
+    for (int i = 0; i < count; ++i) {
+        auto & a = args.items[i];
+        a.src = static_cast<const char *>(sources[i]->data);
+        a.dst = static_cast<char *>(destinations[i]->data);
+        a.count = ggml_nelements(sources[i]);
+        max_count = std::max(max_count, a.count);
+        // fastdiv's multiply-high + numerator uses a 32-bit addition. Restrict
+        // the numerator to 31 bits so that addition cannot overflow.
+        fast &= a.count <= INT32_MAX && a.count > 0;
+        for (int d = 0; d < 4; ++d) {
+            a.src_ne[d] = sources[i]->ne[d]; a.src_nb[d] = sources[i]->nb[d];
+            a.dst_ne[d] = destinations[i]->ne[d]; a.dst_nb[d] = destinations[i]->nb[d];
+        }
+        if (a.count > 0 && a.count <= INT32_MAX) {
+            for (int d = 0; d < 3; ++d) {
+                a.src_div[d] = init_fastdiv_values(a.src_ne[d]);
+                a.dst_div[d] = init_fastdiv_values(a.dst_ne[d]);
+            }
+        }
+    }
+    if (max_count) {
+        if (fast) cpy_batch_f32<true><<<dim3((max_count + 255) / 256, count), 256, 0, ctx.stream()>>>(args);
+        else cpy_batch_f32<false><<<dim3((max_count + 255) / 256, count), 256, 0, ctx.stream()>>>(args);
+    }
+}
+
 const int CUDA_CPY_TILE_DIM_2D = 32; // 2D tile dimension for transposed blocks
 const int CUDA_CPY_BLOCK_NM = 8;     // block size of 3rd dimension if available
 const int CUDA_CPY_BLOCK_ROWS = 8;   // block dimension for marching through rows

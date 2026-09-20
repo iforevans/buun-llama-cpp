@@ -5,7 +5,6 @@
 #include "server-cache-yield.h"
 #include "server-retention-sidecar.h"
 #include "../../common/common-cache-plan.h"
-#include "../../common/common-cache-plan-estimate.h"
 #include "../../common/common-cache-family.h"
 #include "../../src/llama-cache-authority.h"
 #include "ggml-backend.h"
@@ -25,55 +24,6 @@ struct server_cache_live_checkpoint_admission {
     std::vector<llama_cache_acct_op_id> committed;
 };
 
-// Process-local retention-policy seams. The weight callback is deliberately a
-// dimensionless fixed-point multiplier: fitted restore cost remains the
-// economic base, while policy can replace the provisional
-// automatic weight without changing the victim ladder. A weight callback that
-// returns false, or returns true with weight_milli == 0, refuses pricing for
-// that victim (fail-closed); zero never means free-to-evict. The recovery callback
-// is invoked only for an already-authorized durable source; it may never
-// enumerate or widen tenant authorization.
-constexpr uint32_t SERVER_CACHE_HOST_WEIGHT_SCALE = 1000;
-constexpr uint32_t SERVER_CACHE_HOST_SOFT_LEASE_WEIGHT = 2000;
-constexpr uint32_t SERVER_CACHE_HOST_MAIN_FAMILY_WEIGHT = 2000;
-
-inline bool server_cache_multiply_retention_weight(
-        uint32_t & weight_milli,
-        uint32_t factor_milli) noexcept {
-    if (factor_milli == 0) {
-        return false;
-    }
-    const uint64_t weighted =
-        (uint64_t(weight_milli) * factor_milli +
-         SERVER_CACHE_HOST_WEIGHT_SCALE - 1) /
-        SERVER_CACHE_HOST_WEIGHT_SCALE;
-    if (weighted > UINT32_MAX) {
-        return false;
-    }
-    weight_milli = uint32_t(weighted);
-    return true;
-}
-
-bool server_cache_weighted_price_us(
-    long double base_us,
-    uint32_t weight_milli,
-    uint64_t & out) noexcept;
-
-bool server_cache_retention_weight_milli(
-    bool soft_leased,
-    bool main_family,
-    uint32_t additional_weight_milli,
-    uint32_t & weight_milli) noexcept;
-
-bool server_cache_host_retention_price_us(
-    const common_cache_plan_calib & calib,
-    uint64_t bytes,
-    bool soft_leased,
-    bool main_family,
-    uint32_t & weight_milli,
-    uint64_t & price_us,
-    uint32_t additional_weight_milli = SERVER_CACHE_HOST_WEIGHT_SCALE) noexcept;
-
 enum class server_cache_checkpoint_protection : uint8_t {
     none = 0,
     seam_heuristic,
@@ -82,46 +32,9 @@ enum class server_cache_checkpoint_protection : uint8_t {
     _count,
 };
 
-struct server_cache_checkpoint_trade_input {
-    uint32_t ordinal = 0;
-    uint32_t recovery_ordinal = UINT32_MAX;
-    llama_cache_acct_artifact_id artifact;
-    uint64_t stable_id = 0;
-    uint64_t payload_bytes = 0;
-    uint64_t replay_tokens = 0;
-    uint32_t weight_milli = SERVER_CACHE_HOST_WEIGHT_SCALE;
-    bool identity_known = false;
-    bool recovery_available = false;
-    bool seam_heuristic_protected = false;
-    bool mandatory_anchor = false;
-    bool hard_leased = false;
-};
 
-struct server_cache_checkpoint_trade_plan {
-    bool selected = false;
-    uint32_t ordinal = UINT32_MAX;
-    uint32_t recovery_ordinal = UINT32_MAX;
-    uint64_t price_us = 0;
-    uint64_t stable_id = 0;
-    uint32_t weight_milli = SERVER_CACHE_HOST_WEIGHT_SCALE;
-    server_cache_checkpoint_protection protection =
-        server_cache_checkpoint_protection::none;
-    common_cache_plan_destruction_reason reason =
-        common_cache_plan_destruction_reason::recovery_unavailable;
-};
-
-// Policy-free checkpoint-member optimum. Inputs already encode the
-// ownership/recovery relation; the pure chooser refuses incomplete evidence,
-// protects the best-effort seam heuristic and the mandatory/hard rows, and
-// uses the fitted replay-plus-restore formula with the same fixed-point
-// retention weights as host eviction. Bounded same-lineage replay, not this heuristic,
-// is the correctness guarantee for a selected thinning.
-server_cache_checkpoint_trade_plan server_cache_plan_checkpoint_thinning(
-    const std::vector<server_cache_checkpoint_trade_input> & candidates,
-    const common_cache_plan_calib * calib) noexcept;
-
-// A later checkpoint may be omitted after an optional thinning refusal only
-// when the retained predecessor is a same-lineage recovery point within the
+// A later checkpoint may be omitted only when the retained predecessor is a
+// same-lineage recovery point within the
 // configured marginal replay bound.
 bool server_cache_checkpoint_bounded_replay(
     const common_prompt_checkpoint & recovery,
@@ -158,14 +71,13 @@ server_cache_checkpoint_floor_plan server_cache_plan_checkpoint_capacity_floor(
     const std::vector<server_cache_checkpoint_floor_input> & candidates) noexcept;
 
 // A protected/fail-closed ring has no new evidence until its membership
-// changes.  Keep the three expensive creation-time policy passes independently
+// changes. Keep publication checks and capacity selection independently
 // latched so an unchanged ring pays one integer comparison per pass rather than
-// rebuilding identities, leases, and quotes for every attempted publication.
+// rebuilding identities and leases for every attempted publication.
 // A committed member erase or publication advances the generation and re-arms
 // every lane.
 enum class server_cache_checkpoint_attempt_lane : uint8_t {
-    optional_thinning = 0,
-    capacity_thinning,
+    publication_check = 0,
     capacity_floor,
     _count,
 };
@@ -222,16 +134,11 @@ private:
 
 // Checkpoint ownership is prompt-cache authority work even though its
 // physical list belongs to a live slot. The slot supplies this narrow view and
-// retains only the raw X-macro eraser plus thin adapters; policy, quoting,
-// capability preparation, evidence, and ranking live beside the
-// prompt-cache authority orchestration.
+// retains the physical eraser; protected capacity selection and publication
+// accounting live beside the prompt-cache authority orchestration.
 struct server_cache_checkpoint_authority_context {
     using checkpoint_list = std::list<common_prompt_checkpoint>;
     using checkpoint_iterator = checkpoint_list::iterator;
-    using checkpoint_drop_fn = checkpoint_iterator (*)(
-        void * owner,
-        checkpoint_iterator first,
-        checkpoint_iterator last);
 
     int32_t slot_id = -1;
     checkpoint_list & checkpoints;
@@ -241,21 +148,15 @@ struct server_cache_checkpoint_authority_context {
     server_cache_lease_table * leases = nullptr;
     server_cache_checkpoint_attempt_latch & attempts;
     const common_prompt_checkpoint *& seam_heuristic;
-    common_cache_plan_destruction_reason & thinning_refusal;
     common_cache_plan_destruction_reason & floor_refusal;
-    bool main_family = false;
-    common_cache_family_binding cache_family;
     bool debug_observability = false;
-    void * raw_owner = nullptr;
-    checkpoint_drop_fn raw_drop = nullptr;
 };
 
 void server_cache_checkpoint_ring_changed(
     server_cache_checkpoint_authority_context & context) noexcept;
 
-bool server_cache_checkpoint_thinning_attempt_begin(
-    server_cache_checkpoint_authority_context & context,
-    bool capacity_mode) noexcept;
+bool server_cache_checkpoint_publication_attempt_begin(
+    server_cache_checkpoint_authority_context & context) noexcept;
 
 bool server_cache_checkpoint_refusal_state_changed(
     server_cache_checkpoint_authority_context & context,
@@ -267,13 +168,13 @@ server_cache_destruction_admission server_cache_checkpoint_observe_drop(
     server_cache_destruction_reason reason,
     llama_cache_acct_artifact_id artifact = {}) noexcept;
 
-bool server_cache_checkpoint_thin_priced(
-    server_cache_checkpoint_authority_context & context,
+// Called only inside the optional publication-attempt latch. This retains
+// the existing bounded incoming suppression without deleting an incumbent.
+bool server_cache_checkpoint_publication_redundant(
+    const std::list<common_prompt_checkpoint> & checkpoints,
+    const common_prompt_checkpoint & incoming,
     int checkpoint_task_id,
-    uint64_t max_replay_tokens,
-    const common_prompt_checkpoint * seam_heuristic,
-    bool capacity_mode,
-    bool attempt_claimed = false) noexcept;
+    uint64_t max_replay_tokens) noexcept;
 
 bool server_cache_checkpoint_capacity_floor(
     server_cache_checkpoint_authority_context & context,
@@ -285,11 +186,6 @@ bool server_cache_checkpoint_capacity_floor(
 void server_cache_checkpoint_publication_skipped(
     server_cache_checkpoint_authority_context & context,
     common_cache_plan_destruction_reason reason) noexcept;
-
-using server_cache_host_retention_weight_fn = bool (*)(
-    void * context,
-    const server_prompt_cache_state & victim,
-    uint32_t & weight_milli) noexcept;
 
 struct server_cache_host_recovery_evidence {
     llama_cache_acct_artifact_id artifact;
@@ -333,9 +229,6 @@ struct server_cache_authority {
     uint64_t admission_commits   = 0;
     uint64_t admission_rollbacks = 0;
     uint64_t destruction_quote_sequence = 0;
-    std::string calibration_profile;
-    void * host_retention_weight_context = nullptr;
-    server_cache_host_retention_weight_fn host_retention_weight = nullptr;
     void * host_recovery_context = nullptr;
     server_cache_host_recovery_fn host_recovery = nullptr;
     bool configured = true;

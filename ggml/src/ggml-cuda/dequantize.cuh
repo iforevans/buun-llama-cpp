@@ -62,6 +62,16 @@ static __device__ __forceinline__ void dequantize_q2_0_g128(const void * vx, con
     v.y = (c1 - 1) * d;
 }
 
+
+static __device__ __forceinline__ void dequantize_ptq1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_ptq1_0 * x = (const block_ptq1_0 *) vx;
+
+    const float d = x[ib].d;
+
+    v.x = ptq1_0_trit(&x[ib], iqs + 0) * d;
+    v.y = ptq1_0_trit(&x[ib], iqs + 1) * d;
+}
+
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;
 

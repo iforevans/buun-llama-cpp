@@ -217,6 +217,7 @@ struct vbr_target_unit_snapshot {
     std::array<uint8_t, 32> representation_reference_digest = {};
     uint32_t source_loss_history = 0;
     uint32_t checkpoint_codec_hops = 0;
+    int32_t effective_type = -1;
     vbr_artifact_recoverability recoverability =
         vbr_artifact_recoverability::sealed_payload;
     vbr_artifact_side side = vbr_artifact_side::key;
@@ -239,7 +240,6 @@ struct vbr_target_unit_snapshot {
     std::vector<vbr_target_shard_snapshot> shards;
     bool downward_supported = false;
     bool downward_movable = false;
-    int32_t controller_floor_type = -1;
     int32_t downward_type = -1;
     vbr_repr_domain downward_domain = vbr_repr_domain::full;
     uint32_t downward_recipe_id = 0;
@@ -500,9 +500,10 @@ struct vbr_validated_child_plan {
     vbr_import_transform_kind transform_kind =
         vbr_import_transform_kind::none;
     // Controller generation and live extent metadata published by adoption.
-    // Tapped upward reconstruction is one additional lossy promotion hop;
-    // full-domain T8->F16 retains the established whole-import reset.
+    // Every upward reconstruction adds one promotion hop. Exact and downward
+    // imports retain history; a higher-precision container never resets it.
     int32_t target_last_source_type = -1;
+    int32_t target_effective_type = -1;
     uint8_t target_promote_hops = 0;
     vbr_validated_stash_action stash_action =
         vbr_validated_stash_action::none_at_source;

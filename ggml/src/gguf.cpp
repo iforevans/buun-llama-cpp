@@ -711,6 +711,13 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         {
             ok = ok && gr.read(info.t.type);
 
+            // Prism's public wire ids are distinct from our compact runtime ids.
+            if (info.t.type == 142) {
+                info.t.type = GGML_TYPE_Q2_0_G128;
+            } else if (info.t.type == 143) {
+                info.t.type = GGML_TYPE_PTQ1_0;
+            }
+
             // check that tensor type is within defined range
             if (info.t.type < 0 || info.t.type >= GGML_TYPE_COUNT) {
                 GGML_LOG_ERROR("%s: tensor '%s' has invalid ggml type %d. should be in [0, %d)\n",
@@ -1520,7 +1527,8 @@ struct gguf_writer_base {
     }
 
     void write(const enum ggml_type & val) {
-        write(int32_t(val));
+        write(val == GGML_TYPE_Q2_0_G128 ? int32_t(142) :
+              val == GGML_TYPE_PTQ1_0 ? int32_t(143) : int32_t(val));
     }
 
     void write(const enum gguf_type & val) {

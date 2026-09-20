@@ -1417,12 +1417,17 @@ public:
     // lower-quality recapture preserves the prior best owner as an optional
     // anchor when its independent budget fits. No unrelated cache victim is
     // selected by this bounded refresh transaction.
+    // replace_live_recovery is for a fresh capture of the current live
+    // frontier, not a catalog-selected quality variant. It retires stale
+    // placement/companion evidence (and any anchor) under the same budget
+    // and recovery-pin checks.
     server_prompt_cache_vbr_refresh_status refresh_vbr_compact(
         const server_prompt & source_prompt,
         server_prompt_cache_vbr_owner incoming,
         const std::string & execution_identity,
         const std::string & adapter_config_key,
-        int32_t source_slot) noexcept;
+        int32_t source_slot,
+        bool replace_live_recovery = false) noexcept;
     // Conservative pre-D2H replacement check for refresh.  The final refresh
     // transaction remeasures exact shared accounting; this preview only
     // authorizes transfer when the quoted compact cannot exceed the hard cap.
@@ -1612,7 +1617,6 @@ public:
               int32_t id_slot, const std::string & adapter_config_key,
               server_prompt_cache_restore_shape & restore_shape,
               common_cache_plan_record * rec = nullptr,
-              int32_t required_source_id = -1,
               common_cache_family_binding * restored_family = nullptr);
 
     template <bool Observed>
@@ -1620,7 +1624,6 @@ public:
                    llama_context * ctx_tgt, llama_context * ctx_dft,
                    int32_t id_slot, const std::string & adapter_config_key,
                    common_cache_plan_record * rec,
-                   int32_t required_source_id,
                    common_cache_family_binding * restored_family,
                    server_prompt_cache_restore_shape & restore_shape);
 
@@ -1742,7 +1745,7 @@ private:
     const_iterator find_state_exact(
         const server_tokens & tokens,
         const std::string & adapter_config_key) const noexcept;
-    bool destroy_priced_host_entry(
+    bool destroy_retention_host_entry(
             server_cache_destruction_reason reason,
             iterator incoming,
             iterator & legacy_floor,

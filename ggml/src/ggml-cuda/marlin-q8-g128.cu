@@ -147,6 +147,7 @@ bool ggml_cuda_marlin_q8_g128_enabled() {
 
 bool ggml_cuda_marlin_q8_g128_supports_shape(int64_t n, int64_t k, int64_t m, int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_BLACKWELL &&
+        ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE &&
         m >= 1 && n % 256 == 0 && k % 128 == 0;
 }
 

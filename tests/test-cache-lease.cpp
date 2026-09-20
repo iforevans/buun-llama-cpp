@@ -156,11 +156,10 @@ static void test_closed_scope_types() {
     CHECK(mirrored == expected);
 }
 
-static void test_declared_family_replaces_automatic_weight() {
+static void test_declared_family_replaces_automatic_role() {
     const common_cache_family_binding absent;
     CHECK(common_cache_family_main_family(absent, true));
     CHECK(!common_cache_family_main_family(absent, false));
-    CHECK(common_cache_family_allows_additional_weight(absent));
 
     const common_cache_family_binding declared_main {
         { 71 }, common_cache_family_role::main,
@@ -170,8 +169,6 @@ static void test_declared_family_replaces_automatic_weight() {
     };
     CHECK(common_cache_family_main_family(declared_main, false));
     CHECK(!common_cache_family_main_family(declared_branch, true));
-    CHECK(!common_cache_family_allows_additional_weight(declared_main));
-    CHECK(!common_cache_family_allows_additional_weight(declared_branch));
 }
 
 static void test_hard_proof_lifetime_across_clone() {
@@ -562,7 +559,7 @@ static void test_batch_inspection_max_cardinality() {
 
 int main() {
     test_closed_scope_types();
-    test_declared_family_replaces_automatic_weight();
+    test_declared_family_replaces_automatic_role();
     test_soft_renew_expire_release();
     test_checked_deadline();
     test_hard_preflight_and_admission();

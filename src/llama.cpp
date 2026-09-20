@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "llama-ext.h"
 
 #include "llama-impl.h"
 #include "llama-version.h"
@@ -497,6 +498,19 @@ struct llama_model * llama_load_model_from_file(
         const char * path_model,
         struct llama_model_params params) {
     return llama_model_load_from_file(path_model, params);
+}
+
+gguf_context * llama_model_load_metadata(const char * path) {
+    if (!path) return nullptr;
+    try {
+        if (std::filesystem::is_directory(path)) {
+            return llama_safetensors_load_metadata(path);
+        }
+        return gguf_init_from_file(path, {/*no_alloc*/ true, /*ctx*/ nullptr});
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: failed to inspect '%s': %s\n", __func__, path, error.what());
+        return nullptr;
+    }
 }
 
 struct llama_model * llama_model_load_from_file(

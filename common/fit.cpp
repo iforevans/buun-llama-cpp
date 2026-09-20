@@ -36,18 +36,20 @@ class common_params_fit_exception : public std::runtime_error {
 uint32_t common_fit_extra_context_size(
         uint32_t target_n_ctx,
         uint32_t target_n_streams,
-        bool follows_target_per_sequence,
+        bool follows_target_capacity,
         uint32_t fixed_n_ctx) {
     if (fixed_n_ctx > 0) {
         return fixed_n_ctx;
     }
-    if (!follows_target_per_sequence) {
+    if (!follows_target_capacity) {
         return target_n_ctx;
     }
 
     const uint32_t n_streams = std::max<uint32_t>(1, target_n_streams);
     const uint32_t n_ctx     = GGML_PAD(target_n_ctx, 256);
-    return GGML_PAD(n_ctx / n_streams, 256);
+    // Mirror llama_context's per-stream rounding, then cover every stream in
+    // the shared draft pool. Sequence IDs alone are not a capacity multiplier.
+    return GGML_PAD(n_ctx / n_streams, 256) * n_streams;
 }
 
 using common_fit_extra_mapped_memory = std::vector<llama_memory_breakdown_data>;
@@ -175,7 +177,7 @@ common_fit_extra_cache_probe_result common_fit_extra_cache_probe(
             requests.push_back({
                 common_fit_extra_context_size(
                     target_n_ctx, target_n_streams,
-                    model->follows_target_per_sequence, model->fixed_n_ctx),
+                    model->follows_target_capacity, model->fixed_n_ctx),
                 model->shares_model || model->borrows_target_tensors,
                 model->optional_if_no_mtp,
             });
@@ -814,7 +816,7 @@ static void common_params_fit_impl(
         for (const common_fit_extra_model * current : extra_models) {
             const uint32_t n_ctx_current = common_fit_extra_context_size(
                 cparams->n_ctx, n_streams,
-                current->follows_target_per_sequence, current->fixed_n_ctx);
+                current->follows_target_capacity, current->fixed_n_ctx);
             current->cparams->n_ctx = n_ctx_current;
             requests.push_back({
                 n_ctx_current,

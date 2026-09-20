@@ -331,8 +331,8 @@ static void test_refusal_mapping_and_selection() {
     CHECK(server_cache_destruction_quote_all(
         rec, 0, { artifact(1, 11) }, 17, preview(17), project(),
         { true, common_cache_plan_recovery_citation::resolved, 3 }, counters));
-    rec.shadow_choice = 1;
-    server_cache_destruction_select_quote(rec, counters);
+    rec.destruction_legacy_plan_candidate = 1;
+    server_cache_destruction_select_quote(rec, counters, rec.destruction_legacy_plan_candidate);
     CHECK(rec.destruction.plan_candidate == 1);
     CHECK(common_cache_plan_destruction_effect_has(
         rec.destruction.effects,
@@ -525,9 +525,9 @@ static void test_refused_projection_and_selection_failure() {
         rec, 0, { artifact(1, 11) }, 17, preview(17),
         [](const auto &, auto &) { return false; },
         { true, common_cache_plan_recovery_citation::resolved, 9 }, counters));
-    rec.shadow_choice = 1;
+    rec.destruction_legacy_plan_candidate = 1;
     rec.destruction.quote_duration_us = 41;
-    server_cache_destruction_select_quote(rec, counters);
+    server_cache_destruction_select_quote(rec, counters, rec.destruction_legacy_plan_candidate);
     CHECK(rec.destruction.state == common_cache_plan_destruction_state::refused);
     CHECK(rec.destruction.reason ==
           common_cache_plan_destruction_reason::capacity_refused);
@@ -556,18 +556,18 @@ static void test_refused_projection_and_selection_failure() {
     CHECK(server_cache_destruction_quote_all(
         rec, 0, { artifact(1, 11) }, 17, preview(17), project(),
         { true, common_cache_plan_recovery_citation::resolved, 10 }, counters));
-    rec.shadow_choice = -1;
+    rec.destruction_legacy_plan_candidate = -1;
     rec.destruction.quote_duration_us = 42;
     const auto before = counters.refused[size_t(rec.selection)][size_t(
         common_cache_plan_destruction_reason::internal_fault)];
-    server_cache_destruction_select_quote(rec, counters);
+    server_cache_destruction_select_quote(rec, counters, rec.destruction_legacy_plan_candidate);
     CHECK(rec.destruction.state == common_cache_plan_destruction_state::failed);
     CHECK(rec.destruction.reason ==
-          common_cache_plan_destruction_reason::internal_fault);
+          common_cache_plan_destruction_reason::release_evidence_unavailable);
     CHECK(rec.destruction.admission_sequence == 10);
     CHECK(rec.destruction.quote_duration_us == 42);
     CHECK(counters.refused[size_t(rec.selection)][size_t(
-              common_cache_plan_destruction_reason::internal_fault)] == before + 1);
+              common_cache_plan_destruction_reason::internal_fault)] == before);
 
     rec = record_with_cold_candidates();
     common_cache_plan_destruction_counters selected_counters;
@@ -576,9 +576,9 @@ static void test_refused_projection_and_selection_failure() {
         { true, common_cache_plan_recovery_citation::resolved, 11 },
         selected_counters));
     CHECK(!rec.destruction_quotes.empty());
-    rec.shadow_choice = 0;
+    rec.destruction_legacy_plan_candidate = 0;
     rec.destruction.quote_duration_us = 43;
-    server_cache_destruction_select_quote(rec, selected_counters);
+    server_cache_destruction_select_quote(rec, selected_counters, rec.destruction_legacy_plan_candidate);
     CHECK(rec.destruction.state ==
           common_cache_plan_destruction_state::not_required);
     CHECK(rec.destruction.reason ==

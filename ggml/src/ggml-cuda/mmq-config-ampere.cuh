@@ -70,6 +70,7 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
 
     PACKED_INT_CASES(GGML_TYPE_Q4_A32);
     PACKED_INT_CASES(GGML_TYPE_Q8_0_G128);
+    PACKED_INT_CASES(GGML_TYPE_PTQ1_0);
 
 #undef PACKED_INT_CASES
 

@@ -268,6 +268,7 @@ struct llama_model_loader {
     // Exact GGUF wire-name lookup. Unlike get_tensor_meta(), this deliberately
     // bypasses architecture compatibility aliases.
     struct ggml_tensor * get_tensor_meta_exact(const char * name) const;
+    bool has_tensor_exact(const char * name) const;
 
     struct ggml_tensor * require_tensor_meta(const std::string & name) const;
 

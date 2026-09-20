@@ -1513,7 +1513,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.mparams      =*/ &mparams_mtp,
             /*.cparams      =*/ &cparams_mtp,
             /*.shares_model =*/ true,
-            /*.follows_target_per_sequence =*/ params.speculative.draft.n_ctx <= 0,
+            /*.follows_target_capacity =*/ params.speculative.draft.n_ctx <= 0,
             /*.fixed_n_ctx  =*/ params.speculative.draft.n_ctx > 0
                 ? (uint32_t) params.speculative.draft.n_ctx : 0,
             /*.next         =*/ nullptr,
@@ -1525,7 +1525,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.mparams      =*/ &mparams_dft,
             /*.cparams      =*/ &cparams_dft,
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
-            /*.follows_target_per_sequence =*/ extra_is_mtp && params.speculative.draft.n_ctx <= 0,
+            /*.follows_target_capacity =*/ extra_is_mtp && params.speculative.draft.n_ctx <= 0,
             /*.fixed_n_ctx  =*/ extra_is_mtp && params.speculative.draft.n_ctx > 0
                 ? (uint32_t) params.speculative.draft.n_ctx : 0,
             /*.next         =*/ spec_mtp && !extra_is_mtp ? &extra_mtp : nullptr,

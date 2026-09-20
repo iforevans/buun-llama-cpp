@@ -101,7 +101,6 @@ struct server_vbr_empty_handoff_gate {
     uint64_t durable_incumbent_prefix = 0;
     bool exact_incumbent_durable = false;
     bool hard_lease = false;
-    bool recovery_pin = false;
     bool deferred_task = false;
     bool incumbent_supported = false;
     bool family_matches = false;
@@ -199,6 +198,7 @@ struct server_vbr_reclaim_policy_result {
     bool token_identity_distinguishes_attempt = false;
     bool successful_attempt_is_state_sealed = false;
     bool multi_fresh_pressure_isolated = false;
+    bool fragmented_projection_retries_exact = false;
     bool isolated_capture_drains_without_backoff = false;
     bool unchanged_admission_refusal_is_suppressed = false;
     bool checkpoint_admission_refusals_are_independent = false;
@@ -210,6 +210,7 @@ server_vbr_reclaim_policy_result
 server_vbr_reclaim_policy_for_test();
 
 struct server_vbr_slot_selection_result {
+    bool pinned_empty_lookup = false;
     bool learned_selected_cold = false;
     bool learned_kept_hot = false;
     bool selection_was_pure = false;

@@ -1,4 +1,5 @@
 #include "llama-vbr-artifact.h"
+#include "llama-vbr-precision.h"
 #include "llama-bit-ops.h"
 
 #include "llama-sha256.h"
@@ -237,13 +238,15 @@ bool emit_page_ref(emitter & out, const vbr_generation_page_ref & page) {
 
 bool emit_unit_generation(
         emitter & out,
-        const vbr_checkpoint_unit_generation & unit) {
+        const vbr_checkpoint_unit_generation & unit,
+        uint32_t version) {
     return out.u64(unit.repr_gen) &&
            out.i32(unit.current_type) &&
            out.i32(unit.last_source_type) &&
            out.u32(uint32_t(unit.domain)) &&
            out.u32(unit.promote_hops) &&
-           out.u32(uint32_t(unit.last_transition));
+           out.u32(uint32_t(unit.last_transition)) &&
+           (version < 2 || out.i32(unit.effective_type));
 }
 
 bool emit_generation_record(
@@ -264,7 +267,7 @@ bool emit_generation_record(
             return false;
         }
         for (const auto & unit : controller.units) {
-            if (!emit_unit_generation(out, unit)) {
+            if (!emit_unit_generation(out, unit, generation.version)) {
                 return false;
             }
         }
@@ -319,6 +322,8 @@ bool emit_unit_descriptor_body(
         !out.array_digest(descriptor.representation.reference_digest) ||
         !out.u32(descriptor.representation.source_loss_history) ||
         !out.u32(descriptor.representation.checkpoint_codec_hops) ||
+        (format_version >= VBR_UNIT_ARTIFACT_FORMAT_VERSION_PRECISION &&
+         !out.i32(descriptor.representation.effective_type)) ||
         !out.u32(uint32_t(descriptor.recoverability)) ||
         !out.u32(uint32_t(descriptor.side)) ||
         !out.u32(uint32_t(descriptor.layout)) ||
@@ -502,7 +507,7 @@ llama_cache_acct_category role_category(vbr_artifact_accounting_role role) {
 bool validate_generation_record(
         const vbr_checkpoint_generation_record & generation,
         const vbr_artifact_decode_limits * limits = nullptr) {
-    if (generation.version != 1 ||
+    if ((generation.version != 1 && generation.version != 2) ||
         generation.status != vbr_checkpoint_generation_status::complete ||
         !digest_nonzero(generation.identity_policy_order_digest) ||
         generation.controllers.empty() ||
@@ -526,6 +531,10 @@ bool validate_generation_record(
             if (unit.repr_gen == 0 ||
                 unit.current_type < 0 ||
                 unit.last_source_type < 0 ||
+                unit.effective_type < -1 || unit.effective_type >= GGML_TYPE_COUNT ||
+                (unit.effective_type != -1 &&
+                 vbr_precision_merge(unit.effective_type, unit.current_type) != unit.effective_type) ||
+                (generation.version == 1 && unit.effective_type != -1) ||
                 unit.domain > vbr_repr_domain::tapped ||
                 unit.last_transition > vbr_repr_transition::recovery_invalidate) {
                 return false;
@@ -596,6 +605,8 @@ bool descriptor_metadata_valid(
         bool allow_sparse_rows = false) {
     const bool current_type_supported =
         descriptor.current_type == GGML_TYPE_F16 ||
+        descriptor.current_type == GGML_TYPE_TURBO2_0 ||
+        descriptor.current_type == GGML_TYPE_TURBO3_0 ||
         descriptor.current_type == GGML_TYPE_TURBO8_0 ||
         descriptor.current_type == GGML_TYPE_TURBO4_0 ||
         descriptor.current_type == GGML_TYPE_TURBO3_TCQ ||
@@ -603,6 +614,8 @@ bool descriptor_metadata_valid(
         descriptor.current_type == GGML_TYPE_TURBO1_TCQ;
     const bool source_type_supported =
         descriptor.last_source_type == GGML_TYPE_F16 ||
+        descriptor.last_source_type == GGML_TYPE_TURBO2_0 ||
+        descriptor.last_source_type == GGML_TYPE_TURBO3_0 ||
         descriptor.last_source_type == GGML_TYPE_TURBO8_0 ||
         descriptor.last_source_type == GGML_TYPE_TURBO4_0 ||
         descriptor.last_source_type == GGML_TYPE_TURBO3_TCQ ||
@@ -630,6 +643,13 @@ bool descriptor_metadata_valid(
         descriptor.rank > descriptor.dimensions.size() ||
         descriptor.row_alignment == 0 ||
         descriptor.row_codec_version == 0 ||
+        descriptor.representation.effective_type < -1 ||
+        descriptor.representation.effective_type >= GGML_TYPE_COUNT ||
+        (descriptor.representation.effective_type != -1 &&
+         vbr_precision_merge(descriptor.representation.effective_type, descriptor.current_type) !=
+             descriptor.representation.effective_type) ||
+        (format_version < VBR_UNIT_ARTIFACT_FORMAT_VERSION_PRECISION &&
+         descriptor.representation.effective_type != -1) ||
         descriptor.shards.empty() ||
         descriptor.clean_stash_state >= vbr_artifact_clean_stash_state::_count ||
         (artifact_has_meansub_reference(format_version)
@@ -1424,6 +1444,8 @@ bool manifest_valid(
                 blob->descriptor.current_type ||
             child.units[reference.logical_unit_id].last_source_type !=
                 blob->descriptor.last_source_type ||
+            child.units[reference.logical_unit_id].effective_type !=
+                blob->descriptor.representation.effective_type ||
             child.units[reference.logical_unit_id].domain !=
                 (blob->descriptor.current_type == GGML_TYPE_F16 ||
                  blob->descriptor.current_type == GGML_TYPE_TURBO8_0 ?
@@ -2257,7 +2279,8 @@ bool read_page_ref(bounded_reader & in, vbr_generation_page_ref & page) {
 
 bool read_unit_generation(
         bounded_reader & in,
-        vbr_checkpoint_unit_generation & unit) {
+        vbr_checkpoint_unit_generation & unit,
+        uint32_t version) {
     uint32_t domain;
     uint32_t promote_hops;
     uint32_t transition;
@@ -2267,6 +2290,7 @@ bool read_unit_generation(
         !in.u32(domain) ||
         !in.u32(promote_hops) ||
         !in.u32(transition) ||
+        (version >= 2 && !in.i32(unit.effective_type)) ||
         domain > uint32_t(vbr_repr_domain::tapped) ||
         promote_hops > UINT8_MAX ||
         transition > uint32_t(vbr_repr_transition::recovery_invalidate)) {
@@ -2285,6 +2309,7 @@ bool read_generation_record(
     uint32_t status;
     uint32_t n_controllers;
     if (!in.u32(generation.version) ||
+        (generation.version != 1 && generation.version != 2) ||
         !in.u32(status) ||
         !in.fixed_digest(generation.identity_policy_order_digest) ||
         !in.u32(n_controllers) ||
@@ -2316,7 +2341,7 @@ bool read_generation_record(
             checkpoint_child_dependency_mode(dependency_mode);
         controller.units.resize(n_units);
         for (auto & unit : controller.units) {
-            if (!read_unit_generation(in, unit)) {
+            if (!read_unit_generation(in, unit, generation.version)) {
                 return false;
             }
         }
@@ -2393,6 +2418,8 @@ bool read_unit_descriptor_body(
         !in.fixed_digest(descriptor.representation.reference_digest) ||
         !in.u32(descriptor.representation.source_loss_history) ||
         !in.u32(descriptor.representation.checkpoint_codec_hops) ||
+        (format_version >= VBR_UNIT_ARTIFACT_FORMAT_VERSION_PRECISION &&
+         !in.i32(descriptor.representation.effective_type)) ||
         !in.u32(recoverability) ||
         !in.u32(side) ||
         !in.u32(layout) ||

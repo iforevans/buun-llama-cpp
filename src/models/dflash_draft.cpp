@@ -648,7 +648,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     if (!output_use) {
         output_use = ggml_new_tensor_2d(ctx0, GGML_TYPE_Q4_0, n_embd, model.vocab.n_tokens());
     }
-    cur = build_lora_mm(output_use, cur);
+    cur = build_lora_mm(output_use, cur, model.output_s, model.output_in_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

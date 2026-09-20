@@ -1,5 +1,6 @@
 #include "llama-vbr-explicit-capture.h"
 #include "llama-sha256.h"
+#include "llama-vbr-upward.h"
 #include "turbo-rotation-data.h"
 
 #include <atomic>
@@ -46,7 +47,7 @@ static std::array<uint8_t, 32> rotation(int type, bool value_side) {
 int main() {
     try {
         // No environment writes while worker threads run.
-        test_env t8("TURBO_CB_T8"), t4("TURBO_CB_T4"), tcq("TURBO_TCQ_CB"),
+        test_env t8("TURBO_CB_T8"), t4("TURBO_CB_T4"), t3("TURBO_CB_T3"), t2("TURBO_CB_T2"), tcq("TURBO_TCQ_CB"),
             tcq_k("TURBO_TCQ_CB_K"), tcq_v("TURBO_TCQ_CB_V"), t1("TURBO1_TCQ_CB"),
             t1_k("TURBO1_TCQ_CB_K"), t1_v("TURBO1_TCQ_CB_V"),
             mean_off("TURBO_MEANSUB_OFF"), mean_k("TURBO_KMEAN_SUB"), mean_v("TURBO_VMEAN_SUB");
@@ -98,6 +99,41 @@ int main() {
               "mean setting was cached with rotation");
         mean_off.set(nullptr);
 
+        // Real production identities, not fixture markers: the row codecs
+        // differ, but reconstruction must recognize the same baked mean.
+        for (int model : {1, 2}) {
+            for (bool side : {false, true}) {
+                vbr_explicit_representation_identity source, target;
+                check(vbr_explicit_capture_representation_identity(
+                    &policy, GGML_TYPE_TURBO4_0, side, model, source), "source identity failed");
+                check(vbr_explicit_capture_representation_identity(
+                    &policy, GGML_TYPE_F16, side, model, target), "target identity failed");
+                check(source.meansub_baked && target.meansub_baked, "missing baked table fixture");
+                check(source.meansub_digest == target.meansub_digest, "mean identity depends on tier");
+                check(source.codec_id != target.codec_id && source.codec_version == 2 &&
+                      target.codec_version == 2 && source.codebook_digest != target.codebook_digest,
+                      "codec identities lost endpoint separation");
+                vbr_upward_recipe recipe;
+                check(vbr_upward_resolve_recipe(GGML_TYPE_TURBO4_0, GGML_TYPE_F16, recipe) ==
+                      vbr_upward_recipe_status::resolved, "cross-domain recipe failed");
+                const vbr_upward_representation_identity a {
+                    source.codebook_digest, source.rotation_digest, source.meansub_digest,
+                    model, 0, source.meansub_baked, source.codec_id, source.codec_version, source.codebook_digest};
+                auto b = a;
+                b.codebook_digest = target.codebook_digest;
+                b.rotation_digest = target.rotation_digest;
+                b.meansub_digest = target.meansub_digest;
+                b.codec_id = target.codec_id;
+                b.representation_reference_digest = target.codebook_digest;
+                const auto zero = std::array<uint8_t, 32>{};
+                check(vbr_upward_build_identity(recipe, a, b, source.codebook_digest, target.codebook_digest) != zero,
+                      "real cross-domain identity refused");
+                b.meansub_digest[0] ^= 1;
+                check(vbr_upward_build_identity(recipe, a, b, source.codebook_digest, target.codebook_digest) == zero,
+                      "different mean table accepted");
+            }
+        }
+
 #ifdef __linux__
         // Anonymous temporary backing lets the same override path change bytes
         // without touching any user file. Both override readers must stay fresh.
@@ -116,6 +152,16 @@ int main() {
         const auto second = identity(GGML_TYPE_TURBO4_0, false);
         check(first.codebook_digest != second.codebook_digest && first.meansub_digest != second.meansub_digest &&
               first.rotation_digest == second.rotation_digest, "same-path override edit was missed");
+        for (const auto type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0}) {
+            const auto & env = type == GGML_TYPE_TURBO2_0 ? t2 : t3;
+            env.set(path.c_str());
+            write("CCCC");
+            const auto before = identity(type, false);
+            write("DDDD");
+            check(identity(type, false).codebook_digest != before.codebook_digest,
+                  "pinned legacy Turbo codebook override edit was missed");
+            env.set(nullptr);
+        }
         file.reset();
         check(!vbr_explicit_capture_representation_identity(&policy, GGML_TYPE_TURBO4_0, false, 0, changed),
               "missing override accepted after warm lookup");

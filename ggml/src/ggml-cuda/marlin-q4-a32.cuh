@@ -22,6 +22,10 @@ void ggml_cuda_marlin_q4_a32_unrepack(
     int64_t k,
     cudaStream_t stream);
 
+// Stream-ordered conversion into caller-owned canonical storage; no allocation or synchronization.
+void ggml_cuda_marlin_q4_a32_canonical_async(
+    const void * storage, void * canonical, int64_t n, int64_t k, cudaStream_t stream);
+
 void ggml_cuda_marlin_q4_a32_prepare(
     const void * canonical,
     void * raw_weight,

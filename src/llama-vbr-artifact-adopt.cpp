@@ -453,15 +453,7 @@ class vbr_kv_import_session {
                             vbr_validated_stash_action::restore_exact
                         ? uint32_t(plan->descriptor.clean_stash.valid_rows)
                         : 0,
-                    uint8_t((plan->transform_kind ==
-                            vbr_import_transform_kind::upward_same_domain ||
-                             plan->transform_kind ==
-                            vbr_import_transform_kind::upward_cross_domain)
-                        ? plan->target_promote_hops
-                        : plan->transform_kind ==
-                                vbr_import_transform_kind::downward
-                            ? 0
-                            : plan->descriptor.promote_hops),
+                    plan->target_promote_hops,
                     static_cast<ggml_type>(plan->selected_target_type),
                 });
                 final_unit_indices_[plan->logical_unit_id] =
@@ -1033,7 +1025,7 @@ class vbr_kv_import_session {
             return false;
         }
         final_units_[metadata->second].stash_valid = stash_valid;
-        final_units_[metadata->second].promote_hops = 0;
+        final_units_[metadata->second].promote_hops = plan.target_promote_hops;
         return true;
     }
 
@@ -1195,15 +1187,8 @@ class vbr_kv_import_session {
             return test_seam_->session_barrier(
                 child_id_, ledger_serial, manifest);
         }
-        const bool source_ready = manifest.is_prefix_projection()
-            ? manifest.projection_transfer_ready()
-            : manifest.is_occupied_replacement()
-                ? manifest.occupied_replacement() != nullptr &&
-                    manifest.occupied_replacement()->ready()
-                : manifest.source_package().validate() ==
-                    vbr_artifact_status::ok;
         if (!armed_ || !image_ready_ || !cache_->vbr_import_in_progress_ ||
-            cache_->vbr_import_operation_ != operation_ || !source_ready ||
+            cache_->vbr_import_operation_ != operation_ ||
             !cache_->vbr_generation_tracker_get()->import_image_installable(
                 tracker_image_, operation_)) {
             return false;
@@ -1565,16 +1550,6 @@ class import_operation_scope {
     open_status open(const vbr_validated_manifest & manifest,
                      llama_seq_id destination,
                      const std::vector<llama_memory_tree_child> & tree) {
-        if (test_seam_) {
-            const auto status = test_seam_->operation_open(
-                manifest, destination, tree, instances_, test_operation_);
-            test_open_ = status == vbr_adopt_status::adopted;
-            if (status == vbr_adopt_status::recovery_unavailable) {
-                return open_status::recovery_unavailable;
-            }
-            return test_open_ ? open_status::ok :
-                open_status::operation_unavailable;
-        }
         vbr_operation_binding binding;
         binding.kind = vbr_operation_kind::state_import;
         binding.child_phase = vbr_operation_phase::mutate;
@@ -1594,8 +1569,22 @@ class import_operation_scope {
             }
             seen.push_back(child.target_instance);
         }
-        if (seen.empty()) {
+        // Refuse an in-flight decode before acquiring recovery ownership.
+        // Otherwise an untouched import can report quarantine merely because
+        // the foreign operation is still present when cleanup checks quiescence.
+        if (seen.empty() ||
+            !vbr_operation_registry_quiescent_for(seen.data(), seen.size())) {
             return open_status::operation_unavailable;
+        }
+        if (test_seam_) {
+            const auto status = test_seam_->operation_open(
+                manifest, destination, tree, instances_, test_operation_);
+            test_open_ = status == vbr_adopt_status::adopted;
+            if (status == vbr_adopt_status::recovery_unavailable) {
+                return open_status::recovery_unavailable;
+            }
+            return test_open_ ? open_status::ok :
+                open_status::operation_unavailable;
         }
         operation_ = std::make_unique<vbr_scoped_operation>(binding);
         if (!*operation_) {
@@ -2500,13 +2489,7 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             manifest->read_policy_epoch_(manifest->recheck_context_) !=
                 manifest->target().policy_epoch ||
             !transform_projection_stable ||
-            !operation_quiescent(operation, server_hooks) ||
-            (manifest->is_prefix_projection()
-                ? !manifest->projection_transfer_ready()
-                : occupied_replacement
-                    ? !manifest->occupied_replacement()->ready()
-                    : manifest->source_package().validate() !=
-                        vbr_artifact_status::ok)) {
+            !operation_quiescent(operation, server_hooks)) {
             return fail(vbr_adopt_status::barrier_failed);
         }
         std::vector<llama_memory_tree_child> barrier_tree;
@@ -2562,6 +2545,17 @@ vbr_adopt_result vbr_adopt_empty_manifest(
                 !entry.second.session->barrier(post_commit_serial, *manifest)) {
                 return fail(vbr_adopt_status::barrier_failed);
             }
+        }
+        // One source-integrity check for the complete tree, after every child
+        // and companion callback. Rehashing this same package once per child
+        // adds payload-sized work without another mutation boundary.
+        const bool source_ready = manifest->is_prefix_projection()
+            ? manifest->projection_transfer_ready()
+            : occupied_replacement
+                ? manifest->occupied_replacement()->ready()
+                : manifest->source_package().validate() == vbr_artifact_status::ok;
+        if (!source_ready) {
+            return fail(vbr_adopt_status::barrier_failed);
         }
         if (fault_after(server_hooks, out.phase)) {
             return fail(vbr_adopt_status::barrier_failed);

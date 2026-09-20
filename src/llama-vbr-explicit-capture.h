@@ -20,6 +20,7 @@ struct vbr_downward_stage_reservation;
 struct vbr_validated_child_plan;
 class vbr_import_schedule_quote;
 struct vbr_import_schedule_unit;
+struct vbr_import_destination_projection;
 struct vbr_explicit_representation_identity;
 enum class vbr_import_schedule_status : uint8_t;
 
@@ -233,6 +234,17 @@ bool vbr_explicit_capture_runtime_pools(
 uint64_t vbr_explicit_import_policy_epoch(
     llama_memory_i & memory) noexcept;
 
+// Rejection-only, metadata-only preflight. This does not authenticate payloads
+// or mint an import capability. Passing it still requires the normal snapshot,
+// quote, validation and adoption path, including a fresh destination projection.
+bool vbr_explicit_import_destination_preflight(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    const vbr_artifact_package_view & package,
+    uint64_t selected_frontier,
+    uint64_t incoming_cells,
+    vbr_import_destination_projection & output) noexcept;
+
 enum class vbr_import_target_snapshot_status : uint8_t {
     actionable = 0,
     report_only,
@@ -268,7 +280,8 @@ vbr_explicit_import_target_schedule_snapshot(
     vbr_downward_policy_projection & downward_projection,
     bool & downward_required,
     vbr_import_schedule_quote & schedule_quote,
-    uint64_t selected_frontier = 0) noexcept;
+    uint64_t selected_frontier = 0,
+    uint64_t incoming_cells = 0) noexcept;
 
 // Final transform-currency barrier shared by downward and the supported
 // same- and cross-domain upward reconstruction paths. The authenticated

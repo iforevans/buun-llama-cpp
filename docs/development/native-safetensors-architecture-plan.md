@@ -1,6 +1,12 @@
 # Native safetensors architecture bridge
 
-Status: implementation in progress. The tensor-source interface is internal and is not a stable public API.
+> **Historical design and implementation log—not a current support matrix.**
+> Native safetensors support has shipped. Sections below preserve earlier plans,
+> experiments, and dated results; statements about unsupported formats, defaults,
+> and remaining work may have been superseded. For current user-facing guidance,
+> see [Native .safetensors support + EXL3](../safetensors.md).
+
+The tensor-source interface is internal and is not a stable public API.
 
 ## 1. Objective
 

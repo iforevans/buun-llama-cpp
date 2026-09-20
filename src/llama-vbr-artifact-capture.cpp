@@ -43,6 +43,7 @@ bool capture_generation_equal(
            lhs.publish_seq == rhs.publish_seq &&
            lhs.current_type == rhs.current_type &&
            lhs.last_source_type == rhs.last_source_type &&
+           lhs.effective_type == rhs.effective_type &&
            lhs.domain == rhs.domain &&
            lhs.promote_hops == rhs.promote_hops &&
            lhs.last_transition == rhs.last_transition &&
@@ -57,6 +58,7 @@ bool capture_generation_valid(
            generation.current_type < GGML_TYPE_COUNT &&
            generation.last_source_type >= 0 &&
            generation.last_source_type < GGML_TYPE_COUNT &&
+           generation.effective_type >= -1 && generation.effective_type < GGML_TYPE_COUNT &&
            generation.domain <= vbr_repr_domain::tapped &&
            generation.last_transition <=
                vbr_repr_transition::recovery_invalidate &&
@@ -118,6 +120,7 @@ bool capture_descriptor_schema_equal(
         lhs.representation.reference_digest != rhs.representation.reference_digest ||
         lhs.representation.source_loss_history != rhs.representation.source_loss_history ||
         lhs.representation.checkpoint_codec_hops != rhs.representation.checkpoint_codec_hops ||
+        lhs.representation.effective_type != rhs.representation.effective_type ||
         lhs.recoverability != rhs.recoverability || lhs.side != rhs.side ||
         lhs.layout != rhs.layout || lhs.n_stream != rhs.n_stream ||
         lhs.unified != rhs.unified || lhs.wm_cells != rhs.wm_cells ||
@@ -2496,6 +2499,7 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
         unit_hash.u64(snapshot.generation.publish_seq);
         unit_hash.u32(uint32_t(snapshot.generation.current_type));
         unit_hash.u32(uint32_t(snapshot.generation.last_source_type));
+        unit_hash.u32(uint32_t(snapshot.generation.effective_type));
         unit_hash.u32(uint32_t(snapshot.generation.domain));
         unit_hash.u32(snapshot.generation.promote_hops);
         unit_hash.u32(uint32_t(snapshot.generation.last_transition));
@@ -2836,6 +2840,7 @@ bool vbr_capture_assemble_manifests(
                     descriptor.repr_gen == generation.repr_gen &&
                     descriptor.current_type == generation.current_type &&
                     descriptor.last_source_type == generation.last_source_type &&
+                    descriptor.representation.effective_type == generation.effective_type &&
                     descriptor.promote_hops == generation.promote_hops &&
                     descriptor.last_transition == generation.last_transition &&
                     descriptor.n_stream == target.policy.n_stream &&

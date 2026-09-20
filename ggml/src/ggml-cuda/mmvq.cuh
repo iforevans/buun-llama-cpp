@@ -5,6 +5,9 @@
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 bool ggml_cuda_q8_0_mmv_post_silu_supported(int cc, int64_t ncols_x);
 
+void ggml_cuda_mul_mat_vec_q_fwht(ggml_backend_cuda_context & ctx,
+    const ggml_tensor * input, const ggml_tensor * signs, ggml_tensor * dst);
+
 // Single-token dynamic FP8 projection followed by four-tap recurrent conv.
 void ggml_cuda_mul_mat_vec_q_conv(ggml_backend_cuda_context & ctx,
     const ggml_tensor * mm, const ggml_tensor * prefix, const ggml_tensor * conv_weight,

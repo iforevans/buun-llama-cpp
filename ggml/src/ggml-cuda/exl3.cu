@@ -31,6 +31,11 @@
 #include "exl3-had.cuh"
 #include "exl3-gemv.cuh"
 #include "exl3-gemv-int8.cuh"
+#include "exl3-int8-warpk.cuh"
+#if !defined(GGML_USE_HIP)
+#include "exl3-gemm.cuh"
+#include "exl3-head.cuh"
+#endif
 
 namespace {
 
@@ -38,6 +43,12 @@ using exl3::FragB;
 using exl3::FragC_h;
 
 constexpr float EXL3_HAD_SCALE = exl3_had::SCALE;
+
+// Runtime CC alone is insufficient: a compatible older cubin/PTX can execute
+// on SM86 without the SM86-only kernels or their compact shared-memory layout.
+static bool exl3_sm86_available(int cc) {
+    return cc == 860 && ggml_cuda_highest_compiled_arch(cc) == 860;
+}
 constexpr int EXL3_GEMV_MAX_M = 8;
 
 // tile element order (exllamav3 tensor_core_perm): lane t = idx/8, slot j = idx%8
@@ -105,7 +116,7 @@ __global__ void exl3_had_in_kernel(const float * __restrict__ x, const half * __
 }
 
 // y[m][n] (F32, in place) = had128(y) / sqrt(128) * svh; grid (n/128, m), block 32
-__global__ void exl3_had_out_kernel(float * __restrict__ y, const half * __restrict__ svh, int n) {
+__device__ __forceinline__ void exl3_had_out(float * __restrict__ y, const half * __restrict__ svh, int n) {
     const int lane = threadIdx.x;
     const int col  = blockIdx.x * 128 + lane * 4;
     const size_t base = size_t(blockIdx.y) * n + col;
@@ -118,6 +129,16 @@ __global__ void exl3_had_out_kernel(float * __restrict__ y, const half * __restr
     v.z = v.z * EXL3_HAD_SCALE * __low2float(s23);
     v.w = v.w * EXL3_HAD_SCALE * __high2float(s23);
     *reinterpret_cast<float4 *>(y + base) = v;
+}
+
+__global__ void exl3_had_out_kernel(float * y, const half * svh, int n) {
+    exl3_had_out(y, svh, n);
+}
+
+__global__ void exl3_had_out_pair(float * y0, const half * s0, float * y1, const half * s1, int n, int n1) {
+    if (blockIdx.z) n = n1;
+    if (blockIdx.x >= n / 128) return;
+    exl3_had_out(blockIdx.z ? y1 : y0, blockIdx.z ? s1 : s0, n);
 }
 
 template <int bits, int cb>
@@ -136,9 +157,10 @@ void exl3_reconstruct_launch(const uint8_t * data, half * dst, int k, int n0, in
     exl3_reconstruct_kernel<bits, cb><<<unsigned((tiles + 7) / 8), 256, 0, stream>>>(data, dst, k, n0 / 16, n1 / 16);
 }
 
-// ---- int8 activation path (m <= MAX_M) ---------------------------------------------------
+// ---- int8 activation path (up to MAX_M rows per launch) ---------------------------------
 // GGML_EXL3_INT8: 0 = off (fp16 tensor-core gemv), 1 = int8 + error-feedback residual everywhere,
-// 2 = plain int8 (residual only for the head), unset = per-tensor rule: plain for K <= 6, residual for K >= 7.
+// 2 = plain int8 (residual only for the head), unset = per-tensor rule: plain for K <= 6, residual for K >= 7,
+// with the SM86 six-bit vocabulary head using F16 activations and F32 accumulation at M=1..13.
 // The residual limits additional activation error for high-bit weights. Plain activations at lower
 // bit widths are a precision/performance policy, not exact agreement with the F16-activation executor.
 
@@ -197,13 +219,105 @@ void exl3_int8_geometry(int bits, int nacc, int m, int k, int colblocks, int pai
     smem   = size_t(nrows) * 16 * (size_t(nacc) * 4 + size_t(m) * 2) + exl3_int8::stage_bytes(bits);
 }
 
+// Small N cannot amortize preparation; large split counts exceed the ordered
+// reduction's shared-memory budget. K6 qualification covers five/six K groups.
+static bool exl3_warpk_shape(int bits, bool residual, int n, int ksplit) {
+    return (bits == 4 && !residual && n >= 4096 && ksplit <= 40) ||
+           (bits == 6 && residual && n >= 131072 && (ksplit == 5 || ksplit == 6));
+}
+
+template <int BITS, bool RESID, bool PAIR, int M = 8>
+static void exl3_warpk_launch(ggml_backend_cuda_context & ctx, const uint8_t * weights, const float * x,
+        const half * suh, const half * svh, float * output, int k, int n, int rows, int splits, int m,
+        exl3_int8::warpk_pair pair = {}, const half * svh1 = nullptr) {
+    constexpr int NACC = M * (RESID ? 2 : 1);
+    const size_t bytes = size_t(splits) * (8 * NACC + NACC * rows * 32);
+    const size_t pair_bytes = PAIR ? size_t(pair.splits) * (8 * NACC + NACC * pair.rows * 32) : 0;
+    ggml_cuda_pool_alloc<uint8_t> prepared(ctx.pool(), bytes + pair_bytes);
+    if constexpr (PAIR) pair.prepared = prepared.get() + bytes;
+    const auto stream = ctx.stream();
+    const int max_splits = PAIR ? std::max(splits, pair.splits) : splits;
+    const int max_rows = PAIR ? std::max(rows, pair.rows) : rows;
+    const int max_n = PAIR ? std::max(n, pair.n) : n;
+    if constexpr (M == 16) {
+        static bool attributes[GGML_CUDA_MAX_DEVICES] = {};
+        if (!attributes[ctx.device]) {
+            // The K6 consumer also owns a 4.5 KiB static weight stage.
+            const int cap = int(ggml_cuda_info().devices[ctx.device].smpbo) - 8192;
+            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(exl3_int8::prepare_warpk<RESID, PAIR, M>), cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
+            if constexpr (BITS == 4) {
+                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(exl3_int8::gemv_warpk<4, BITS, RESID, PAIR, M>), cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
+                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(exl3_int8::gemv_warpk<5, BITS, RESID, PAIR, M>), cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
+                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(exl3_int8::gemv_warpk<16, BITS, RESID, PAIR, M>), cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
+            } else {
+                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(exl3_int8::gemv_warpk<5, BITS, RESID, PAIR, M>), cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
+                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(exl3_int8::gemv_warpk<6, BITS, RESID, PAIR, M>), cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
+            }
+            attributes[ctx.device] = true;
+        }
+    }
+    exl3_int8::prepare_warpk<RESID, PAIR, M><<<dim3(1, max_splits, PAIR ? 2 : 1), M * 32, size_t(max_rows) * 16 * (NACC + 2 * M), stream>>>(
+            x, suh, prepared.get(), k, rows, m, pair);
+    const dim3 grid(max_n / 32, 1, PAIR ? 2 : 1);
+    const size_t smem = size_t(max_splits) * M * 32 * sizeof(float);
+    if constexpr (BITS == 4) {
+        // Wide output projections favor fewer K warps; narrower projections
+        // have more original K groups and benefit from the larger block.
+        if (n >= 3 * k) {
+            // Five warps divide ten original K groups evenly for wider verify
+            // batches. Keep the independently measured eight-row schedule.
+            if (M == 16 && splits == 10 && (!PAIR || pair.splits == 10)) {
+                exl3_int8::gemv_warpk<5, BITS, RESID, PAIR, M><<<grid, 160, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+            } else {
+                exl3_int8::gemv_warpk<4, BITS, RESID, PAIR, M><<<grid, 128, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+            }
+        } else {
+            if constexpr (M == 16 && !RESID) {
+                // Two blocks fit by shared memory, but the unconstrained M16
+                // kernel's 81-100 registers otherwise limit residency to one.
+                // Drop unused partial rows when that also brings a larger
+                // shared-memory projection below the two-block limit.
+                const size_t live_smem = size_t(max_splits) * m * 32 * sizeof(float);
+                if (smem > 48 * 1024 && live_smem <= 48 * 1024) {
+                    exl3_int8::gemv_warpk_m16_compact<PAIR><<<grid, 512, live_smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+                } else if (smem <= 48 * 1024) {
+                    exl3_int8::gemv_warpk_m16<PAIR><<<grid, 512, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+                } else {
+                    exl3_int8::gemv_warpk<16, BITS, RESID, PAIR, M><<<grid, 512, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+                }
+            } else {
+                exl3_int8::gemv_warpk<16, BITS, RESID, PAIR, M><<<grid, 512, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+            }
+        }
+    } else {
+        // One useful warp per original K group avoids idle warps in the head.
+        if (splits == 5) {
+            exl3_int8::gemv_warpk<5, BITS, RESID, PAIR, M><<<grid, 160, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+        } else if (M == 8 && m >= 7 && splits == 6 && n >= 200000) {
+            // Large-vocabulary verification benefits from two K groups per
+            // warp; smaller heads retain the independently measured schedule.
+            exl3_int8::gemv_warpk<3, BITS, RESID, PAIR, M><<<grid, 96, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+        } else {
+            exl3_int8::gemv_warpk<6, BITS, RESID, PAIR, M><<<grid, 192, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+        }
+    }
+    if constexpr (PAIR) {
+        exl3_had_out_pair<<<dim3(max_n / 128, m, 2), 32, 0, stream>>>(output, svh, pair.output, svh1, n, pair.n);
+    } else {
+        exl3_had_out_kernel<<<dim3(n / 128, m), 32, 0, stream>>>(output, svh, n);
+    }
+}
+
 // One launch = grid (n/256, ksplit, pairs); dense calls pass pairs = 1 with M tokens, the grouped
 // MoE path M = 1 with one (token, expert) pair per block-z.
 template <int bits, int cb, int M, bool RESID, bool GROUPED>
 void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, const float * x, const half * suh, const half * svh,
         float * y, int k, int n, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream) {
     const auto kernel = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, GROUPED>;
-    const size_t cap = exl3_int8_smem_cap(ctx.device);
+    const size_t cap = M > exl3_int8::MAX_M
+        ? std::min(exl3_int8_smem_cap(ctx.device),
+                size_t(ggml_cuda_info().devices[ctx.device].smpbo) - size_t(M) * exl3_int8::COLS * sizeof(float) - 4096)
+        : exl3_int8_smem_cap(ctx.device);
     // function attributes are per device: opt this instantiation in once on each
     static bool attr_set[GGML_CUDA_MAX_DEVICES] = {};
     if (!attr_set[ctx.device]) {
@@ -217,11 +331,46 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
     // Grouped launches size the split by pair count for occupancy; their activation scales can
     // therefore differ across batches. The fixed dense geometry does not apply to this grouped path.
     int ksplit, nrows; size_t smem;
-    exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs, cap, ksplit, nrows, smem);
+    // Keep activation scales and partial-sum order identical to smaller batches.
+    // Larger specializations are admitted only when this geometry fits their cap.
+    exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs,
+            exl3_int8_smem_cap(ctx.device), ksplit, nrows, smem);
+    if constexpr (M >= 3 && M <= 8 && exl3_int8::sm86_matrix_shape(bits, cb, M, RESID, GROUPED)) {
+        if (exl3_sm86_available(ggml_cuda_info().devices[ctx.device].cc)) {
+            // Byte activations, F16 transform scratch, and the head's weight ring.
+            smem = size_t(nrows) * 16 * (nacc + M * 2) + exl3_int8::head_stage_bytes(bits);
+        }
+    }
+    GGML_ASSERT(smem <= cap);
+    if constexpr (cb == 2 && !GROUPED && ((bits == 4 && !RESID && M >= 4 && M <= 8) || (bits == 6 && RESID && M >= 5 && M <= 8))) {
+        if (exl3_sm86_available(ggml_cuda_info().devices[ctx.device].cc) && exl3_warpk_shape(bits, RESID, n, ksplit)) {
+            exl3_warpk_launch<bits, RESID, false>(ctx, B, x, suh, svh, y, k, n, nrows, ksplit, M);
+            return;
+        }
+    }
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
     int * counters = exl3_int8_counters(ctx);
+    if constexpr (cb == 2 && bits == 6 && M >= 3 && M <= 8 && RESID && !GROUPED) {
+        if (exl3_sm86_available(ggml_cuda_info().devices[ctx.device].cc)) {
+            const auto prepare = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, false, false, exl3_int8::input_mode::prepare>;
+            const auto consume = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, false, false, exl3_int8::input_mode::consume>;
+            static bool prep_attr[GGML_CUDA_MAX_DEVICES] = {};
+            if (!prep_attr[ctx.device]) {
+                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(prepare), cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
+                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(consume), cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
+                prep_attr[ctx.device] = true;
+            }
+            ggml_cuda_pool_alloc<uint8_t> prepared(ctx.pool(), size_t(ksplit) * (2 * nacc * sizeof(uint32_t) + nacc * nrows * 16));
+            prepare<<<dim3(1, ksplit), exl3_int8::THREADS, smem, stream>>>(
+                B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, prepared.get());
+            const size_t consume_smem = size_t(nacc) * nrows * 16 + exl3_int8::head_stage_bytes(bits);
+            consume<<<dim3(colblocks, ksplit), exl3_int8::THREADS, consume_smem, stream>>>(
+                B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, prepared.get());
+            return;
+        }
+    }
     kernel<<<dim3(colblocks, ksplit, pairs), exl3_int8::THREADS, smem, stream>>>(
-        B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga);
+        B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, nullptr);
 }
 
 template <int bits, bool RESID>
@@ -275,12 +424,112 @@ bool exl3_mul_mat_id_fast_shape(const ggml_tensor * dst) {
         dst->src[3] != nullptr && dst->src[4] != nullptr;
 }
 
-bool exl3_int8_applicable(int bits, int m, int k, int n) {
-    return exl3_int8_mode() != 0 && bits >= 1 && bits <= 8 && m >= 1 && m <= exl3_int8::MAX_M &&
+bool exl3_int8_applicable(int bits, int m, int k, int n, int cc) {
+    // SM86: bounded speculative batches reuse the existing eight-row kernels
+    // instead of reconstructing the entire weight matrix above eight rows.
+    // Dense/head sweeps retain M<=16 for K2..4 and M<=13 for K5..8;
+    // wider high-bit batches and K1 residual heads can lose to reconstruction.
+    // Keep other architectures at their measured crossover.
+    const int max_m = exl3_sm86_available(cc) && bits >= 2 ? (bits <= 4 ? 16 : 13) : exl3_int8::MAX_M;
+    return exl3_int8_mode() != 0 && bits >= 1 && bits <= 8 && m >= 1 && m <= max_m &&
         n % 128 == 0 && k % 128 == 0 && size_t(n) <= EXL3_INT8_MAX_N;
 }
 
 } // namespace
+
+template <int M>
+static bool exl3_int8_bundle_launch(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_tensor * b) {
+    const auto kernel = exl3_int8::gemv_int8_kernel<4, 2, M, false, false, true>;
+    const int k = a->src[0]->ne[0], n0 = a->ne[0], n1 = b->ne[0];
+    const int c0 = (n0 + exl3_int8::COLS - 1) / exl3_int8::COLS;
+    const int c1 = (n1 + exl3_int8::COLS - 1) / exl3_int8::COLS;
+    const size_t cap = std::min(exl3_int8_smem_cap(ctx.device),
+            size_t(ggml_cuda_info().devices[ctx.device].smpbo) - M * exl3_int8::COLS * sizeof(float) - 4096);
+    int s0, r0, s1, r1;
+    size_t sm0, sm1;
+    exl3_int8_geometry(4, M, M, k, c0, 1, exl3_int8_smem_cap(ctx.device), s0, r0, sm0);
+    exl3_int8_geometry(4, M, M, k, c1, 1, exl3_int8_smem_cap(ctx.device), s1, r1, sm1);
+    if constexpr (M >= 4 && M <= 8) {
+        sm0 = size_t(r0) * 16 * M * 3;
+        sm1 = size_t(r1) * 16 * M * 3;
+    }
+    if (std::max(sm0, sm1) > cap) {
+        return false;
+    }
+    static bool attr_set[GGML_CUDA_MAX_DEVICES] = {};
+    if (!attr_set[ctx.device]) {
+        CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
+        attr_set[ctx.device] = true;
+    }
+    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(M) * (size_t(s0) * n0 + size_t(s1) * n1));
+    int * counters = exl3_int8_counters(ctx);
+    const exl3_int8::bundle_args args {
+        static_cast<const uint8_t *>(b->src[0]->data), static_cast<const half *>(b->src[3]->data),
+        static_cast<const half *>(b->src[2]->data), static_cast<float *>(b->data),
+        partials.get() + size_t(M) * s0 * n0, counters + c0, n1, r1, s1, c0 * s0, c1 * s1,
+    };
+    kernel<<<c0 * s0 + c1 * s1, exl3_int8::THREADS, std::max(sm0, sm1), ctx.stream()>>>(
+        static_cast<const uint8_t *>(a->src[0]->data), static_cast<const float *>(a->src[1]->data),
+        static_cast<const half *>(a->src[3]->data), static_cast<const half *>(a->src[2]->data),
+        static_cast<float *>(a->data), partials.get(), counters, k, n0, r0, {}, args, nullptr);
+    return true;
+}
+
+bool ggml_cuda_exl3_bundle(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_tensor * b) {
+    // Measured SM86 mul1/plain-int8 shapes. Each source keeps its own signs;
+    // concatenating these weights into an ordinary projection is not equivalent.
+    if (!exl3_sm86_available(ggml_cuda_info().devices[ctx.device].cc) ||
+            exl3_int8_mode() == 0 || exl3_int8_mode() == 1 ||
+            a->src[1] != b->src[1] || a->src[0]->type != ggml_exl3_type(4, 2) ||
+            b->src[0]->type != ggml_exl3_type(4, 2) ||
+            !ggml_cuda_exl3_supports_mul_mat(a) || !ggml_cuda_exl3_supports_mul_mat(b) ||
+            !a->src[2] || !a->src[3] || !b->src[2] || !b->src[3] ||
+            a->ne[0] > 32768 || b->ne[0] > 32768 ||
+            strcmp(a->src[0]->name, "output.weight") == 0 || strcmp(b->src[0]->name, "output.weight") == 0) {
+        return false;
+    }
+    const int m = a->ne[1], k = a->src[0]->ne[0], n = a->ne[0], n1 = b->ne[0];
+    if (((m >= 4 && m <= 8) || m == 13) && n >= 4096 && n1 >= 4096 &&
+            (n >= 3 * k) == (n1 >= 3 * k)) {
+        // Keep each projection's original quantization slices and input signs.
+        int splits, rows, splits1, rows1; size_t smem;
+        exl3_int8_geometry(4, 8, 8, k, (n + 255) / 256, 1, exl3_int8_smem_cap(ctx.device), splits, rows, smem);
+        exl3_int8_geometry(4, 8, 8, k, (n1 + 255) / 256, 1, exl3_int8_smem_cap(ctx.device), splits1, rows1, smem);
+        if (exl3_warpk_shape(4, false, n, splits) && exl3_warpk_shape(4, false, n1, splits1)) {
+            exl3_int8::warpk_pair pair {
+                static_cast<const uint8_t *>(b->src[0]->data), static_cast<const half *>(b->src[3]->data),
+                nullptr, static_cast<float *>(b->data), n1, rows1, splits1,
+            };
+            if (m == 13) {
+                exl3_warpk_launch<4, false, true, 16>(ctx, static_cast<const uint8_t *>(a->src[0]->data),
+                        static_cast<const float *>(a->src[1]->data),
+                        static_cast<const half *>(a->src[3]->data), static_cast<const half *>(a->src[2]->data),
+                        static_cast<float *>(a->data), k, n, rows, splits, m, pair,
+                        static_cast<const half *>(b->src[2]->data));
+                return true;
+            }
+            // Smaller adaptive widths use the padded eight-row executor.
+            for (int row = 0; row < m; row += 8) {
+                pair.output = static_cast<float *>(b->data) + size_t(row) * n1;
+                exl3_warpk_launch<4, false, true>(ctx, static_cast<const uint8_t *>(a->src[0]->data),
+                        static_cast<const float *>(a->src[1]->data) + size_t(row) * k,
+                        static_cast<const half *>(a->src[3]->data), static_cast<const half *>(a->src[2]->data),
+                        static_cast<float *>(a->data) + size_t(row) * n, k, n, rows, splits,
+                        std::min(8, m - row), pair, static_cast<const half *>(b->src[2]->data));
+            }
+            return true;
+        }
+    }
+    // Preserve the measured scalar fallback outside the matrix executor's shapes.
+    if (m == 13 && n == n1) return false;
+    switch (a->ne[1]) {
+        case 1:  return exl3_int8_bundle_launch<1>(ctx, a, b);
+        case 4:  return exl3_int8_bundle_launch<4>(ctx, a, b);
+        case 7:  return exl3_int8_bundle_launch<7>(ctx, a, b);
+        case 13: return exl3_int8_bundle_launch<13>(ctx, a, b);
+        default: return false;
+    }
+}
 
 bool ggml_cuda_exl3_supports_mul_mat(const ggml_tensor * dst) {
     const ggml_tensor * w   = dst->src[0];
@@ -321,19 +570,71 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     cudaStream_t stream = ctx.stream();
     float * y = static_cast<float *>(dst->data);
 
+#if !defined(GGML_USE_HIP)
+    // Keep one head arithmetic policy across single-row decode and verification.
+    // Explicit INT8 modes retain their original executors; this is the default
+    // SM86 policy, not a drafting-only switch or an expanded-weight cache.
+    if (exl3_int8_mode() == -1 && exl3_sm86_available(ggml_cuda_info().devices[ctx.device].cc) && bits == 6 && cb == 2 &&
+            m >= 1 && m <= 13 && k % 128 == 0 && n >= 131072 && n % 128 == 0 &&
+            strcmp(src0->name, "output.weight") == 0) {
+        ggml_cuda_pool_alloc<half> transformed(ctx.pool(), size_t(m) * k);
+        exl3_had_in_kernel<<<dim3(k / 128, m), 32, 0, stream>>>(
+            static_cast<const float *>(src1->data), suh, transformed.get(), k);
+        const auto * weights = static_cast<const uint8_t *>(src0->data);
+        if (m <= 8) {
+            exl3_head::project<1><<<n / 32, 512, 0, stream>>>(transformed.get(), weights, y, m, k, n);
+        } else {
+            exl3_head::project<2><<<n / 32, 512, 0, stream>>>(transformed.get(), weights, y, m, k, n);
+        }
+        exl3_had_out_kernel<<<dim3(n / 128, m), 32, 0, stream>>>(y, svh, n);
+        return;
+    }
+#endif
+
     // the int8 path relies on the mul1 codebook being affine in the byte sum
-    if (cb == 2 && exl3_int8_applicable(bits, m, k, n)) {
+    if (cb == 2 && exl3_int8_applicable(bits, m, k, n, ggml_cuda_info().devices[ctx.device].cc)) {
         // int8 activation path: fused input transform, per-slice quantization, fused output transform
         const uint8_t * B = static_cast<const uint8_t *>(src0->data);
         const float * x = static_cast<const float *>(src1->data);
         const bool resid = exl3_int8_resid(bits, strcmp(src0->name, "output.weight") == 0);
-        switch (bits) {
-#define EXL3_INT8_CASE(K) case K: resid ? exl3_int8_run<K, true>(ctx, x, suh, B, svh, y, m, k, n, stream) \
-                                       : exl3_int8_run<K, false>(ctx, x, suh, B, svh, y, m, k, n, stream); break;
-            EXL3_INT8_CASE(1) EXL3_INT8_CASE(2) EXL3_INT8_CASE(3) EXL3_INT8_CASE(4)
-            EXL3_INT8_CASE(5) EXL3_INT8_CASE(6) EXL3_INT8_CASE(7) EXL3_INT8_CASE(8)
+        if (exl3_sm86_available(ggml_cuda_info().devices[ctx.device].cc) && m == 13 && bits == 6 && resid) {
+            int splits, rows; size_t smem;
+            exl3_int8_geometry(bits, 16, 8, k, (n + 255) / 256, 1,
+                    exl3_int8_smem_cap(ctx.device), splits, rows, smem);
+            if (exl3_warpk_shape(bits, resid, n, splits)) {
+                exl3_warpk_launch<6, true, false, 16>(ctx, B, x, suh, svh, y, k, n, rows, splits, m);
+                return;
+            }
+        }
+        if (exl3_sm86_available(ggml_cuda_info().devices[ctx.device].cc) && bits == 4 &&
+                m == 13 && n <= 32768 && !resid) {
+            const size_t cap = std::min(exl3_int8_smem_cap(ctx.device),
+                    size_t(ggml_cuda_info().devices[ctx.device].smpbo) - 13 * exl3_int8::COLS * sizeof(float) - 4096);
+            int ksplit, nrows; size_t smem;
+            exl3_int8_geometry(bits, 13, 13, k, (n + exl3_int8::COLS - 1) / exl3_int8::COLS,
+                    1, exl3_int8_smem_cap(ctx.device), ksplit, nrows, smem);
+            if (exl3_warpk_shape(bits, resid, n, ksplit)) {
+                exl3_warpk_launch<4, false, false, 16>(ctx, B, x, suh, svh, y, k, n, nrows, ksplit, m);
+                return;
+            }
+            if (smem <= cap) {
+                exl3_gemv_int8_launch<4, 2, 13, false, false>(
+                        ctx, B, x, suh, svh, y, k, n, 1, {}, stream);
+                return;
+            }
+        }
+        for (int row = 0; row < m; row += exl3_int8::MAX_M) {
+            const int rows = std::min(exl3_int8::MAX_M, m - row);
+            const float * x_rows = x + size_t(row) * k;
+            float * y_rows = y + size_t(row) * n;
+            switch (bits) {
+#define EXL3_INT8_CASE(K) case K: resid ? exl3_int8_run<K, true>(ctx, x_rows, suh, B, svh, y_rows, rows, k, n, stream) \
+                                       : exl3_int8_run<K, false>(ctx, x_rows, suh, B, svh, y_rows, rows, k, n, stream); break;
+                EXL3_INT8_CASE(1) EXL3_INT8_CASE(2) EXL3_INT8_CASE(3) EXL3_INT8_CASE(4)
+                EXL3_INT8_CASE(5) EXL3_INT8_CASE(6) EXL3_INT8_CASE(7) EXL3_INT8_CASE(8)
 #undef EXL3_INT8_CASE
-            default: GGML_ABORT("EXL3 int8 path: unsupported bit width %d", bits);
+                default: GGML_ABORT("EXL3 int8 path: unsupported bit width %d", bits);
+            }
         }
         return;
     }
@@ -342,6 +643,42 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     ggml_cuda_pool_alloc<half> xh(ctx.pool(), size_t(m) * k);
     exl3_had_in_kernel<<<dim3(k / 128, m), 32, 0, stream>>>(
         static_cast<const float *>(src1->data), suh, xh.get(), k);
+
+#if !defined(GGML_USE_HIP)
+    // Consume decoded shared tiles instead of reconstructing the entire
+    // projection. SM75 wins at short batches, and up to 128 rows on wide
+    // outputs; its narrower shapes favor cuBLAS sooner than SM86's do.
+    const int cc_gemm = ggml_cuda_info().devices[ctx.device].cc;
+    const bool turing_gemm = ggml_cuda_exl3_turing_gemm_supported(
+        cc_gemm, ggml_cuda_highest_compiled_arch(cc_gemm), m, n, k);
+    if (bits == 4 && cb == 2 &&
+            ((exl3_sm86_available(cc_gemm) && m >= 17) || turing_gemm)) {
+        const uint8_t * weights = static_cast<const uint8_t *>(src0->data);
+        const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+        // Short batches benefit from smaller row tiles. Keep enough blocks for
+        // narrow outputs: BM128 halves their grid and can lose to BM32/64.
+        if (m <= 32 || (m <= 64 && n / 64 < nsm)) {
+            exl3_gemm_kernel<4, 2, 32, 3><<<dim3(n / 64, (m + 31) / 32), 256, 0, stream>>>(weights, xh.get(), y, k, n, m);
+        } else if (m <= 64 || (m <= 128 && n / 64 < (3 * nsm + 1) / 2)) {
+            exl3_gemm_kernel<4, 2, 64, 2><<<dim3(n / 64, (m + 63) / 64), 256, 0, stream>>>(weights, xh.get(), y, k, n, m);
+        } else {
+            const dim3 grid(n / 64, (m + 127) / 128);
+            const int blocks = grid.x * grid.y;
+            const int sms = ggml_cuda_info().devices[ctx.device].nsm;
+            // A third resident CTA shortens some launch tails, but its tighter
+            // register budget loses when two CTAs/SM finish in as few waves.
+            const int waves2 = (blocks + 2 * sms - 1) / (2 * sms);
+            const int waves3 = (blocks + 3 * sms - 1) / (3 * sms);
+            if (waves3 < waves2) {
+                exl3_gemm_kernel<4, 2, 128, 3><<<grid, 256, 0, stream>>>(weights, xh.get(), y, k, n, m);
+            } else {
+                exl3_gemm_kernel<4, 2, 128, 2><<<grid, 256, 0, stream>>>(weights, xh.get(), y, k, n, m);
+            }
+        }
+        exl3_had_out_kernel<<<dim3(n / 128, m), 32, 0, stream>>>(y, svh, n);
+        return;
+    }
+#endif
 
 #if !defined(GGML_USE_HIP)
     if (m <= EXL3_GEMV_MAX_M && ampere_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {

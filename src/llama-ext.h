@@ -9,6 +9,12 @@
 #include <cstdint>
 #include <map>
 
+// Read model metadata without allocating model weights. Accepts GGUF files and
+// native safetensors directories; the latter may validate quant auxiliaries and
+// return key/value metadata only, not a tensor directory.
+// Caller owns the result (gguf_free). Returns nullptr on failure.
+LLAMA_API struct gguf_context * llama_model_load_metadata(const char * path);
+
 struct llama_dflash_proposal_view {
     const int32_t * candidate_ids = nullptr; // [blocks, steps, top_k]
     const float   * q_rows        = nullptr; // [blocks, steps, top_k]

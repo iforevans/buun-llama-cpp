@@ -75,7 +75,6 @@ contradictory answers.
 | `--vbr-codec <auto\|turbo\|classic>` | Representation ladder. `auto` (default) prefers Turbo when every KV layer supports the complete ladder, then falls back to classic for BailingMoE3/Ling. Explicit families are strict. |
 | `--vbr-entry <tier>` | Dynamic VBR entry tier. Default `f16` preserves maximum quality; `t8` (or a lower tier) explicitly trades some quality for lower KV bandwidth and memory from the first token. |
 | `--vbr-floor <bits\|tier>` | Literal aggregate bits/value floor for dynamic mode. Implicit VBR defaults to t4 (4.125); explicit `-ct vbr` without this flag uses t1 (1.25). Degrades stop at the last step still ≥ the floor. |
-| `--vbr-budget <tier\|number>` | Default `dynamic` (runtime controller). A tier (`t8/t4/t3/t2/t1`) or a number instead selects a **fixed** static tier — no runtime degrades. |
 
 Auto selects the classic ladder for BailingMoE3/Ling models whose head geometry is not supported by TurboQuant:
 
@@ -95,6 +94,12 @@ unified KV (forced automatically with `-np > 1`). Context-shift / self-extend an
 save-restore are disabled in dynamic mode (they would snapshot tier-typed KV that can't restore across a
 degrade — tier-aware save-restore is planned); context checkpoints stay enabled on hybrid models. Generation stops cleanly when the context
 fills. Models without a baked price order use a generic cross-model order.
+
+## Native .safetensors support + EXL3
+
+Load supported `.safetensors` model directories directly, including EXL3 quants—no GGUF conversion
+required. See the [safetensors guide](docs/safetensors.md#supported-quantization-formats)
+for supported quantization types and limitations. Support depends on the model architecture and backend.
 
 ## TCQ (trellis-coded KV cache)
 
@@ -405,6 +410,12 @@ machine will rely on reclaim/reload or swap and can slow down sharply. More slot
 other resident models require additional headroom. Context length, KV type, host memory bandwidth,
 CPU threads, and expert-cache hit rate all affect the final speed.
 
+## Bonsai 2 ternary models
+
+CPU/CUDA inference supports Prism's Bonsai 2 `PQ2_0` and `PTQ1_0` GGUFs,
+including their Hadamard-folded weights. See [Bonsai 2](docs/bonsai.md) for
+format details, launch flags, and backend limitations.
+
 ## Build
 
 ### NVIDIA (CUDA)
@@ -556,37 +567,25 @@ The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal s
 a wide range of hardware - locally and in the cloud.
 
 - Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
 - AVX, AVX2, AVX512 and AMX support for x86 architectures
 - RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
 - 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
+- Custom CUDA kernels for running LLMs on NVIDIA GPUs, with AMD GPU support via HIP/ROCm
 - CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
 
 The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
 
 ## Supported backends
 
+The fork's Turbo/TCQ KV codecs and dynamic VBR support these GPU backends:
+
 | Backend | Target devices |
 | --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+| [CUDA](docs/build.md#cuda) | NVIDIA GPU |
+| [HIP/ROCm](docs/build.md#hip) | AMD GPU |
+
+CPU offloading remains supported; CPU-resident KV layers fall back to `q8_0` rather than Turbo/TCQ.
+Other upstream backends remain in the source tree but are not supported for these fork-specific features.
 
 ## Documentation
 

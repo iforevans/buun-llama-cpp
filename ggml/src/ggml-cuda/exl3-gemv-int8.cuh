@@ -53,8 +53,30 @@ __device__ __forceinline__ void cp_async_wait() {
 
 // pair-row staging depth (rows in flight per warp) for the smem unit (K = 5..8)
 constexpr int STAGE_D = 4;
+// The SM86 multi-row head favors two warp-private stages; the scalar decoder
+// retains its independently tuned four-stage pipeline.
+constexpr int HEAD_STAGE_D = 2;
 __host__ __device__ constexpr bool stage_smem(int bits) { return bits >= 5; }
 __host__ __device__ constexpr int stage_bytes(int bits) { return stage_smem(bits) ? 8 * STAGE_D * 16 * bits * 4 : 0; }
+
+// Shared by the device specialization and host allocation: compact storage
+// must never be selected for a row count that still uses the scalar executor.
+__host__ __device__ constexpr bool sm86_matrix_shape(int bits, int cb, int m, bool residual, bool grouped) {
+    return cb == 2 && !grouped && (
+            (bits >= 2 && bits <= 4 &&
+             (m == 3 || m == 4 || m == 8 || (bits == 4 && (m == 5 || m == 6 || m == 7 || (m == 13 && !residual)))) &&
+             !(bits == 4 && m == 3 && !residual)) ||
+            (bits == 6 && residual && m >= 3 && m <= 8));
+}
+
+__host__ __device__ constexpr int head_stage_bytes(int bits) {
+    return bits == 6 ? 8 * HEAD_STAGE_D * 16 * bits * 4 : 0;
+}
+
+// Reuse the same transform/quantization implementation when a large head can
+// amortize one preparation launch across its output columns. No decoded weights
+// are retained, and each original K slice keeps its scales and sum order.
+enum class input_mode { inline_quantize, prepare, consume };
 
 __device__ __forceinline__ float dot2(half2 w, half2 x) {
     const float2 wf = __half22float2(w), xf = __half22float2(x);
@@ -264,10 +286,50 @@ struct grouped_args {
 };
 
 // cb == 2 (mul1): int8 activations, dp4a; other codebooks: F16 activations, decoded weights, fp32 FMA.
-template <int bits, int cb, int M, bool RESID, bool GROUPED>
+// Independent second projection for a paired dense launch. Each projection keeps
+// its own input signs, scales, K-slices and ordered partial reduction.
+struct bundle_args {
+    const uint8_t * weights;
+    const half * suh;
+    const half * svh;
+    float * output;
+    float * partials;
+    int * counters;
+    int n, nrows, ksplit, first_blocks, second_blocks;
+};
+
+template <int bits, int cb, int M, bool RESID, bool GROUPED, bool BUNDLE = false, input_mode INPUT = input_mode::inline_quantize>
 __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __restrict__ B,
         const float * __restrict__ x, const half * __restrict__ suh, const half * __restrict__ svh, float * __restrict__ y,
-        float * __restrict__ partials, int * __restrict__ counters, int k, int n, int nrows_max, grouped_args ga) {
+        float * __restrict__ partials, int * __restrict__ counters, int k, int n, int nrows_max, grouped_args ga, bundle_args bundle = {}, uint8_t * prepared = nullptr) {
+    int column_block = blockIdx.x, k_block = blockIdx.y, k_blocks = gridDim.y;
+    if constexpr (BUNDLE) {
+        static_assert(!GROUPED);
+        // Alternate independent projection blocks; append any unmatched tail.
+        const int paired = min(bundle.first_blocks, bundle.second_blocks);
+        const int flat = blockIdx.x;
+        const bool second = flat < 2 * paired ? (flat & 1) : bundle.second_blocks > bundle.first_blocks;
+        const int index = flat < 2 * paired ? flat / 2 : flat - paired;
+        if (second) {
+            B = bundle.weights; suh = bundle.suh; svh = bundle.svh;
+            y = bundle.output; partials = bundle.partials; counters = bundle.counters;
+            n = bundle.n; nrows_max = bundle.nrows; k_blocks = bundle.ksplit;
+        } else {
+            k_blocks = bundle.first_blocks / ((n + COLS - 1) / COLS);
+        }
+        const int columns = (n + COLS - 1) / COLS;
+        column_block = index % columns;
+        k_block = index / columns;
+    }
+    // Visit adjacent K slices first for dense single-row SM86 decode. Keep the
+    // same slice boundaries/scales and ordered reduction; only CTA order changes.
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+    if constexpr (M == 1 && !GROUPED && !BUNDLE) {
+        const int linear_block = blockIdx.y * gridDim.x + blockIdx.x;
+        column_block = linear_block / gridDim.y;
+        k_block = linear_block % gridDim.y;
+    }
+#endif
     constexpr int TWORDS = 8 * bits;
     constexpr bool WIDE = bits == 4;   // uint2-per-lane block pair; other K use pointer extraction
     constexpr bool INT8 = cb == 2;
@@ -277,10 +339,14 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     // Measured dense mul1 crossover: retain vector dots for one/two rows.
     // Other row counts/precisions and grouped MoE retain their existing executor.
     constexpr bool WMMA = INT8 && !GROUPED && bits >= 2 && bits <= 4 && (M == 3 || M == 4 || M == 8);
+#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 750
+    // Turing uses four smaller integer MMAs. Keep vector dots for the
+    // unmeasured formats/rows and for small plain-int8 verification batches.
+    constexpr bool WMMA = INT8 && !GROUPED && bits == 4 && (M == 8 || (RESID && M == 4));
 #elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
-    // Measured sm86 code-target crossover; plain 4-bit M3 still favors vector dots.
-    constexpr bool WMMA = INT8 && !GROUPED && bits >= 2 && bits <= 4 && (M == 3 || M == 4 || M == 8) &&
-                          !(bits == 4 && M == 3 && !RESID);
+    // SM86: matrix cores help dense verify batches; plain K4 M3 favors vector dots.
+    // K6 residual batches cover the vocabulary head without dropping its correction.
+    constexpr bool WMMA = sm86_matrix_shape(bits, cb, M, RESID, GROUPED);
 #else
     constexpr bool WMMA = false;
 #endif
@@ -297,12 +363,18 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         suh += size_t(expert) * k;
         x   += size_t(t) * ga.x_nb2 + (ga.ne11 == 1 ? 0 : size_t(e) * ga.x_nb1);
         y   += size_t(pair) * n;
-        partials += size_t(pair) * gridDim.y * M * n;
+        partials += size_t(pair) * k_blocks * M * n;
         counters += size_t(pair) * gridDim.x;
     }
-    extern __shared__ uint32_t sh_as[];   // [NACC][nrows_max * 16] splats, then [M][nrows_max * 16] F16 xh
-    half * sh_xh = reinterpret_cast<half *>(sh_as + size_t(NACC) * nrows_max * 16);
-    uint32_t * sh_stage = reinterpret_cast<uint32_t *>(sh_xh + size_t(M) * nrows_max * 16);   // [8 warps][STAGE_D][2*TWORDS]
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+    constexpr bool COMPACT = WMMA && M >= 3 && M <= 8;
+#else
+    constexpr bool COMPACT = false;
+#endif
+    extern __shared__ uint32_t sh_as[];
+    half * sh_xh = reinterpret_cast<half *>(reinterpret_cast<uint8_t *>(sh_as) + size_t(NACC) * nrows_max * 16 * (COMPACT ? 1 : 4));
+    uint32_t * sh_stage = reinterpret_cast<uint32_t *>(sh_xh +
+            (INPUT == input_mode::consume ? 0 : size_t(M) * nrows_max * 16));
     __shared__ float sh_y[M][COLS];
     __shared__ float sh_redf[THREADS / 32][M];
     __shared__ int   sh_redi[THREADS / 32][NACC];
@@ -312,13 +384,18 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
 
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, lq = lane & 15;
     const int kslices = k / 16;
-    const int kb0   = blockIdx.y * nrows_max;
+    const int kb0   = k_block * nrows_max;
     const int nrows = min(nrows_max, kslices - kb0);
     const int kn    = nrows * 16;
+    constexpr int HEADER_BYTES = 2 * NACC * sizeof(uint32_t);
+    if constexpr (INPUT != input_mode::inline_quantize) {
+        static_assert(M >= 3 && M <= 8 && bits == 6 && RESID && !GROUPED && !BUNDLE);
+        prepared += size_t(k_block) * (HEADER_BYTES + NACC * nrows_max * 16);
+    }
 
     // input transform of this block's own k range (128-aligned: nrows % 8 == 0): xh = had128(x * suh) / sqrt(128),
     // F16 in smem, with the per-slice max |xh| per row
-    {
+    if constexpr (INPUT != input_mode::consume) {
         float amax[M];
 #pragma unroll
         for (int r = 0; r < M; ++r) amax[r] = 0.0f;
@@ -364,8 +441,16 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
 #endif
         return p * nrows_max * 16 + i;
     };
+    auto store_splat = [&](int p, int i, int v) {
+        if constexpr (COMPACT) reinterpret_cast<uint8_t *>(sh_as)[splat_index(p, i)] = uint8_t(int8_t(v));
+        else sh_as[splat_index(p, i)] = uint32_t(uint8_t(int8_t(v))) * 0x01010101u;
+    };
+    auto load_splat = [&](int p, int i) {
+        if constexpr (COMPACT) return uint32_t(reinterpret_cast<uint8_t *>(sh_as)[splat_index(p, i)]) * 0x01010101u;
+        else return sh_as[splat_index(p, i)];
+    };
     // quantize inline while staging the splats; exact int sums per plane
-    if constexpr (INT8) {
+    if constexpr (INT8 && INPUT != input_mode::consume) {
         int sum[NACC];
 #pragma unroll
         for (int p = 0; p < NACC; ++p) sum[p] = 0;
@@ -377,13 +462,13 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                 const float q  = sh_q[p0];
                 int v = __float2int_rn(a / q);
                 v = max(-127, min(127, v));
-                sh_as[splat_index(p0, i)] = uint32_t(uint8_t(int8_t(v))) * 0x01010101u;
+                store_splat(p0, i, v);
                 sum[p0] += v;
                 if constexpr (RESID) {
                     const float rr = a - q * float(v);
                     int v2 = __float2int_rn(rr / sh_q[p0 + 1]);
                     v2 = max(-127, min(127, v2));
-                    sh_as[splat_index(p0 + 1, i)] = uint32_t(uint8_t(int8_t(v2))) * 0x01010101u;
+                    store_splat(p0 + 1, i, v2);
                     sum[p0 + 1] += v2;
                 }
             }
@@ -403,6 +488,27 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         __syncthreads();
     }
 
+    if constexpr (INPUT == input_mode::prepare) {
+        for (int i = threadIdx.x; i < NACC * nrows_max * 4; i += THREADS) {
+            reinterpret_cast<uint32_t *>(prepared + HEADER_BYTES)[i] = i % (nrows_max * 4) < kn / 4 ? sh_as[i] : 0;
+        }
+        if (threadIdx.x < NACC) {
+            reinterpret_cast<uint32_t *>(prepared)[threadIdx.x] = __float_as_uint(sh_q[threadIdx.x]);
+            reinterpret_cast<uint32_t *>(prepared)[NACC + threadIdx.x] = uint32_t(sh_s[threadIdx.x]);
+        }
+        return;
+    }
+    if constexpr (INPUT == input_mode::consume) {
+        for (int i = threadIdx.x; i < NACC * nrows_max * 4; i += THREADS) {
+            sh_as[i] = reinterpret_cast<const uint32_t *>(prepared + HEADER_BYTES)[i];
+        }
+        if (threadIdx.x < NACC) {
+            sh_q[threadIdx.x] = __uint_as_float(reinterpret_cast<uint32_t *>(prepared)[threadIdx.x]);
+            sh_s[threadIdx.x] = int(reinterpret_cast<uint32_t *>(prepared)[NACC + threadIdx.x]);
+        }
+        __syncthreads();
+    }
+
     const float k_inv = __half2float(__ushort_as_half(0x1eee));
     const float bias  = __half2float(__ushort_as_half(0xc931));
     const float cbias = 1024.0f * k_inv + bias;
@@ -410,34 +516,66 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
 
     const int n_tiles = n / 16;
     if constexpr (WMMA) {
-        static_assert(bits >= 2 && bits <= 4 && NACC <= 16);
-        const int nt = blockIdx.x * 16 + warp * 2;
+        static_assert(bits >= 2 && bits <= 6 && NACC <= 16);
+        const int nt = column_block * 16 + warp * 2;
 #if defined(GGML_USE_HIP) && defined(RDNA4)
         using i2 = int __attribute__((ext_vector_type(2)));
         using i8 = int __attribute__((ext_vector_type(8)));
         i8 acc[2] = {};
-#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+#elif !defined(GGML_USE_HIP) && (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 750)
         constexpr int PLANES = (NACC + 7) / 8;
         int acc[2][PLANES][4] = {};
 #endif
-        // Each lane loads one packed word per tile. Prefetch four K tiles, then
+        // Each lane loads one packed word per tile (two for K6). Prefetch four K tiles, then
         // shuffle word pairs and extract nearby windows together for the matrix core.
         constexpr int RING = 4;
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+        constexpr bool WSTAGE = bits == 6 && M >= 3 && M <= 8;
+#else
+        constexpr bool WSTAGE = false;
+#endif
+        constexpr int PAIRW = 2 * TWORDS;
+        uint32_t * warp_stage = sh_stage + warp * HEAD_STAGE_D * PAIRW;
+        auto stage_weights = [&](int kb) {
+            if constexpr (WSTAGE) {
+                const int tile = lane / (TWORDS / 4);
+                if (lane < PAIRW / 4 && kb < nrows && nt + tile < n_tiles) {
+                    const auto * src = B32 + (size_t(nt + tile) * kslices + kb0 + kb) * TWORDS + (lane % (TWORDS / 4)) * 4;
+                    cp_async16(warp_stage + (kb % HEAD_STAGE_D) * PAIRW + lane * 4, src);
+                }
+                cp_async_commit();
+            }
+        };
+        if constexpr (WSTAGE) {
+#pragma unroll
+            for (int i = 0; i < HEAD_STAGE_D - 1; ++i) stage_weights(i);
+        }
         uint32_t words[2][RING] = {};
-        auto load_word = [&](int tile, int kb) {
-            return nt + tile < n_tiles && lane < TWORDS && kb < nrows
-                ? exl3::load_streaming(B32 + (size_t(nt + tile) * kslices + kb0 + kb) * TWORDS + lane) : 0u;
+        uint32_t words_hi[2][RING] = {};
+        auto load_word = [&](int tile, int kb, int extra = 0) {
+            return nt + tile < n_tiles && lane + extra < TWORDS && kb < nrows
+                ? exl3::load_streaming(B32 + (size_t(nt + tile) * kslices + kb0 + kb) * TWORDS + lane + extra) : 0u;
         };
 #pragma unroll
         for (int tile = 0; tile < 2; ++tile) {
 #pragma unroll
-            for (int d = 0; d < RING; ++d) words[tile][d] = load_word(tile, d);
+            for (int d = 0; d < RING; ++d) {
+                if constexpr (!WSTAGE) {
+                    words[tile][d] = load_word(tile, d);
+                    if constexpr (bits > 4) words_hi[tile][d] = load_word(tile, d, 32);
+                }
+            }
         }
         for (int base = 0; base < nrows; base += RING) {
 #pragma unroll
             for (int drow = 0; drow < RING; ++drow) {
                 const int kb = base + drow;
                 if (kb >= nrows) break;
+                if constexpr (WSTAGE) {
+                    cp_async_wait<HEAD_STAGE_D - 2>();
+                    __syncwarp();
+                    stage_weights(kb + HEAD_STAGE_D - 1);
+                }
 #if defined(GGML_USE_HIP) && defined(RDNA4)
                 i2 decoded[2][4];
 #pragma unroll
@@ -475,12 +613,32 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                         acc[tile] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, true, b, acc[tile], false);
                     }
                 }
-#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+#elif !defined(GGML_USE_HIP) && (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 750)
                 uint32_t current[2];
+                uint32_t current_hi[2] = {};
+                uint32_t operands[2][PLANES][2];
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+#pragma unroll
+                    for (int plane = 0; plane < PLANES; ++plane) {
+                        const int p = plane * 8 + lane / 4;
+                        const int j = half * 8 + lane % 4;
+                        if constexpr (M <= 8) {
+                            operands[half][plane][0] = p < NACC ? load_splat(p, kb * 16 + j) : 0;
+                            operands[half][plane][1] = p < NACC ? load_splat(p, kb * 16 + j + 4) : 0;
+                        }
+                    }
+                }
 #pragma unroll
                 for (int tile = 0; tile < 2; ++tile) {
-                    current[tile] = words[tile][drow];
-                    words[tile][drow] = load_word(tile, kb + RING);
+                    if constexpr (!WSTAGE) {
+                        current[tile] = words[tile][drow];
+                        words[tile][drow] = load_word(tile, kb + RING);
+                        if constexpr (bits > 4) {
+                            current_hi[tile] = words_hi[tile][drow];
+                            words_hi[tile][drow] = load_word(tile, kb + RING, 32);
+                        }
+                    }
                 }
 #pragma unroll
                 for (int tile = 0; tile < 2; ++tile) {
@@ -489,14 +647,42 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                     for (int g = 0; g < 2; ++g) {
                         // Ampere fragment: four stride-two windows per group.
                         const int t = (lane / 4) * 32 + ((lane % 4) / 2) * 8 + (lane & 1) + g * 16;
-                        const int end = (t + 257 + 6) * bits;
-                        const int first = (end - 6 * bits - 16) / 32, last = (end - 1) / 32;
-                        const uint32_t lo = __shfl_sync(0xffffffffu, current[tile], last % TWORDS);
-                        const uint32_t hi = __shfl_sync(0xffffffffu, current[tile], first % TWORDS);
+                        if constexpr (bits > 4) {
+                            // Four stride-two K6 windows can span three packed words.
+                            // Decode pairs so each funnel shift covers adjacent words.
 #pragma unroll
-                        for (int s = 0; s < 4; ++s) {
-                            const uint32_t w = exl3::fshift(lo, hi, (last + 1) * 32 - end + (6 - 2 * s) * bits) & 65535u;
-                            decoded[s & 1][2 * g + s / 2] = w * 0x83DCD12Du;
+                            for (int pair = 0; pair < 2; ++pair) {
+                                const int end = (t + 257 + 4 * pair + 2) * bits;
+                                const int first = (end - 2 * bits - 16) / 32, last = (end - 1) / 32;
+                                const int ilo = last % TWORDS, ihi = first % TWORDS;
+                                uint32_t lo, hi;
+                                if constexpr (WSTAGE) {
+                                    const uint32_t * row = warp_stage + (kb % HEAD_STAGE_D) * PAIRW + tile * TWORDS;
+                                    lo = nt + tile < n_tiles ? row[ilo] : 0;
+                                    hi = nt + tile < n_tiles ? row[ihi] : 0;
+                                } else {
+                                    const uint32_t lo0 = __shfl_sync(0xffffffffu, current[tile], ilo & 31);
+                                    const uint32_t hi0 = __shfl_sync(0xffffffffu, current[tile], ihi & 31);
+                                    const uint32_t lo1 = __shfl_sync(0xffffffffu, current_hi[tile], ilo & 31);
+                                    const uint32_t hi1 = __shfl_sync(0xffffffffu, current_hi[tile], ihi & 31);
+                                    lo = ilo < 32 ? lo0 : lo1; hi = ihi < 32 ? hi0 : hi1;
+                                }
+#pragma unroll
+                                for (int s = 0; s < 2; ++s) {
+                                    const uint32_t w = exl3::fshift(lo, hi, (last + 1) * 32 - end + (2 - 2 * s) * bits) & 65535u;
+                                    decoded[s][2 * g + pair] = w * 0x83DCD12Du;
+                                }
+                            }
+                        } else {
+                            const int end = (t + 257 + 6) * bits;
+                            const int first = (end - 6 * bits - 16) / 32, last = (end - 1) / 32;
+                            const uint32_t lo = __shfl_sync(0xffffffffu, current[tile], last % TWORDS);
+                            const uint32_t hi = __shfl_sync(0xffffffffu, current[tile], first % TWORDS);
+#pragma unroll
+                            for (int s = 0; s < 4; ++s) {
+                                const uint32_t w = exl3::fshift(lo, hi, (last + 1) * 32 - end + (6 - 2 * s) * bits) & 65535u;
+                                decoded[s & 1][2 * g + s / 2] = w * 0x83DCD12Du;
+                            }
                         }
                     }
 #pragma unroll
@@ -506,17 +692,34 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                         for (int plane = 0; plane < PLANES; ++plane) {
                             const int p = plane * 8 + lane / 4;
                             const int j = j0 + lane % 4;
-                            const uint32_t b0 = p < NACC ? sh_as[splat_index(p, kb * 16 + j)] : 0;
-                            const uint32_t b1 = p < NACC ? sh_as[splat_index(p, kb * 16 + j + 4)] : 0;
+                            const uint32_t b0 = M <= 8 ? operands[j0 / 8][plane][0] : (p < NACC ? load_splat(p, kb * 16 + j) : 0);
+                            const uint32_t b1 = M <= 8 ? operands[j0 / 8][plane][1] : (p < NACC ? load_splat(p, kb * 16 + j + 4) : 0);
                             int * d = acc[tile][plane];
+#if __CUDA_ARCH__ == 750
+                            // Same integer dot and accumulator layout as m16n8k32;
+                            // Turing's native instruction covers eight rows / K16.
+                            asm("mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                                : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(b0));
+                            asm("mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                                : "+r"(d[2]), "+r"(d[3]) : "r"(a[1]), "r"(b0));
+                            asm("mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                                : "+r"(d[0]), "+r"(d[1]) : "r"(a[2]), "r"(b1));
+                            asm("mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                                : "+r"(d[2]), "+r"(d[3]) : "r"(a[3]), "r"(b1));
+#else
                             asm("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
                                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
                         }
                     }
                 }
 #endif
             }
+        }
+        if constexpr (WSTAGE) {
+            cp_async_wait<0>();
+            __syncwarp();
         }
 #if defined(GGML_USE_HIP) && defined(RDNA4)
 #pragma unroll
@@ -533,11 +736,11 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                     float v = sh_q[lq] * (k_inv * float(acc[tile][l]) + cbias * float(sh_s[lq]));
                     if constexpr (RESID) v += sh_q[lq + 1] * (k_inv * float(second) + cbias * float(sh_s[lq + 1]));
                     const int r = RESID ? lq / 2 : lq;
-                    partials[(size_t(blockIdx.y) * M + r) * n + (nt + tile) * 16 + 8 * (lane / 16) + l] = v;
+                    partials[(size_t(k_block) * M + r) * n + (nt + tile) * 16 + 8 * (lane / 16) + l] = v;
                 }
             }
         }
-#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+#elif !defined(GGML_USE_HIP) && (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 750)
 #pragma unroll
         for (int tile = 0; tile < 2; ++tile) {
 #pragma unroll
@@ -552,14 +755,14 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                         float v = sh_q[p] * (k_inv * float(acc[tile][plane][l]) + cbias * float(sh_s[p]));
                         if constexpr (RESID) v += sh_q[p + 1] * (k_inv * float(acc[tile][plane][l + 1]) + cbias * float(sh_s[p + 1]));
                         const int r = RESID ? p / 2 : p;
-                        partials[(size_t(blockIdx.y) * M + r) * n + (nt + tile) * 16 + c] = v;
+                        partials[(size_t(k_block) * M + r) * n + (nt + tile) * 16 + c] = v;
                     }
                 }
             }
         }
 #endif
     } else if constexpr (WIDE) {
-        const int nt = blockIdx.x * 16 + warp * 2 + (lane >> 4);
+        const int nt = column_block * 16 + warp * 2 + (lane >> 4);
         const bool active = nt < n_tiles;   // partial last block: warps beyond n idle (whole warp)
         const uint32_t * bp = B32 + (size_t(nt) * kslices + kb0) * TWORDS + 2 * lq;
         const int c2 = (lane & 1) ? 4 : 0;
@@ -647,7 +850,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                     o0 = facc0[r];
                     o1 = facc1[r];
                 }
-                float * part = partials + (size_t(blockIdx.y) * M + r) * n;
+                float * part = partials + (size_t(k_block) * M + r) * n;
                 part[n0]     = o0;
                 part[n0 + 8] = o1;
             }
@@ -659,7 +862,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         constexpr bool REG   = bits == 2 || bits == 3;
         constexpr bool STAGE = stage_smem(bits);         // cp.async pair rows into warp-private smem
         constexpr bool REGW  = bits >= 5 && !STAGE;      // two words per lane per tile
-        const int ntA = blockIdx.x * 16 + warp * 2;
+        const int ntA = column_block * 16 + warp * 2;
         const bool active = ntA < n_tiles;   // partial last block: idle warps skip loads and stores
         const uint32_t * bpA = B32 + (size_t(ntA) * kslices + kb0) * TWORDS;
         const uint32_t * bpB = B32 + (size_t(ntA + 1) * kslices + kb0) * TWORDS;
@@ -833,7 +1036,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                 } else {
                     oa0 = fa0[r]; oa1 = fa1[r]; ob0 = fb0[r]; ob1 = fb1[r];
                 }
-                float * part = partials + (size_t(blockIdx.y) * M + r) * n;
+                float * part = partials + (size_t(k_block) * M + r) * n;
                 part[cA] = oa0; part[cA + 8] = oa1;
                 part[cB] = ob0; part[cB + 8] = ob1;
             }
@@ -844,18 +1047,18 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) {
-        sh_last = atomicAdd(counters + blockIdx.x, 1) == int(gridDim.y) - 1;
+        sh_last = atomicAdd(counters + column_block, 1) == int(k_blocks) - 1;
     }
     __syncthreads();
     if (!sh_last) return;
     __threadfence();
 
-    const int col = blockIdx.x * COLS + threadIdx.x;
+    const int col = column_block * COLS + threadIdx.x;
 #pragma unroll
     for (int r = 0; r < M; ++r) {
         float v = 0.0f;
         if (col < n) {
-            for (int sl = 0; sl < int(gridDim.y); ++sl) {
+            for (int sl = 0; sl < int(k_blocks); ++sl) {
 #if defined(GGML_USE_HIP)
                 // Read other blocks' published partials through an agent-scope load.
                 v += __hip_atomic_load(partials + (size_t(sl) * M + r) * n + col,
@@ -867,16 +1070,16 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         }
         sh_y[r][threadIdx.x] = v;
     }
-    if (threadIdx.x == 0) counters[blockIdx.x] = 0;
+    if (threadIdx.x == 0) counters[column_block] = 0;
     __syncthreads();
     // output Hadamard: 2 x 128-blocks per row, one warp each
     for (int b = warp; b < 2 * M; b += THREADS / 32) {
         const int r = b >> 1;
         const int c = (b & 1) * 128 + lane * 4;
-        if (blockIdx.x * COLS + (b & 1) * 128 >= n) continue;   // partial block: second 128-half absent
+        if (column_block * COLS + (b & 1) * 128 >= n) continue;   // partial block: second 128-half absent
         float v0 = sh_y[r][c], v1 = sh_y[r][c + 1], v2 = sh_y[r][c + 2], v3 = sh_y[r][c + 3];
         exl3_had::had128(v0, v1, v2, v3, lane);
-        const int gc = blockIdx.x * COLS + c;
+        const int gc = column_block * COLS + c;
         const half2 s01 = *reinterpret_cast<const half2 *>(svh + gc);
         const half2 s23 = *reinterpret_cast<const half2 *>(svh + gc + 2);
         float4 o;

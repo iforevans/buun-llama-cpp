@@ -69,7 +69,9 @@ struct common_fit_extra_model {
     llama_model_params * mparams;
     llama_context_params * cparams;
     bool shares_model;
-    bool follows_target_per_sequence = false;
+    // Follow all realized target streams (including per-stream padding), not
+    // just one sequence. Used by the shared unified MTP pool.
+    bool follows_target_capacity = false;
     uint32_t fixed_n_ctx = 0;
     const common_fit_extra_model * next = nullptr;
     bool optional_if_no_mtp = false;
@@ -79,7 +81,7 @@ struct common_fit_extra_model {
 uint32_t common_fit_extra_context_size(
         uint32_t target_n_ctx,
         uint32_t target_n_streams,
-        bool follows_target_per_sequence,
+        bool follows_target_capacity,
         uint32_t fixed_n_ctx);
 
 // Deterministic seam for the linked-extra cache policy. The production fitter

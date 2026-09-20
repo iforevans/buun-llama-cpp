@@ -5829,9 +5829,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return 1;
         }
     }
-    // EXL3 projections have their own executor (Hadamard + trellis gemv); no matcher applies.
+    // EXL3 projections retain independent input signs even when sharing a launch.
     if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
             node->src[0] != nullptr && ggml_cuda_is_exl3(node->src[0]->type)) {
+        if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes &&
+                cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
+                (node->ne[1] <= 8 || node->ne[1] == 13) &&
+                ggml_cuda_info().devices[cuda_ctx->device].cc == 860) {
+            const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+            const int outputs[] = { i, i + 1 };
+            if (ggml_can_fuse_subgraph(cgraph, i, 2, ops, outputs, 2) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, outputs, 2) &&
+                    ggml_cuda_exl3_bundle(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+                return 1;
+            }
+        }
         return 0;
     }
 #if !defined(GGML_USE_HIP)
@@ -6113,10 +6125,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // Qwen3.5/3.6 recurrent decode computes two small BF16 projections from
+    // Qwen3.5-family recurrent decode computes two small projections from
     // the same activation, then immediately applies their gate epilogues.
     // Pairing the projections and eliding four launch-sized epilogues is
-    // worthwhile at batch one. Keep the structural and layout checks strict
+    // worthwhile for BF16 batch one and measured SM86 F16 verify batches.
+    // Keep the structural and layout checks strict
     // so all other graphs retain the ordinary implementation.
     static const bool qwen35_gates = std::getenv("GGML_CUDA_DISABLE_QWEN35_GATES") == nullptr;
     if (qwen35_gates && i + 8 < cgraph->n_nodes) {
@@ -6151,8 +6164,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_get_unary_op(beta) == GGML_UNARY_OP_SIGMOID &&
                 beta_mm->src[1] == input;
             const bool layout_ok = edges_ok && dt && a && input &&
-                alpha_mm->src[0]->type == GGML_TYPE_BF16 &&
-                beta_mm->src[0]->type == GGML_TYPE_BF16 && input->type == GGML_TYPE_F32 &&
+                (alpha_mm->src[0]->type == GGML_TYPE_BF16 ||
+                    // Above eight rows the ordinary F16 route changes its
+                    // accumulation, so only fuse the matching half2 reduction.
+                    (alpha_mm->src[0]->type == GGML_TYPE_F16 && input->ne[1] <= 8 &&
+                     alpha_mm->src[0]->ne[0] == 5120 &&
+                     ggml_cuda_info().devices[cuda_ctx->device].cc == 860 &&
+                     ggml_get_op_params_i32(alpha_mm, 0) == GGML_PREC_DEFAULT &&
+                     ggml_get_op_params_i32(beta_mm, 0) == GGML_PREC_DEFAULT)) &&
+                beta_mm->src[0]->type == alpha_mm->src[0]->type && input->type == GGML_TYPE_F32 &&
                 dt->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 &&
                 alpha_mm->type == GGML_TYPE_F32 && beta_mm->type == GGML_TYPE_F32 &&
                 gate->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32 &&
@@ -6169,7 +6189,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_nelements(dt) == alpha_mm->src[0]->ne[1] &&
                 ggml_nelements(a) == alpha_mm->src[0]->ne[1];
             if (layout_ok) {
-                if (input->ne[1] == 1) {
+                if (input->ne[1] == 1 || alpha_mm->src[0]->type == GGML_TYPE_F16) {
                     const bool gate_direct = ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, out_nodes, 1);
                     const bool beta_direct = ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, out_nodes + 1, 1);
                     if ((!gate_direct || !beta_direct) && ggml_cuda_tensors_overlap(gate, beta)) {
@@ -6188,8 +6208,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     if (!beta_direct) {
                         beta_tmp.data = beta_scratch.alloc(ggml_nelements(beta));
                     }
-                    ggml_cuda_op_qwen35_recurrent_gates(
-                        *cuda_ctx, alpha_mm->src[0], beta_mm->src[0], input, dt, a, &gate_tmp, &beta_tmp);
+                    if (alpha_mm->src[0]->type == GGML_TYPE_F16) {
+                        ggml_cuda_op_qwen35_recurrent_gates_f16(
+                            *cuda_ctx, alpha_mm->src[0], beta_mm->src[0], input, dt, a, &gate_tmp, &beta_tmp);
+                    } else {
+                        ggml_cuda_op_qwen35_recurrent_gates(
+                            *cuda_ctx, alpha_mm->src[0], beta_mm->src[0], input, dt, a, &gate_tmp, &beta_tmp);
+                    }
                     if (!gate_direct) {
                         CUDA_CHECK(cudaMemcpyAsync(gate->data, gate_tmp.data, ggml_nbytes(gate),
                             cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
@@ -6219,6 +6244,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 }
                 return 8;
             }
+        }
+    }
+
+    // Coalesce independent state-window copies. VIEW nodes carry metadata only;
+    // every read/write range must remain disjoint from the other copies.
+    if (node->op == GGML_OP_CPY && ggml_cuda_info().devices[cuda_ctx->device].cc == 860) {
+        const ggml_tensor * sources[16];
+        ggml_tensor * destinations[16];
+        int count = 0, last = i;
+        for (int j = i; j < cgraph->n_nodes && count < 16; ++j) {
+            ggml_tensor * candidate = cgraph->nodes[j];
+            if (candidate->op == GGML_OP_VIEW) continue;
+            if (candidate->op != GGML_OP_CPY || candidate->type != GGML_TYPE_F32 ||
+                    (candidate->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                    candidate->src[0]->type != GGML_TYPE_F32 ||
+                    // External DFlash views may carry device data without a
+                    // buffer object. Leave those on the ordinary copy path.
+                    candidate->buffer == nullptr || candidate->src[0]->buffer == nullptr ||
+                    ggml_nelements(candidate) != ggml_nelements(candidate->src[0]) ||
+                    ggml_cuda_tensors_overlap(candidate, candidate->src[0])) break;
+            bool independent = true;
+            for (int c = 0; independent && c < count; ++c) {
+                independent = !ggml_cuda_tensors_overlap(candidate, destinations[c]) &&
+                    !ggml_cuda_tensors_overlap(candidate, sources[c]) &&
+                    !ggml_cuda_tensors_overlap(candidate->src[0], destinations[c]);
+            }
+            if (!independent) break;
+            sources[count] = candidate->src[0];
+            destinations[count++] = candidate;
+            last = j;
+        }
+        if (count > 1) {
+            ggml_cuda_cpy_batch(*cuda_ctx, sources, destinations, count);
+            return last - i;
         }
     }
 
@@ -6435,6 +6494,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Single-sequence verification can read the indexed initial state directly.
+    // The source remains an explicit graph dependency; no host-side row index
+    // is baked into a captured graph. Keep all other shapes on the gather path.
+    if (node->op == GGML_OP_GET_ROWS && i + 2 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 860) {
+        constexpr ggml_op ops[] = {GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_GATED_DELTA_NET};
+        const int outputs[] = {i + 2};
+        ggml_tensor * reshape = cgraph->nodes[i + 1];
+        ggml_tensor * gdn = cgraph->nodes[i + 2];
+        if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 1) &&
+            reshape->src[0] == node && gdn->src[5] == reshape &&
+            node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
+            node->src[1]->type == GGML_TYPE_I32 && ggml_nelements(node->src[1]) == 1 &&
+            ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) &&
+            ggml_is_matrix(node->src[0]) && gdn->src[2]->ne[3] == 1 &&
+            gdn->src[2]->ne[0] == 128 && gdn->src[3]->ne[0] == 1 &&
+            gdn->src[2]->ne[2] >= 2 && gdn->src[2]->ne[2] <= 16 &&
+            ggml_get_op_params_i32(gdn, 0) > 1 &&
+            node->src[0]->ne[0] == ggml_nelements(reshape) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, outputs, 1)) {
+            ggml_cuda_gated_delta_net_fused_cache cache{};
+            const int skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i + 2, cuda_ctx, cache);
+            cache.input_state = static_cast<const float *>(node->src[0]->data);
+            cache.input_rows = static_cast<const int32_t *>(node->src[1]->data);
+            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, gdn, cache);
+            return 2 + skip;
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy{};
@@ -6551,6 +6639,84 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     return ops.size() - 1;
                 }
             }
+        }
+    }
+
+    // Single-consumer Bonsai transforms can write MMVQ's Q8 activation layout
+    // directly. The subgraph check deliberately leaves shared Q/K/V rotations
+    // on the ordinary path instead of recomputing them for every projection.
+    if (ggml_can_fuse_subgraph(cgraph, i,
+            { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 4 })) {
+        const ggml_tensor * mul = node;
+        const ggml_tensor * reshape = cgraph->nodes[i + 1];
+        const ggml_tensor * rot = cgraph->nodes[i + 2];
+        const ggml_tensor * restored = cgraph->nodes[i + 3];
+        ggml_tensor * mm = cgraph->nodes[i + 4];
+        const ggml_tensor * x = mul->src[0];
+        const ggml_tensor * signs = mul->src[1];
+        const ggml_tensor * w = mm->src[0];
+        const int output = i + 4;
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        if (ggml_get_op_params_i32(rot, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            rot->ne[0] == 1024 && rot->src[1] == reshape && reshape->src[0] == mul &&
+            restored->src[0] == rot && mm->src[1] == restored &&
+            (w->type == GGML_TYPE_PTQ1_0 || w->type == GGML_TYPE_Q2_0_G128) &&
+            x->type == GGML_TYPE_F32 && signs->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
+            x->ne[0] % 1024 == 0 && ggml_are_same_shape(x, restored) &&
+            signs->ne[0] == x->ne[0] && ggml_nelements(signs) == x->ne[0] &&
+            ggml_is_contiguous(x) && ggml_is_contiguous(signs) && ggml_is_contiguous(w) &&
+            ggml_is_contiguous(restored) && ggml_is_contiguous(mm) &&
+            ggml_backend_buft_is_cuda(w->buffer->buft) &&
+            ggml_cuda_should_use_mmvq(w->type, cc, x->ne[1]) &&
+            ggml_get_op_params_i32(mm, 1) != GGML_HINT_FORCE_MMQ &&
+            !w->view_src &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, &output, 1)) {
+            ggml_cuda_mul_mat_vec_q_fwht(*cuda_ctx, x, signs, mm);
+            return 4;
+        }
+    }
+
+    // Inverse embedding rotation: gather, FWHT, then signs, without an
+    // intermediate dequantized embedding or transform buffer.
+    if (ggml_can_fuse_subgraph(cgraph, i,
+            { GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_MUL }, { i + 4 })) {
+        const ggml_tensor * reshape = cgraph->nodes[i + 1];
+        const ggml_tensor * rot = cgraph->nodes[i + 2];
+        const ggml_tensor * restored = cgraph->nodes[i + 3];
+        ggml_tensor * out = cgraph->nodes[i + 4];
+        const int output = i + 4;
+        if (ggml_get_op_params_i32(rot, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            rot->ne[0] == 1024 && rot->src[1] == reshape && reshape->src[0] == node &&
+            restored->src[0] == rot && out->src[0] == restored &&
+            ggml_backend_buft_is_cuda(node->src[0]->buffer->buft) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, &output, 1) &&
+            ggml_cuda_get_rows_fwht(*cuda_ctx, node, out->src[1], out)) {
+            return 4;
+        }
+    }
+
+    // Hadamard sign flip + reshape + FWHT-hint matmul: multiply the sign
+    // vector during the transform's load instead of a separate full pass
+    if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 2 })) {
+        const ggml_tensor * mul     = cgraph->nodes[i];
+        const ggml_tensor * reshape = cgraph->nodes[i + 1];
+        ggml_tensor *       mm      = cgraph->nodes[i + 2];
+
+        const ggml_tensor * x     = mul->src[0];
+        const ggml_tensor * signs = mul->src[1];
+
+        const bool pattern_ok = ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            mm->src[1] == reshape && reshape->src[0] == mul &&
+            signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
+            signs->type == GGML_TYPE_F32 &&
+            (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) &&
+            // ggml_mul keeps src0's type, so an F16 x gives an F16 mul
+            mul->type == x->type &&
+            ggml_is_contiguous(x) && ggml_is_contiguous(signs) &&
+            signs->ne[0] == x->ne[0] && signs->ne[0] % mm->src[0]->ne[0] == 0;
+
+        if (pattern_ok && ggml_cuda_op_fwht_signed(*cuda_ctx, x, signs, mm)) {
+            return 2;
         }
     }
 
@@ -7569,7 +7735,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     x->type == GGML_TYPE_F32 && gamma->type == GGML_TYPE_F32 &&
                     gate->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
                     (x->ne[0] == 256 || x->ne[0] == 128) &&
-                    x->ne[2] == 1 && x->ne[3] == 1 &&
+                    // Verification preserves token/sequence axes around the
+                    // contiguous normalization rows. Keep the measured small-
+                    // batch extension on SM86; other shapes use existing paths.
+                    ((x->ne[2] == 1 && x->ne[3] == 1) ||
+                     (ggml_cuda_info().devices[cuda_ctx->device].cc == 860 &&
+                      x->ne[2] <= 13 && x->ne[3] <= 4)) &&
                     ggml_are_same_shape(x, gate) && ggml_are_same_shape(x, dst) &&
                     ggml_is_contiguous(x) && ggml_is_contiguous(dst) &&
                     ggml_is_contiguous(gamma) && gamma->ne[0] == x->ne[0] &&
@@ -8869,7 +9040,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
-                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
+                const bool is_hadamard = op->op == GGML_OP_MUL_MAT &&
+                    ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD;
+                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 &&
+                    !(is_hadamard && a->type == GGML_TYPE_F32)) {
                     return false;
                 }
 #ifdef GGML_USE_MUSA
@@ -8891,6 +9065,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q2_0_G128:
+                    case GGML_TYPE_PTQ1_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q4_A32:
@@ -8935,6 +9110,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q2_0_G128:
+                    case GGML_TYPE_PTQ1_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:

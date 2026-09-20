@@ -1,0 +1,33 @@
+{
+  "object": "cache_plan_preflight",
+  "schema_version": 2,
+  "cache_plan_schema_version": 10,
+  "authoritative": false,
+  "reservation": "none",
+  "valid_until": null,
+  "status": "ok",
+  "selection": {
+    "selection_tier": "similarity",
+    "provider": "live_slot",
+    "target_relation": "same_as_legacy",
+    "cache_hit": "partial",
+    "prompt_tokens": 100,
+    "reuse_tokens": 96,
+    "replay_tokens": 4,
+    "restore_bytes": 0
+  },
+  "miss_reasons": [
+    {
+      "provider": "host_cache_entry",
+      "reason": "adapter_config_mismatch",
+      "count": 2
+    }
+  ],
+  "limitations": [
+    "point_in_time",
+    "no_reservation",
+    "displacement_not_projected",
+    "queue_and_contention_not_modeled",
+    "post_generation_maintenance_not_modeled"
+  ]
+}

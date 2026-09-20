@@ -8,11 +8,11 @@
 template <int block_size, typename dst_t>
 static __global__ void rms_norm_silu_f32(
         const float * x, const float * gamma, const float * gate, dst_t * dst,
-        int ncols, int64_t gate_stride, float eps) {
+        int ncols, int64_t gate_stride, int64_t gate_channel, int64_t gate_sample, float eps) {
     const int col = threadIdx.x;
-    const int row = blockIdx.x;
+    const int row = (blockIdx.z*gridDim.y + blockIdx.y)*gridDim.x + blockIdx.x;
     x += row*ncols;
-    gate += row*gate_stride;
+    gate += blockIdx.x*gate_stride + blockIdx.y*gate_channel + blockIdx.z*gate_sample;
     const float value = x[col];
     const float z = gate[col];
     float sum = 0.0f;
@@ -28,15 +28,15 @@ template <typename dst_t>
 static void rms_norm_silu_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * x,
         const ggml_tensor * gamma, const ggml_tensor * gate, ggml_tensor * dst, float eps) {
     if (x->ne[0] == 128) {
-        rms_norm_silu_f32<128, dst_t><<<x->ne[1], 128, 0, ctx.stream()>>>(
+        rms_norm_silu_f32<128, dst_t><<<dim3(x->ne[1], x->ne[2], x->ne[3]), 128, 0, ctx.stream()>>>(
             static_cast<const float *>(x->data), static_cast<const float *>(gamma->data),
             static_cast<const float *>(gate->data), static_cast<dst_t *>(dst->data),
-            x->ne[0], gate->nb[1]/sizeof(float), eps);
+            x->ne[0], gate->nb[1]/sizeof(float), gate->nb[2]/sizeof(float), gate->nb[3]/sizeof(float), eps);
     } else {
-        rms_norm_silu_f32<256, dst_t><<<x->ne[1], 256, 0, ctx.stream()>>>(
+        rms_norm_silu_f32<256, dst_t><<<dim3(x->ne[1], x->ne[2], x->ne[3]), 256, 0, ctx.stream()>>>(
             static_cast<const float *>(x->data), static_cast<const float *>(gamma->data),
             static_cast<const float *>(gate->data), static_cast<dst_t *>(dst->data),
-            x->ne[0], gate->nb[1]/sizeof(float), eps);
+            x->ne[0], gate->nb[1]/sizeof(float), gate->nb[2]/sizeof(float), gate->nb[3]/sizeof(float), eps);
     }
 }
 
@@ -47,7 +47,7 @@ void ggml_cuda_op_rms_norm_silu(
     const ggml_tensor * x = rms->src[0];
     float eps;
     memcpy(&eps, rms->op_params, sizeof(eps));
-    GGML_ASSERT((x->ne[0] == 128 || x->ne[0] == 256) && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT((x->ne[0] == 128 || x->ne[0] == 256) && ggml_is_contiguous(x));
 #if !defined(GGML_USE_HIP)
     if (bf16_activation != nullptr) {
         rms_norm_silu_cuda<nv_bfloat16>(ctx, x, gamma, gate, dst, eps);
@@ -629,9 +629,10 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         const dim3 block_dims(block_size, 1, 1);
         const size_t nbytes_shared = block_size > WARP_SIZE ? 32 * sizeof(float) : 0;
         // Overlap gain loads with the unchanged sum-of-squares reduction.
-        // This fixed-width cache also pays off across measured prefill grids.
+        // This fixed-width cache pays off on SM86 and Blackwell, including prefill.
         if (ncols == 5120 && nchannels == 1 && nsamples == 1 &&
-                ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_BLACKWELL) {
+                (ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_BLACKWELL ||
+                 ggml_cuda_info().devices[ggml_cuda_get_device()].cc == 860)) {
             rms_norm_mul_bcast_f32<1024, float, 5><<<blocks_num, block_dims, nbytes_shared, stream>>>(
                 x, mul, dst, ncols, stride_row, stride_channel, stride_sample, eps);
             return;

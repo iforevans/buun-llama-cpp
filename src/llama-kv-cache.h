@@ -654,6 +654,10 @@ private:
     bool vbr_import_destination_input(
         uint32_t projected_wm_cells,
         vbr_import_destination_child & output) const noexcept;
+    // source_watermark=0 selects normal incoming occupancy; otherwise price
+    // the actual import placement without changing the desired quality policy.
+    uint32_t vbr_import_watermark_cells(uint32_t incoming_cells, uint32_t prefix_cells,
+                                        uint32_t source_watermark, llama_seq_id destination) const;
     struct vbr_import_destination_pricing {
         struct pool_row {
             const ggml_vbr_backend_iface * be = nullptr;
@@ -693,7 +697,7 @@ private:
         uint32_t projected_wm_cells,
         std::vector<llama_memory_vbr_physical_growth> * physical) const noexcept;
     bool vbr_policy_priced_steps(
-        std::vector<ggml_type> & sim, size_t start_cursor,
+        std::vector<ggml_type> & sim, size_t start_cursor, size_t end_cursor,
         int demanded_device, uint32_t watermark, bool fixed_watermark,
         bool fail_closed, llama_vbr_policy::child & output,
         vbr_hard_seal_consult_session * seal_session = nullptr) const;
@@ -1571,7 +1575,7 @@ private:
     // unified pin contract: a unit may be stepped only if its current type is a vbr tier AND
     // its side is not flag-pinned — every degrade/promote/sim walk must use this predicate
     bool vbr_unit_movable(ggml_type t, bool is_v) const;
-    uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
+    uint32_t vbr_watermark_cells(uint32_t extra_tokens) const;
     uint32_t get_pad_floor() const; // model-scoped attention read padding, also used by scratch sizing
     enum class vbr_degrade_result {
         applied,

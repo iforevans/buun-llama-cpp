@@ -61,13 +61,6 @@ constexpr bool common_cache_family_main_family(
         : automatic_main_family;
 }
 
-// A declared role already occupies the one main_family price carrier. The
-// independent policy callback must therefore be neutral for that entry.
-constexpr bool common_cache_family_allows_additional_weight(
-        const common_cache_family_binding & binding) noexcept {
-    return !binding.declared();
-}
-
 // Family provenance follows the retained immutable conversation. Only an
 // append/exact continuation keeps the existing lineage. A trim, branch, or
 // replacement adopts the incoming declaration (or the undeclared default),

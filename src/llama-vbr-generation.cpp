@@ -1,4 +1,5 @@
 #include "llama-vbr-generation.h"
+#include "llama-vbr-precision.h"
 
 #include "llama-vbr-explicit-capture.h"
 #include "llama-vbr-artifact-validate.h"
@@ -90,7 +91,8 @@ void mask_set(std::array<uint64_t, VBR_GENERATION_MASK_WORDS> & mask, uint32_t o
 bool unit_equal(const vbr_checkpoint_unit_generation & captured, const vbr_unit_generation & current) {
     return captured.repr_gen == current.repr_gen && captured.current_type == current.current_type &&
            captured.last_source_type == current.last_source_type && captured.domain == current.domain &&
-           captured.promote_hops == current.promote_hops && captured.last_transition == current.last_transition;
+           captured.promote_hops == current.promote_hops && captured.last_transition == current.last_transition &&
+           captured.effective_type == current.effective_type;
 }
 
 }  // namespace
@@ -820,6 +822,16 @@ bool vbr_generation_tracker::global_transition(vbr_mutation_registrant registran
     }
     ++mutation_serial_;
     ++global_generation_;
+    if (registrant == vbr_mutation_registrant::state_read_install ||
+        registrant == vbr_mutation_registrant::whole_import) {
+        // Raw state streams have no authenticated precision provenance. They
+        // must not inherit a fresh destination's apparent quality. Artifact
+        // import installs its own validated tracker image separately.
+        std::lock_guard<std::mutex> lock(units_mutex_);
+        for (auto & unit : units_) {
+            unit.effective_type = -1;
+        }
+    }
     ++mutation_serial_;
     // The unavailable state does not auto-clear here: the cause (registry or
     // slab exhaustion) may persist. try_clear_shadow_unavailable() probes the cause.
@@ -835,6 +847,7 @@ bool vbr_generation_tracker::initialize_unit(uint32_t unit, int32_t type, vbr_re
     state.repr_gen         = 1;
     state.current_type     = type;
     state.last_source_type = type;
+    state.effective_type   = type;
     state.domain           = domain;
     state.last_transition  = vbr_repr_transition::initial;
     return true;
@@ -874,6 +887,8 @@ bool vbr_generation_tracker::publish_unit(uint32_t                unit,
     ++state.repr_gen;
     state.last_source_type = source_type;
     state.current_type     = target_type;
+    state.effective_type = transition == vbr_repr_transition::full_reset
+        ? target_type : vbr_precision_merge(state.effective_type, target_type);
     state.domain           = domain;
     state.promote_hops     = promote_hops;
     state.last_transition  = transition;
@@ -1211,6 +1226,43 @@ bool vbr_generation_tracker::prepare_import_image_impl(
                 return false;
             }
             next->units = units_;
+            for (size_t i = 0; i < next->units.size(); ++i) {
+                auto & unit = next->units[i];
+                const auto & incoming = plan.units[i];
+                if (!replacement->preserved_cells().empty()) {
+                    // Foreign rows share this representation and history. Do
+                    // not publish incoming extent metadata inconsistent with
+                    // their tracker; incompatible histories safely miss.
+                    if (unit.current_type != incoming.current_type ||
+                        unit.domain != incoming.domain ||
+                        unit.promote_hops != incoming.promote_hops) {
+                        return false;
+                    }
+                    unit.effective_type = vbr_precision_merge(
+                        unit.effective_type, incoming.effective_type);
+                } else {
+                    // Keep the guarded controller lineage, but publish the
+                    // same final representation/history as the live extents.
+                    unit.current_type = incoming.current_type;
+                    unit.last_source_type = incoming.last_source_type;
+                    unit.effective_type = incoming.effective_type;
+                    unit.domain = incoming.domain;
+                    unit.promote_hops = incoming.promote_hops;
+                    unit.last_transition = incoming.last_transition;
+                }
+                const auto & prior = units_[i];
+                if (unit.current_type != prior.current_type ||
+                    unit.last_source_type != prior.last_source_type ||
+                    unit.effective_type != prior.effective_type ||
+                    unit.domain != prior.domain || unit.promote_hops != prior.promote_hops ||
+                    unit.last_transition != prior.last_transition) {
+                    if (unit.repr_gen == UINT64_MAX || unit.publish_seq > UINT64_MAX-2) {
+                        return false;
+                    }
+                    ++unit.repr_gen;
+                    unit.publish_seq += 2;
+                }
+            }
         } else {
             next->units.reserve(plan.units.size());
             for (const auto & unit : plan.units) {
@@ -1222,6 +1274,7 @@ bool vbr_generation_tracker::prepare_import_image_impl(
                 installed.publish_seq = 0;
                 installed.current_type = unit.current_type;
                 installed.last_source_type = unit.last_source_type;
+                installed.effective_type = unit.effective_type;
                 installed.domain = unit.domain;
                 installed.promote_hops = unit.promote_hops;
                 installed.last_transition = unit.last_transition;
@@ -1424,6 +1477,7 @@ bool vbr_generation_capture_controller(const vbr_generation_tracker &           
             live_unit.domain,
             live_unit.promote_hops,
             live_unit.last_transition,
+            live_unit.effective_type,
         });
     }
 

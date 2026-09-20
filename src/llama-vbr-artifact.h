@@ -12,7 +12,8 @@
 // Internal VBR artifact format. This is intentionally not part of public llama.h:
 // This header defines immutable value types and a fail-closed streaming codec.
 constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION_MIN = 1;
-constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION = 3;
+constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION = 4;
+constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION_PRECISION = 4;
 constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION_REFERENCE_PLACEMENT = 2;
 constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION_MEANSUB_REFERENCE = 3;
 constexpr uint32_t VBR_ARTIFACT_TOKEN_BLOCK_CODEC_VERSION = 1;
@@ -301,6 +302,7 @@ struct vbr_artifact_representation {
     std::array<uint8_t, 32> reference_digest = {};
     uint32_t source_loss_history = 0;
     uint32_t checkpoint_codec_hops = 0;
+    int32_t effective_type = -1;
 };
 
 struct vbr_artifact_unit_descriptor {

@@ -835,6 +835,114 @@ int main(int argc, char ** argv) {
     }
 
     {
+        // Tokenizer-free DFlash2 exports use either bare or model.-prefixed
+        // names. Keep EXL3 auxiliaries and learned convolution/selector bytes.
+        for (const std::string prefix : {std::string(), std::string("model.")}) {
+            const auto path = dir.path / (prefix.empty() ? "dflash2-bare" : "dflash2-prefixed");
+            std::vector<uint8_t> signs(512), scales(256);
+            for (size_t i = 1; i < signs.size(); i += 2) signs[i] = 0xbc; // F16 -1
+            for (size_t i = 1; i < scales.size(); i += 2) scales[i] = 0x38; // F16 0.5
+            write_single_shard_model(path, {
+                {prefix + "hidden_norm.weight", "BF16", {128}, std::vector<uint8_t>(256)},
+                {prefix + "layers.0.post_attention_layernorm.weight", "BF16", {128}, std::vector<uint8_t>(256)},
+                {prefix + "fc.trellis", "I16", {16, 8, 64}, std::vector<uint8_t>(16384)},
+                {prefix + "fc.suh", "F16", {256}, signs},
+                {prefix + "fc.svh", "F16", {128}, scales},
+                {prefix + "fc.mul1", "I32", {}, std::vector<uint8_t>(4)},
+                {prefix + "layers.0.attention_conv.base_kernel", "F16", {2, 2, 128}, std::vector<uint8_t>(1024, 0x10)},
+                {prefix + "layers.0.mlp_conv.kernel_projection.weight", "F16", {32, 128}, std::vector<uint8_t>(8192)},
+                {prefix + "candidate_selector.hidden_projection.weight", "F16", {16, 128}, std::vector<uint8_t>(4096)},
+                {prefix + "candidate_selector.predecessor_codebook" + (prefix.empty() ? ".weight" : ""),
+                    "F16", {256, 16}, std::vector<uint8_t>(8192, 0x22)},
+            });
+            llama_safetensors_json config = {
+                {"architectures", {"DFlash2DraftModel"}}, {"model_type", "qwen3"},
+                {"hidden_size", 128}, {"intermediate_size", 256}, {"num_hidden_layers", 1},
+                {"num_attention_heads", 1}, {"num_key_value_heads", 1}, {"head_dim", 128},
+                {"num_target_layers", 4}, {"vocab_size", 256}, {"max_position_embeddings", 8192},
+                {"rope_parameters", {{"rope_theta", 10000000}}}, {"rms_norm_eps", 1e-6},
+                {"use_sliding_window", true}, {"sliding_window", 2048},
+                {"layer_types", {"sliding_attention"}},
+                {"quantization_config", {{"quant_method", "exl3"}}},
+                {"dflash_config", {{"block_size", 8}, {"mask_token_id", 255},
+                    {"target_layer_ids", {1, 2}}, {"conv_kernel_size", 2}, {"conv_group_size", 16},
+                    {"selector_rank", 16}, {"selector_top_k", 16}}},
+            };
+            require(llama_safetensors_qwen3_importer::probe(config), "DFlash2 architecture was not recognized");
+            llama_safetensors_qwen3_importer importer(path, config);
+            std::unique_ptr<gguf_context, decltype(&gguf_free)> metadata(importer.build_metadata(), gguf_free);
+            require(std::string(gguf_get_val_str(metadata.get(), gguf_find_key(metadata.get(), "general.architecture"))) == "dflash",
+                    "DFlash2 selected the generic Qwen3 graph");
+            require(std::string(gguf_get_val_str(metadata.get(), gguf_find_key(metadata.get(), "tokenizer.ggml.model"))) == "none",
+                    "DFlash2 fabricated a tokenizer");
+            const auto * targets = static_cast<const uint32_t *>(gguf_get_arr_data(metadata.get(), gguf_find_key(metadata.get(), "dflash.target_layers")));
+            require(targets[0] == 2 && targets[1] == 3, "DFlash2 feature layer offset is wrong");
+            require(gguf_get_arr_type(metadata.get(), gguf_find_key(metadata.get(), "dflash.attention.sliding_window_pattern")) == GGUF_TYPE_BOOL,
+                    "DFlash2 SWA pattern has wrong wire type");
+            ggml_type type;
+            std::array<int64_t, GGML_MAX_DIMS> ne;
+            require(importer.describe("fc.weight", type, ne) && type == GGML_TYPE_EXL3_4 && ne[0] == 256 && ne[1] == 128,
+                    "DFlash2 EXL3 feature projection mapping failed");
+            for (const char * name : {"fc.scale", "fc.input_scale"}) {
+                const auto & bytes = std::string(name) == "fc.input_scale" ? signs : scales;
+                require(importer.describe(name, type, ne) && type == GGML_TYPE_F16 && ne[0] == int64_t(bytes.size() / 2),
+                        "DFlash2 lost an EXL3 auxiliary");
+                require(importer.materialize(name, type, bytes.size()) == bytes,
+                        "DFlash2 auxiliary bytes changed");
+                importer.bind(name);
+            }
+            importer.bind("fc.weight");
+            importer.validate_complete();
+            require(importer.describe("blk.0.attn_conv.base", type, ne) && type == GGML_TYPE_F16 && ne[0] == 128 && ne[1] == 2 && ne[2] == 2,
+                    "DFlash2 convolution dimensions changed");
+            require(importer.describe("blk.0.ffn_conv.proj.weight", type, ne) && ne[0] == 128 && ne[1] == 32,
+                    "DFlash2 convolution projection mapping failed");
+            require(importer.describe("selector.pred_codebook", type, ne) && ne[0] == 16 && ne[1] == 256,
+                    "DFlash2 selector codebook naming failed");
+            require(importer.materialize("selector.pred_codebook", GGML_TYPE_F16, 8192) == std::vector<uint8_t>(8192, 0x22),
+                    "DFlash2 selector bytes changed");
+            require(importer.materialize("blk.0.attn_conv.base", GGML_TYPE_F16, 1024) == std::vector<uint8_t>(1024, 0x10),
+                    "DFlash2 convolution bytes changed");
+            require(importer.describe("enc.output_norm.weight", type, ne) && type == GGML_TYPE_F32,
+                    "DFlash2 feature norm mapping failed");
+            require(importer.describe("blk.0.ffn_norm.weight", type, ne), "DFlash2 decoder norm missing");
+            require(!importer.describe("token_embd.weight", type, ne) && !importer.describe("output.weight", type, ne),
+                    "DFlash2 fabricated shared target weights");
+            config["use_sliding_window"] = false;
+            config["sliding_window"] = 1024;
+            config["dflash_config"]["use_swa"] = true;
+            config["dflash_config"]["swa_window_size"] = 512;
+            config["dflash_config"]["causal"] = true;
+            config["dflash_config"]["output_multiplier"] = 0.5;
+            config["output_multiplier"] = 0.25;
+            config["dflash_config"]["input_embedding_scale"] = 2.0;
+            const auto check_nested = [&](bool causal) {
+                llama_safetensors_qwen3_importer nested(path, config);
+                std::unique_ptr<gguf_context, decltype(&gguf_free)> md(nested.build_metadata(), gguf_free);
+                require(gguf_get_val_u32(md.get(), gguf_find_key(md.get(), "dflash.attention.sliding_window")) == 512,
+                        "DFlash2 nested SWA configuration was ignored");
+                require(gguf_get_val_bool(md.get(), gguf_find_key(md.get(), "dflash.attention.causal")) == causal,
+                        "DFlash2 causal precedence differs from converter");
+                require(gguf_get_val_f32(md.get(), gguf_find_key(md.get(), "dflash.logit_scale")) == 0.5f &&
+                        gguf_get_val_f32(md.get(), gguf_find_key(md.get(), "dflash.embedding_scale")) == 2.0f,
+                        "DFlash2 output/embedding scale was lost");
+            };
+            check_nested(true);
+            config["is_causal"] = false;
+            check_nested(false);
+            config["dflash_config"]["final_logit_softcapping"] = 30.0;
+            require_rejected([&] { llama_safetensors_qwen3_importer invalid(path, config); },
+                    "DFlash2 silently accepted unsupported softcapping metadata");
+            config["dflash_config"].erase("final_logit_softcapping");
+            config["dflash_config"]["target_layer_ids"] = {4};
+            require_rejected([&] {
+                llama_safetensors_qwen3_importer invalid(path, config);
+                std::unique_ptr<gguf_context, decltype(&gguf_free)> ignored(invalid.build_metadata(), gguf_free);
+            }, "DFlash2 accepted out-of-range target layers");
+        }
+    }
+
+    {
         // EXL3 quantizes projections, but can store a plain FP8 embedding next
         // to ordinary dense norms. Neither needs EXL3 sign vectors or FP8 scales.
         const auto path = dir.path / "exl3-dense-fp8";

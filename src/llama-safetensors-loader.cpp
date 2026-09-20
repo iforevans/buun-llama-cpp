@@ -158,6 +158,10 @@ llama_safetensors_json llama_safetensors_read_model_config(const std::filesystem
     return config;
 }
 
+gguf_context * llama_safetensors_load_metadata(const std::filesystem::path & model_dir) {
+    return select_importer(model_dir, llama_safetensors_io_mode::BUFFERED)->build_metadata();
+}
+
 llama_model * llama_model_load_from_safetensors_dir(
         const std::filesystem::path & model_dir, llama_model_params params) {
     // Capture before opening import sources; reject a replacement during import.

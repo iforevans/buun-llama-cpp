@@ -293,9 +293,12 @@ __global__ void Marlin(
   #endif
 
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
-  // Turing TensorCore only supports fp16 and int8
-  if constexpr (a_type_id != vllm::kFloat16.id() && a_type_id != vllm::kS8.id())
-    return;
+  // Turing supports FP16/INT8 MMA, not BF16. A constexpr return alone does
+  // not discard the statements below: BF16 helpers would still instantiate
+  // in a mixed-architecture build even though host dispatch rejects SM75.
+  if constexpr (a_type_id != vllm::kFloat16.id() && a_type_id != vllm::kS8.id()) {
+    __trap();
+  } else {
   #endif
 
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
@@ -2124,6 +2127,9 @@ __global__ void Marlin(
       }
     }
   }
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+  } // supported Turing compute type
+  #endif
 }
 
 }  // namespace MARLIN_NAMESPACE_NAME

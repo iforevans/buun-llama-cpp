@@ -1336,12 +1336,12 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         }
     }
 
-    // infer the speculative type from the draft GGUF metadata when none is requested
+    // infer the speculative type from draft model metadata when none is requested
     // note: reads only the first split - sharded drafts need an explicit --spec-type
     if (spec_types_is_default(params) && !params.speculative.draft.mparams.path.empty()) {
-        const auto types_gguf = common_speculative_types_from_gguf(params.speculative.draft.mparams.path);
-        if (!types_gguf.empty()) {
-            params.speculative.types = types_gguf;
+        const auto types = common_speculative_types_from_model(params.speculative.draft.mparams.path);
+        if (!types.empty()) {
+            params.speculative.types = types;
         }
     }
 
@@ -4723,7 +4723,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
     add_opt(common_arg(
         {"--cache-debug"},
-        string_format("emit one shadow cache-plan decision record per request as a JSON log line and expose the last record in /slots (default: %s)", params.cache_debug ? "enabled" : "disabled"),
+        string_format("log observed cache reuse decisions per request and expose the last record in /slots (default: %s)", params.cache_debug ? "enabled" : "disabled"),
         [](common_params & params) {
             params.cache_debug = true;
         }
@@ -4744,10 +4744,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_CONTROL_API"));
     add_opt(common_arg(
         {"--cache-plan-authority"}, "LEVEL",
-        "set cache-plan authority at LEVEL: off, by_id, similarity, route_home, or lru (non-off levels remain observation-only; default: off)",
-        [](common_params & params, const std::string & value) {
-            params.cache_plan_authority =
-                common_cache_plan_authority_level_parse(value);
+        "removed: calibrated cache-plan authority is no longer supported",
+        [](common_params &, const std::string &) {
+            throw std::invalid_argument("--cache-plan-authority has been removed; normal cache reuse and retention remain enabled without it");
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_PLAN_AUTHORITY"));
     add_opt(common_arg(

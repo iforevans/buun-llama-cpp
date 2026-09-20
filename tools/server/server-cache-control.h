@@ -32,7 +32,6 @@ enum class server_cache_control_status : uint8_t {
     subject_lost,
     orphaned,
     already_released,
-    profile_unfitted,
     capacity_refused,
     stale_capability,
     internal_fault,

@@ -21,7 +21,17 @@ static inline int ggml_cuda_exl3_codebook(ggml_type type) {
 
 bool ggml_cuda_exl3_supports_mul_mat(const ggml_tensor * dst);
 
+// Only admit the measured Turing image: older PTX may have no tiled GEMM body.
+static inline bool ggml_cuda_exl3_turing_gemm_supported(int cc, int compiled_cc, int m, int n, int k) {
+    return cc == GGML_CUDA_CC_TURING && compiled_cc == GGML_CUDA_CC_TURING &&
+        m >= 9 && (m <= 32 || (m <= 128 && int64_t(n) >= 2 * int64_t(k)));
+}
+
 void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// Pair independent dense projections sharing an input, preserving both outputs.
+// Caller validates graph dependencies and memory ranges; false retains ordinary execution.
+bool ggml_cuda_exl3_bundle(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_tensor * b);
 
 // MUL_MAT_ID with EXL3 experts: grouped kernel (no host sync) for decode shapes; src[3] = svh
 // [n, n_expert], src[4] = suh [k, n_expert].

@@ -12,6 +12,7 @@
 // Internal test helpers.
 #include "../src/llama-arch.h"
 #include "../src/llama-cparams.h"
+#include "../src/llama-context.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-memory.h"
 #include "../src/llama-memory-hybrid-idx.h"
@@ -557,6 +558,123 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         throw std::runtime_error("failed to create llama context");
     }
     return std::make_pair(std::move(model), std::move(lctx));
+}
+
+static void test_bonsai_mapped_load(llama_model * model, gguf_context * meta, llama_model_params params);
+
+static void test_bonsai_loader(const size_t seed) {
+    const auto metadata = [] {
+        auto meta = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+        gguf_set_val_u32(meta.get(), "prism.hadamard.version", 1);
+        gguf_set_val_u32(meta.get(), "prism.hadamard.block_size", 128);
+        gguf_set_val_str(meta.get(), "prism.hadamard.transform", "normalized-sylvester-walsh-hadamard");
+        gguf_set_val_str(meta.get(), "prism.hadamard.axis", "input-last-dimension");
+        gguf_set_val_str(meta.get(), "prism.hadamard.sign_mode", "explicit");
+        const char * weights[] = { "blk.0.attn_q.weight", "blk.1.attn_k.weight" };
+        gguf_set_arr_str(meta.get(), "prism.hadamard.weight_names", weights, 2);
+        const int32_t width = 256;
+        std::vector<int32_t> signs(width, 1);
+        signs[1] = -1;
+        gguf_set_arr_data(meta.get(), "prism.hadamard.sign_widths", GGUF_TYPE_INT32, &width, 1);
+        gguf_set_arr_data(meta.get(), "prism.hadamard.sign_values", GGUF_TYPE_INT32, signs.data(), signs.size());
+        const char * inverse[] = { "token_embd.weight" };
+        gguf_set_arr_str(meta.get(), "prism.hadamard.inverse_weight_names", inverse, 1);
+        return meta;
+    };
+
+    std::vector<ggml_backend_dev_t> devices;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            devices.push_back(dev);
+        }
+    }
+    devices.push_back(nullptr);
+    // Two GPU layers offload blk.1 and output, leaving blk.0 (and its
+    // embedding inverse) on CPU: the mixed placement that exposed the bug.
+    for (int n_gpu : { 0, 2, 99 }) {
+        if (n_gpu && devices.size() == 1) {
+            continue;
+        }
+        auto meta = metadata();
+        auto mp = llama_model_default_params();
+        mp.devices = devices.data();
+        mp.n_gpu_layers = n_gpu;
+        mp.progress_callback = silent_model_load_progress;
+        size_t tmp = seed;
+        llama_model_ptr real(llama_model_init_from_user(meta.get(), set_tensor_data, &tmp, mp));
+        GGML_ASSERT(real);
+        test_bonsai_mapped_load(real.get(), meta.get(), mp);
+        mp.no_alloc = true;
+        // Different metadata insertion order must not affect inverse placement.
+        const char * reversed[] = { "blk.1.attn_k.weight", "blk.0.attn_q.weight" };
+        gguf_set_arr_str(meta.get(), "prism.hadamard.weight_names", reversed, 2);
+        llama_model_ptr dry(llama_model_init_from_user(meta.get(), set_tensor_data, &tmp, mp));
+        GGML_ASSERT(dry);
+        GGML_ASSERT(real->memory_breakdown() == dry->memory_breakdown());
+        for (auto * model : { real.get(), dry.get() }) {
+            if (n_gpu == 2) {
+                GGML_ASSERT(ggml_backend_dev_type(model->dev_layer(0)) == GGML_BACKEND_DEVICE_TYPE_CPU);
+                GGML_ASSERT(ggml_backend_dev_type(model->dev_layer(1)) == GGML_BACKEND_DEVICE_TYPE_GPU);
+            }
+            GGML_ASSERT(model->hadamard_rotations.size() == 2);
+            GGML_ASSERT(model->hadamard_inverses.size() == 1);
+            const auto & inverse = model->hadamard_inverses.begin()->second;
+            GGML_ASSERT(ggml_backend_buffer_get_type(inverse.rot->buffer) ==
+                    ggml_backend_dev_buffer_type(model->dev_layer(0)));
+            for (const auto * transforms : { &model->hadamard_rotations, &model->hadamard_inverses }) {
+                for (const auto & entry : *transforms) {
+                    for (const auto * tensor : { entry.second.rot, entry.second.signs }) {
+                        GGML_ASSERT(tensor && tensor->buffer);
+                        GGML_ASSERT((tensor->data == nullptr) == model->hparams.no_alloc);
+                    }
+                }
+            }
+        }
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 256;
+        cp.n_batch = cp.n_ubatch = 32;
+        cp.type_k = cp.type_v = GGML_TYPE_F16;
+        llama_context_ptr real_ctx(llama_init_from_model(real.get(), cp));
+        llama_context_ptr dry_ctx(llama_init_from_model(dry.get(), cp));
+        GGML_ASSERT(real_ctx && dry_ctx);
+        auto * real_gf = real_ctx->get_gf_res_reserve()->get_gf();
+        auto * dry_gf = dry_ctx->get_gf_res_reserve()->get_gf();
+        GGML_ASSERT(ggml_graph_n_nodes(real_gf) == ggml_graph_n_nodes(dry_gf));
+        int rotations = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(real_gf); ++i) {
+            const auto * a = ggml_graph_node(real_gf, i);
+            const auto * b = ggml_graph_node(dry_gf, i);
+            GGML_ASSERT(a->op == b->op && a->type == b->type && ggml_are_same_shape(a, b));
+            rotations += a->op == GGML_OP_MUL_MAT &&
+                reinterpret_cast<const int32_t *>(a->op_params)[1] == GGML_HINT_SRC0_IS_HADAMARD;
+        }
+        GGML_ASSERT(rotations == 3);
+    }
+
+    // Optional means absent is allowed, not that malformed metadata is ignored.
+    for (int variant = 0; variant < 5; ++variant) {
+        auto meta = metadata();
+        if (variant == 0) {
+            gguf_remove_key(meta.get(), "prism.hadamard.inverse_weight_names");
+        } else if (variant == 1) {
+            gguf_set_val_str(meta.get(), "prism.hadamard.inverse_weight_names", "token_embd.weight");
+        } else if (variant == 2) {
+            const int32_t value = 1;
+            gguf_set_arr_data(meta.get(), "prism.hadamard.inverse_weight_names", GGUF_TYPE_INT32, &value, 1);
+        } else if (variant == 3) {
+            const int32_t widths[] = { 256, 256 };
+            std::vector<int32_t> signs(512, 1);
+            gguf_set_arr_data(meta.get(), "prism.hadamard.sign_widths", GGUF_TYPE_INT32, widths, 2);
+            gguf_set_arr_data(meta.get(), "prism.hadamard.sign_values", GGUF_TYPE_INT32, signs.data(), signs.size());
+        }
+        auto mp = llama_model_default_params();
+        mp.n_gpu_layers = 0;
+        mp.no_alloc = true;
+        llama_model_ptr model(llama_model_init_from_user(meta.get(), set_tensor_data, nullptr, mp));
+        GGML_ASSERT(bool(model) == (variant == 0 || variant == 4));
+    }
+    printf("Bonsai loader: dry-fit graph/memory, placement and metadata contracts passed\n");
 }
 
 static void test_qwen4_ple_recurrent_resize(const size_t seed) {
@@ -2622,6 +2740,24 @@ static file_ptr make_test_tmpfile() {
 #endif
 }
 
+static void test_bonsai_mapped_load(llama_model * model, gguf_context * meta, llama_model_params params) {
+    auto file = make_test_tmpfile();
+    if (!file) {
+        throw std::runtime_error("cannot create Bonsai mmap test fixture");
+    }
+    llama_model_saver saver(model);
+    saver.add_kv_from_model();
+    gguf_set_kv(saver.gguf_ctx, meta);
+    saver.add_tensors_from_model();
+    saver.save(file.get());
+    rewind(file.get());
+    params.load_mode = LLAMA_LOAD_MODE_MMAP;
+    llama_model_ptr mapped(llama_model_load_from_file_ptr(file.get(), params));
+    GGML_ASSERT(mapped);
+    GGML_ASSERT(mapped->hadamard_rotations.size() == model->hadamard_rotations.size());
+    GGML_ASSERT(mapped->hadamard_inverses.size() == model->hadamard_inverses.size());
+}
+
 static file_ptr make_dflash_selector_identity_file(std::initializer_list<const char *> tensor_names) {
     file_ptr file = make_test_tmpfile();
     if (!file) {
@@ -3425,10 +3561,6 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     target_model->output = target_output;
     GGML_ASSERT(tied_shared_model != nullptr);
     GGML_ASSERT(tied_shared_model->output == target_model->tok_embd);
-    GGML_ASSERT(!llama_model_shared_output_needs_separate_copy(true, true, true));
-    GGML_ASSERT(llama_model_shared_output_needs_separate_copy(true, true, false));
-    GGML_ASSERT(llama_model_shared_output_needs_separate_copy(false, true, true));
-    GGML_ASSERT(!llama_model_shared_output_needs_separate_copy(true, false, true));
 
     llama_context_ptr shared_ctx(llama_init_from_model(shared_model.get(), ctx_params));
     GGML_ASSERT(shared_ctx != nullptr);
@@ -4229,6 +4361,9 @@ int main(int argc, char ** argv) {
         test_dflash_loader_exact_identity();
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
+        }
+        if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_LLAMA) {
+            test_bonsai_loader(seed);
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN35) {
             test_qwen35_mtp_fused_qkv(seed, LLM_ARCH_QWEN35);

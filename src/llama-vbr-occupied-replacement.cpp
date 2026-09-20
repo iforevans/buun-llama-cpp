@@ -31,8 +31,12 @@ bool occupied_projected_packed_rows(
     packed_rows.resize(placement.cells.size(), UINT64_MAX);
     const auto & proofs = incoming.projected_ranges();
     if (proofs.empty()) {
-        for (size_t i = 0; i < placement.cells.size(); ++i) {
-            packed_rows[i] = placement.cells[i].physical_cell;
+        for (const auto & cell : placement.cells) {
+            if (cell.logical_position < 0 || size_t(cell.logical_position) >= packed_rows.size() ||
+                packed_rows[size_t(cell.logical_position)] != UINT64_MAX) {
+                return false;
+            }
+            packed_rows[size_t(cell.logical_position)] = cell.physical_cell;
         }
         return true;
     }
@@ -198,6 +202,9 @@ bool occupied_target_unit_matches(
         target.last_source_type != descriptor.last_source_type ||
         captured.last_source_type != descriptor.last_source_type ||
         live.generation.last_source_type != descriptor.last_source_type ||
+        captured.effective_type != descriptor.representation.effective_type ||
+        live.generation.effective_type != descriptor.representation.effective_type ||
+        target.effective_type != descriptor.representation.effective_type ||
         target.promote_hops != descriptor.promote_hops ||
         captured.promote_hops != descriptor.promote_hops ||
         live.generation.promote_hops != descriptor.promote_hops ||
@@ -329,6 +336,7 @@ std::array<uint8_t, 32> occupied_currency_digest(
         writer.u64(unit.generation.publish_seq);
         writer.u64(uint64_t(unit.generation.current_type));
         writer.u64(uint64_t(unit.generation.last_source_type));
+        writer.u64(uint64_t(unit.generation.effective_type));
         writer.u64(uint64_t(unit.generation.domain));
         writer.u64(unit.generation.promote_hops);
         writer.u64(uint64_t(unit.generation.last_transition));
@@ -509,17 +517,26 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
         incoming_tokens == 0 || incoming_tokens > parent_incoming_tokens) {
         return vbr_occupied_replacement_guard_status::frontier_mismatch;
     }
-    for (size_t logical = 0; logical < recovery_tokens; ++logical) {
-        if (recovery_placement.cells[logical].logical_position !=
-                llama_pos(logical)) {
-            return vbr_occupied_replacement_guard_status::unsupported_layout;
+    // Artifacts are sealed in physical-row order. After a slot is restored
+    // into free cells and then extended, that order need not be token order.
+    // Index the authenticated placements by logical position without changing
+    // their physical ownership or assuming a contiguous allocation.
+    const auto index_logical = [](const vbr_artifact_stream_placement & placement,
+                                  std::vector<const vbr_artifact_cell_placement *> & index) {
+        index.assign(placement.cells.size(), nullptr);
+        for (const auto & cell : placement.cells) {
+            if (cell.logical_position < 0 || size_t(cell.logical_position) >= index.size() ||
+                index[size_t(cell.logical_position)] != nullptr) {
+                return false;
+            }
+            index[size_t(cell.logical_position)] = &cell;
         }
-    }
-    for (size_t logical = 0; logical < incoming_tokens; ++logical) {
-        if (incoming_placement.cells[logical].logical_position !=
-                llama_pos(logical)) {
-            return vbr_occupied_replacement_guard_status::unsupported_layout;
-        }
+        return true;
+    };
+    std::vector<const vbr_artifact_cell_placement *> recovery_logical, incoming_logical;
+    if (!index_logical(recovery_placement, recovery_logical) ||
+        !index_logical(incoming_placement, incoming_logical)) {
+        return vbr_occupied_replacement_guard_status::unsupported_layout;
     }
     // A unified physical cache may contain several independent server slots.
     // Authenticate every occupied cell, isolate the destination's exact
@@ -579,8 +596,7 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
         if (logical != 0) {
             return vbr_occupied_replacement_guard_status::ownership_mismatch;
         }
-        const auto & sealed = recovery_placement.cells[
-            size_t(live.logical_position)];
+        const auto & sealed = *recovery_logical[size_t(live.logical_position)];
         if (sealed.physical_cell != live.physical_cell ||
             sealed.ext_x != live.ext_x || sealed.ext_y != live.ext_y) {
             return vbr_occupied_replacement_guard_status::ownership_mismatch;
@@ -637,7 +653,7 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
                 return false;
             }
             for (uint32_t offset = 0; offset < run.cell_count; ++offset) {
-                const auto & cell = incoming_placement.cells[logical];
+                const auto & cell = *incoming_logical[logical];
                 if (uint64_t(run.first_physical_cell)+offset !=
                         cell.physical_cell ||
                     run.first_packed_row > UINT64_MAX-offset) {
@@ -694,8 +710,8 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
     if (strategy ==
             vbr_occupied_replacement_strategy::recycle_incumbent_cells) {
         for (size_t logical = 0; logical < incoming_tokens; ++logical) {
-            const auto & source = incoming_placement.cells[logical];
-            const auto & incumbent = recovery_placement.cells[logical];
+            const auto & source = *incoming_logical[logical];
+            const auto & incumbent = *recovery_logical[logical];
             if (incoming_transformed &&
                 incumbent.physical_cell != logical) {
                 return vbr_occupied_replacement_guard_status::unsupported_layout;
@@ -746,7 +762,7 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
             continue;
         }
         if (mapped < incoming_tokens) {
-            const auto & source = incoming_placement.cells[mapped];
+            const auto & source = *incoming_logical[mapped];
             const uint64_t source_packed_row = build
                 ? packed_rows[mapped]
                 : expected && mapped < expected->mappings.size()

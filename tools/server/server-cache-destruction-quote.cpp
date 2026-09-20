@@ -1,7 +1,6 @@
 #include "server-cache-destruction-quote.h"
 
 #include "ggml.h"
-#include "../../common/common-cache-plan-estimate.h"
 
 #include "../../src/llama-sha256.h"
 
@@ -912,11 +911,20 @@ server_cache_destruction_quote_redundant_host(
 void server_cache_destruction_select_quote(
         common_cache_plan_record & rec,
         common_cache_plan_destruction_counters & counters,
+        int32_t selected_candidate,
         common_cache_plan_destruction_effect_set permitted_effects) noexcept {
     if (rec.destruction_quotes.empty()) {
         return;
     }
-    if (!server_cache_plan_shadow_choice_valid(rec)) {
+    if (selected_candidate < 0) {
+        rec.destruction.state = common_cache_plan_destruction_state::failed;
+        rec.destruction.reason =
+            common_cache_plan_destruction_reason::release_evidence_unavailable;
+        rec.destruction.selected_attention.clear();
+        rec.destruction.selected_recurrent.clear();
+        return;
+    }
+    if (uint32_t(selected_candidate) >= rec.n_inventory) {
         rec.destruction.state = common_cache_plan_destruction_state::failed;
         rec.destruction.reason =
             common_cache_plan_destruction_reason::internal_fault;
@@ -928,7 +936,7 @@ void server_cache_destruction_select_quote(
     const auto it = std::find_if(
         rec.destruction_quotes.begin(), rec.destruction_quotes.end(),
         [&](const auto & quote) {
-            return quote.receipt.plan_candidate == rec.shadow_choice;
+            return quote.receipt.plan_candidate == selected_candidate;
         });
     if (it != rec.destruction_quotes.end()) {
         const uint64_t duration = rec.destruction.quote_duration_us;
@@ -937,7 +945,7 @@ void server_cache_destruction_select_quote(
         return;
     }
     if (server_cache_destruction_effects_for(
-            rec, rec.shadow_choice,
+            rec, selected_candidate,
             rec.destruction_legacy_plan_candidate,
             permitted_effects) == 0) {
         const uint64_t duration = rec.destruction.quote_duration_us;
@@ -962,16 +970,16 @@ void server_cache_destruction_select_preview(
         common_cache_plan_destruction_effect_set permitted_effects) noexcept {
     if (lifecycle_available) {
         server_cache_destruction_select_quote(
-            rec, counters, permitted_effects);
+            rec, counters, legacy_plan_candidate, permitted_effects);
         return;
     }
-    if (!server_cache_plan_shadow_choice_valid(rec)) {
+    if (legacy_plan_candidate < 0 || uint32_t(legacy_plan_candidate) >= rec.n_inventory) {
         return;
     }
     rec.destruction_legacy_plan_candidate = legacy_plan_candidate;
-    rec.destruction.plan_candidate = rec.shadow_choice;
+    rec.destruction.plan_candidate = legacy_plan_candidate;
     rec.destruction.effects = server_cache_destruction_effects_for(
-        rec, rec.shadow_choice, legacy_plan_candidate, permitted_effects);
+        rec, legacy_plan_candidate, legacy_plan_candidate, permitted_effects);
     if (rec.destruction.effects != 0) {
         rec.destruction.state =
             common_cache_plan_destruction_state::refused;

@@ -72,23 +72,16 @@ enum class server_cache_destruction_execution : uint8_t {
     pass_through = 0,
     // The legacy-selected host victim is still chosen by the existing
     // FIFO/dedup policy, but its exact C release is committed through the
-    // prepared capability after the physical erase. Lease verdicts remain
-    // pricing evidence here; this terminal does not select the victim.
+    // prepared capability after the physical erase. This terminal does not
+    // select the victim.
     prepared_release,
     // A host victim was erased only after all three payload planes were
     // proved identical to a disjoint survivor and the survivor was pinned
     // through the exact prepared-release commit.
     redundant_host_eviction,
-    // A cache-plan-priced host capacity/token victim, certified against a
-    // disjoint retained or pre-authorized durable recovery source.
-    priced_host_eviction,
-    // One independently accounted live checkpoint member was removed
-    // under a pinned replay-source certificate. Host-entry checkpoint rings
-    // remain aggregate-owned and can never reach this terminal.
-    priced_checkpoint_thinning,
-    // The cache plan selected an occupied live target only after a durable recovery
-    // source and the complete fixed-pool/checkpoint union were certified.
-    priced_live_displacement,
+    // Host artifacts retired together by the retention-capacity policy,
+    // with their union accounted and committed as one prepared release.
+    retention_host_eviction,
     _count,
 };
 
@@ -222,8 +215,6 @@ struct server_cache_destruction_observer {
     uint64_t host_trade_attempted = 0;
     uint64_t host_trade_certified = 0;
     uint64_t host_trade_executed = 0;
-    uint64_t host_trade_refused = 0;
-    uint64_t host_trade_unpriced = 0;
     uint64_t host_trade_legacy_fallbacks = 0;
     uint64_t host_trade_retention_capacity_executed = 0;
     uint64_t host_trade_hard_lease_vetoes = 0;
@@ -231,20 +222,8 @@ struct server_cache_destruction_observer {
     uint64_t host_trade_substrate_unavailable = 0;
     uint64_t host_trade_main_family_evictions = 0;
     uint64_t host_trade_soft_lease_evictions = 0;
-    uint64_t host_trade_zero_destruction_ties = 0;
     uint64_t host_trade_release_bytes = 0;
-    uint64_t checkpoint_thin_attempted = 0;
-    uint64_t checkpoint_thin_certified = 0;
-    uint64_t checkpoint_thin_executed = 0;
-    uint64_t checkpoint_thin_refused = 0;
-    uint64_t checkpoint_thin_heuristic_refusals = 0;
-    uint64_t checkpoint_thin_mandatory_refusals = 0;
-    uint64_t checkpoint_thin_hard_lease_refusals = 0;
     uint64_t checkpoint_publication_skips = 0;
-    uint64_t checkpoint_thin_release_bytes = 0;
-    uint64_t live_displacement_certified = 0;
-    uint64_t live_displacement_executed = 0;
-    uint64_t live_displacement_refused = 0;
     void * lease_context = nullptr;
     server_cache_lease_evaluator lease_evaluator = nullptr;
 
@@ -328,22 +307,6 @@ struct server_cache_destruction_observer {
         }
     }
 
-    void note_live_displacement_certified() noexcept {
-        live_displacement_certified++;
-    }
-
-    void note_live_displacement_refused() noexcept {
-        live_displacement_refused++;
-    }
-
-    void note_live_displacement_executed(uint64_t sequence) noexcept {
-        live_displacement_executed++;
-        if (auto * event = event_for_sequence(sequence)) {
-            event->execution =
-                server_cache_destruction_execution::priced_live_displacement;
-        }
-    }
-
     void note_redundant_host_refused(uint64_t) noexcept {
         redundant_host_refused++;
     }
@@ -358,16 +321,6 @@ struct server_cache_destruction_observer {
             event->execution =
                 server_cache_destruction_execution::redundant_host_eviction;
         }
-    }
-
-    void note_host_trade_refused() noexcept {
-        host_trade_attempted++;
-        host_trade_refused++;
-    }
-
-    void note_host_trade_unpriced() noexcept {
-        host_trade_attempted++;
-        host_trade_unpriced++;
     }
 
     void note_host_trade_veto() noexcept {
@@ -387,53 +340,20 @@ struct server_cache_destruction_observer {
             uint64_t sequence,
             uint64_t released_bytes,
             bool main_family,
-            bool soft_leased,
-            bool zero_destruction_tie) noexcept {
+            bool soft_leased) noexcept {
         host_trade_certified++;
         host_trade_executed++;
         host_trade_release_bytes += released_bytes;
         host_trade_main_family_evictions += main_family ? 1 : 0;
         host_trade_soft_lease_evictions += soft_leased ? 1 : 0;
-        host_trade_zero_destruction_ties += zero_destruction_tie ? 1 : 0;
         if (auto * event = event_for_sequence(sequence)) {
             event->execution =
-                server_cache_destruction_execution::priced_host_eviction;
+                server_cache_destruction_execution::retention_host_eviction;
         }
-    }
-
-    void note_checkpoint_thin_refused() noexcept {
-        checkpoint_thin_attempted++;
-        checkpoint_thin_refused++;
-    }
-
-    void note_checkpoint_thin_heuristic_refused() noexcept {
-        checkpoint_thin_heuristic_refusals++;
-    }
-
-    void note_checkpoint_thin_mandatory_refused() noexcept {
-        checkpoint_thin_mandatory_refusals++;
-    }
-
-    void note_checkpoint_thin_hard_lease_refused() noexcept {
-        checkpoint_thin_hard_lease_refusals++;
     }
 
     void note_checkpoint_publication_skip() noexcept {
         checkpoint_publication_skips++;
-    }
-
-    void note_checkpoint_thin_executed(
-            uint64_t sequence,
-            uint64_t released_bytes) noexcept {
-        checkpoint_thin_attempted++;
-        checkpoint_thin_certified++;
-        checkpoint_thin_executed++;
-        checkpoint_thin_release_bytes += released_bytes;
-        if (auto * event = event_for_sequence(sequence)) {
-            event->execution =
-                server_cache_destruction_execution::
-                    priced_checkpoint_thinning;
-        }
     }
 };
 

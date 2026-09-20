@@ -28,6 +28,8 @@ llama_safetensors_json llama_safetensors_read_model_config(
 llama_model * llama_model_load_from_safetensors_dir(
     const std::filesystem::path & model_dir, llama_model_params params);
 
+gguf_context * llama_safetensors_load_metadata(const std::filesystem::path & model_dir);
+
 enum class llama_safetensors_dtype {
     BOOL,
     U8,

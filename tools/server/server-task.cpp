@@ -2,7 +2,6 @@
 #include "server-cache-plan-authority.h"
 #include "server-cache-destruction-quote.h"
 
-#include "../../common/common-cache-plan-estimate.h"
 
 #include "build-info.h"
 #include "server-cache-authority.h"
@@ -2851,7 +2850,8 @@ server_prompt_cache::refresh_vbr_compact(
         server_prompt_cache_vbr_owner incoming,
         const std::string & execution_identity,
         const std::string & adapter_config_key,
-        int32_t source_slot) noexcept {
+        int32_t source_slot,
+        bool replace_live_recovery) noexcept {
     using status = server_prompt_cache_vbr_refresh_status;
     if (!incoming || !acct || !retention_obs || source_slot < 0 ||
         execution_identity.empty() || adapter_config_key.empty() ||
@@ -2889,6 +2889,20 @@ server_prompt_cache::refresh_vbr_compact(
         if (target->recovery_pins != 0) {
             return status::busy;
         }
+        if (replace_live_recovery) {
+            server_cache_lease_identity identity;
+            if (!lease_obs || !server_cache_lease_build_identity(
+                    execution_identity, adapter_config_key, target->prompt.tokens,
+                    target->prompt.n_tokens(), identity)) {
+                return status::busy;
+            }
+            const auto lease = lease_obs->inspect_range(
+                retention_obs->artifact_id(server_retention_instance_key::for_host_entry(&*target)),
+                identity, target->prompt.sequence_epoch, 0, target->prompt.n_tokens());
+            if (lease.state != server_cache_lease_eval_state::known || server_cache_lease_is_hard(lease)) {
+                return status::busy;
+            }
+        }
 
         const auto * old_variants = target->payload.vbr_variants();
         if (!old_variants || !old_variants->compact_current()) {
@@ -2902,7 +2916,16 @@ server_prompt_cache::refresh_vbr_compact(
         const auto * old_compact = old_variants->compact_current().get();
         server_prompt_cache_payload replacement;
         bool unchanged = false;
-        if (!target->payload.prepare_vbr_refresh(
+        // Reuse is content-addressed, but rollback also authenticates the
+        // live physical placement and companion bytes. A fresh capture of
+        // that same frontier may therefore replace an equal-tier artifact.
+        // Do not retain an anchor from a different numerical execution.
+        if (replace_live_recovery) {
+            replacement = server_prompt_cache_payload::from_vbr(std::move(incoming));
+            if (!replacement.valid()) {
+                return status::invalid;
+            }
+        } else if (!target->payload.prepare_vbr_refresh(
                 std::move(incoming), replacement,
                 quality_anchor_budget_enabled, unchanged)) {
             return unchanged ? status::unchanged : status::internal_error;
@@ -2974,7 +2997,12 @@ server_prompt_cache::refresh_vbr_compact(
         vbr_artifact_prepared_retire prepared;
         bool physical_retire = false;
         const uint64_t serial = acct->serial();
-        if (retired_owner &&
+        if (replace_live_recovery && !target->payload.vbr_logical_erase_only()) {
+            if (!target->payload.prepare_vbr_retire(serial, prepared)) {
+                return status::accounting_unavailable;
+            }
+            physical_retire = true;
+        } else if (retired_owner &&
             !target->payload.vbr_logical_erase_only()) {
             std::vector<const vbr_artifact_package_view *> retiring_packages {
                 &retired_owner->package(),
@@ -4439,19 +4467,14 @@ void server_cache_checkpoint_ring_changed(
         server_cache_checkpoint_authority_context & context) noexcept {
     context.attempts.ring_changed();
     context.seam_heuristic = nullptr;
-    context.thinning_refusal =
-        common_cache_plan_destruction_reason::none;
     context.floor_refusal =
         common_cache_plan_destruction_reason::mandatory_anchor;
 }
 
-bool server_cache_checkpoint_thinning_attempt_begin(
-        server_cache_checkpoint_authority_context & context,
-        bool capacity_mode) noexcept {
+bool server_cache_checkpoint_publication_attempt_begin(
+        server_cache_checkpoint_authority_context & context) noexcept {
     return context.attempts.begin(
-        capacity_mode
-            ? server_cache_checkpoint_attempt_lane::capacity_thinning
-            : server_cache_checkpoint_attempt_lane::optional_thinning);
+        server_cache_checkpoint_attempt_lane::publication_check);
 }
 
 bool server_cache_checkpoint_refusal_state_changed(
@@ -4478,64 +4501,16 @@ server_cache_destruction_admission server_cache_checkpoint_observe_drop(
 
 namespace {
 
-bool build_checkpoint_destruction_artifact(
-        const server_cache_checkpoint_authority_context & context,
-        server_cache_checkpoint_iterator checkpoint,
-        server_cache_destruction_artifact & out) noexcept {
-    out = {};
-    try {
-        if (!context.retention || !context.leases ||
-            checkpoint == context.checkpoints.end()) {
-            return false;
-        }
-        const auto key = server_retention_instance_key::for_checkpoint(
-            context.slot_id, &*checkpoint);
-        server_retention_checkpoint_inventory inventory;
-        server_retention_candidate catalog;
-        if (!context.retention->checkpoint_inventory(key, inventory) ||
-            !inventory.identity_known || !inventory.release_owned ||
-            !context.retention->candidate_for_instance(key, catalog) ||
-            catalog.artifact_id.v == 0 ||
-            catalog.record.kind !=
-                common_retention_artifact_kind::checkpoint ||
-            catalog.release_ops.empty()) {
-            return false;
-        }
-        out.candidate.artifact_id = catalog.artifact_id;
-        out.candidate.record = catalog.record;
-        out.candidate.lineage = catalog.lineage;
-        out.candidate.availability = catalog.avail;
-        out.candidate.release_ops = catalog.release_ops;
-        out.candidate.identity_known = true;
-        out.candidate.lease = inventory.lease;
-        out.kind = common_retention_artifact_kind::checkpoint;
-        out.owner_slot = context.slot_id;
-        out.pool = catalog.record.stamp.pool;
-        out.mandatory_anchor =
-            catalog.record.stamp.mandatory_anchor;
-        return true;
-    } catch (...) {
-        out = {};
-        return false;
-    }
-}
 
 void emit_checkpoint_destruction(
         const server_cache_checkpoint_authority_context & context,
-        const common_cache_plan_destruction_receipt & receipt,
-        uint64_t projected_bytes,
-        uint64_t price_us,
-        uint32_t weight_milli,
-        uint32_t ordinal) noexcept {
+        const common_cache_plan_destruction_receipt & receipt) noexcept {
     if (!context.debug_observability) {
         return;
     }
     try {
         json payload = server_json_from_ordered(server_cache_destruction_receipt_json(
-            receipt, projected_bytes, "checkpoint_drop"));
-        payload["price_us"] = price_us;
-        payload["retention_weight_milli"] = weight_milli;
-        payload["rank_ordinal"] = ordinal;
+            receipt, 0, "checkpoint_drop"));
         SRV_INF("CACHE_HOST_DESTRUCTION %s\n",
                 payload.dump().c_str());
     } catch (...) {
@@ -4543,351 +4518,7 @@ void emit_checkpoint_destruction(
     }
 }
 
-bool checkpoint_drop_certified(
-        server_cache_checkpoint_authority_context & context,
-        server_cache_checkpoint_iterator victim,
-        server_cache_checkpoint_iterator recovery,
-        server_cache_destruction_reason reason,
-        uint64_t price_us,
-        uint32_t weight_milli,
-        uint32_t ordinal,
-        server_cache_checkpoint_iterator & next) noexcept {
-    if (!context.authority || !context.retention || !context.destruction ||
-        victim == context.checkpoints.end() ||
-        recovery == context.checkpoints.end() || victim == recovery) {
-        return false;
-    }
-    auto & authority = *context.authority;
-    const uint64_t sequence = ++authority.destruction_quote_sequence;
-    const auto refuse = [&](common_cache_plan_destruction_receipt * existing,
-                            common_cache_plan_destruction_reason why) {
-        context.thinning_refusal = why;
-        if (!server_cache_checkpoint_refusal_state_changed(context, why)) {
-            return;
-        }
-        common_cache_plan_destruction_receipt receipt = existing
-            ? std::move(*existing)
-            : common_cache_plan_destruction_receipt{};
-        receipt.state = common_cache_plan_destruction_state::refused;
-        receipt.reason = why;
-        receipt.effects = common_cache_plan_destruction_effect_bit(
-            common_cache_plan_destruction_effect::checkpoint_member_drop);
-        receipt.admission_sequence = sequence;
-        authority.observe_host_destruction(receipt, true);
-        context.destruction->note_checkpoint_thin_refused();
-        emit_checkpoint_destruction(context,
-            receipt, 0, price_us, weight_milli, ordinal);
-    };
-
-    server_cache_destruction_artifact victim_artifact;
-    server_cache_destruction_artifact recovery_artifact;
-    if (!build_checkpoint_destruction_artifact(context,
-            victim, victim_artifact) ||
-        !build_checkpoint_destruction_artifact(context,
-            recovery, recovery_artifact)) {
-        refuse(nullptr,
-               common_cache_plan_destruction_reason::manifest_incomplete);
-        return false;
-    }
-    const auto recovery_key =
-        server_retention_instance_key::for_checkpoint(context.slot_id, &*recovery);
-    auto pin = context.retention->acquire_recovery_pin(recovery_key);
-    if (!pin.valid() || !pin.binds_exact(
-            recovery_artifact.candidate.artifact_id,
-            recovery_artifact.candidate.release_ops)) {
-        refuse(nullptr,
-               common_cache_plan_destruction_reason::recovery_unavailable);
-        return false;
-    }
-
-    const auto preview = [&](const auto & ops, uint64_t serial,
-                             auto & released) {
-        return authority.ledger.preview_release_set(
-            ops, serial, released);
-    };
-    const auto project = [&](const auto & released, auto & domains) {
-        return authority.project_release(released, domains);
-    };
-    const uint64_t accounting_serial = authority.ledger.serial();
-    auto quote = server_cache_destruction_quote_single_artifact(
-        victim_artifact,
-        common_cache_plan_destruction_effect_bit(
-            common_cache_plan_destruction_effect::checkpoint_member_drop),
-        accounting_serial, sequence,
-        preview, project);
-    if (quote.receipt.state !=
-            common_cache_plan_destruction_state::quoted) {
-        const auto why = quote.receipt.reason;
-        refuse(&quote.receipt, why);
-        return false;
-    }
-    authority.observe_host_destruction(quote.receipt, false);
-    std::vector<server_cache_destruction_artifact> current;
-    try {
-        current.push_back(std::move(victim_artifact));
-    } catch (...) {
-        refuse(&quote.receipt,
-               common_cache_plan_destruction_reason::internal_fault);
-        return false;
-    }
-    auto prepared = server_cache_prepare_release_set(
-        quote, current, authority.ledger, authority.ledger.serial(),
-        project, std::move(pin));
-    if (prepared.status !=
-            server_cache_prepare_release_status::prepared) {
-        refuse(&quote.receipt, prepared.reason);
-        return false;
-    }
-    uint64_t projected_bytes = 0;
-    for (const auto & row : quote.projected_domains) {
-        if (row.projected_release_bytes.state !=
-                llama_cache_acct_known::known ||
-            row.projected_release_bytes.value >
-                std::numeric_limits<uint64_t>::max() - projected_bytes) {
-            refuse(&quote.receipt,
-                   common_cache_plan_destruction_reason::
-                       accounting_unavailable);
-            return false;
-        }
-        projected_bytes += row.projected_release_bytes.value;
-    }
-    quote.receipt.displaced_fate =
-        common_cache_plan_displaced_fate::exact_replay_recipe;
-    quote.receipt.recovery_citation =
-        common_cache_plan_recovery_citation::resolved;
-    quote.receipt.recovery_source_artifact_id =
-        recovery_artifact.candidate.artifact_id;
-    quote.receipt.recovery_source_manifest_digest =
-        server_cache_destruction_recovery_source_digest(
-            recovery_artifact.candidate.artifact_id,
-            recovery_artifact.candidate.release_ops);
-    quote.receipt.state =
-        common_cache_plan_destruction_state::certified;
-    authority.observe_host_destruction(quote.receipt, true);
-    emit_checkpoint_destruction(context,
-        quote.receipt, projected_bytes,
-        price_us, weight_milli, ordinal);
-
-    const auto victim_key =
-        server_retention_instance_key::for_checkpoint(context.slot_id, &*victim);
-    const auto admission = server_cache_checkpoint_observe_drop(context,
-        reason, current.front().candidate.artifact_id);
-    const std::thread::id scheduler_owner = std::this_thread::get_id();
-    GGML_ASSERT(context.raw_owner && context.raw_drop);
-    next = context.raw_drop(
-        context.raw_owner, victim, std::next(victim));
-    // The typed raw_drop adapter is pinned to the slot's X-macro _impl door;
-    // that door only advances the ring latch and erases this list node. The
-    // node destructor frees checkpoint-owned vectors and shadow metadata and
-    // cannot write C, so no ledger producer can interleave before commit.
-    GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
-    server_cache_recovery_pin retained_pin;
-    const auto committed = prepared.capability.commit(retained_pin);
-    GGML_ASSERT(committed ==
-                common_cache_plan_destruction_reason::none);
-    context.retention->retire_after_committed_release(victim_key);
-    quote.receipt.state =
-        common_cache_plan_destruction_state::executed;
-    quote.receipt.actual_accounting_serial =
-        authority.ledger.serial();
-    authority.observe_host_destruction(quote.receipt, false);
-    emit_checkpoint_destruction(context,
-        quote.receipt, projected_bytes,
-        price_us, weight_milli, ordinal);
-    context.destruction->note_checkpoint_thin_executed(
-        admission.sequence, projected_bytes);
-    return true;
-}
-
 } // namespace
-
-bool server_cache_checkpoint_thin_priced(
-        server_cache_checkpoint_authority_context & context,
-        int checkpoint_task_id,
-        uint64_t max_replay_tokens,
-        const common_prompt_checkpoint * seam_heuristic,
-        bool capacity_mode,
-        bool attempt_claimed) noexcept {
-    if (!context.authority || !context.retention || !context.leases ||
-        context.checkpoints.size() < 2) {
-        return false;
-    }
-    if (!attempt_claimed &&
-        !server_cache_checkpoint_thinning_attempt_begin(context, capacity_mode)) {
-        return false;
-    }
-    context.thinning_refusal =
-        common_cache_plan_destruction_reason::none;
-    context.leases->lifecycle_point();
-    struct local_candidate {
-        server_cache_checkpoint_iterator victim;
-        server_cache_checkpoint_iterator recovery;
-        server_cache_checkpoint_trade_input price;
-    };
-    struct member_inventory {
-        server_cache_checkpoint_iterator member;
-        server_retention_checkpoint_inventory catalog;
-        bool found = false;
-    };
-    std::vector<local_candidate> local;
-    std::vector<server_cache_checkpoint_trade_input> prices;
-    try {
-        local.reserve(context.checkpoints.size());
-        prices.reserve(context.checkpoints.size());
-        std::vector<member_inventory> inventory;
-        inventory.reserve(context.checkpoints.size());
-        for (auto it = context.checkpoints.begin();
-             it != context.checkpoints.end(); ++it) {
-            member_inventory member;
-            member.member = it;
-            member.found = context.retention->checkpoint_inventory(
-                server_retention_instance_key::for_checkpoint(context.slot_id, &*it),
-                member.catalog);
-            inventory.push_back(std::move(member));
-        }
-
-        size_t previous_index = 0;
-        for (size_t index = 1; index < inventory.size(); ++index) {
-            auto it = inventory[index].member;
-            auto previous = inventory[previous_index].member;
-            const bool close = it->n_tokens >= previous->n_tokens &&
-                uint64_t(it->n_tokens - previous->n_tokens) <=
-                    max_replay_tokens;
-            if ((!capacity_mode && !close) ||
-                it->id_task == checkpoint_task_id) {
-                previous_index = index;
-                continue;
-            }
-
-            local_candidate candidate;
-            candidate.victim = it;
-            candidate.recovery = previous;
-            candidate.price.ordinal = uint32_t(index);
-            candidate.price.recovery_ordinal =
-                uint32_t(previous_index);
-            candidate.price.payload_bytes = it->size();
-            candidate.price.replay_tokens =
-                it->n_tokens >= previous->n_tokens
-                    ? uint64_t(it->n_tokens - previous->n_tokens)
-                    : UINT64_MAX;
-            candidate.price.seam_heuristic_protected =
-                seam_heuristic == &*it;
-            const bool same_replay_lineage =
-                server_cache_checkpoint_bounded_replay(
-                    *previous, *it, max_replay_tokens);
-            candidate.price.recovery_available =
-                same_replay_lineage &&
-                inventory[previous_index].found &&
-                inventory[previous_index].catalog.identity_known &&
-                inventory[previous_index].catalog.release_owned;
-            const auto & victim_catalog = inventory[index].catalog;
-            if (inventory[index].found &&
-                victim_catalog.identity_known &&
-                victim_catalog.release_owned) {
-                candidate.price.artifact =
-                    victim_catalog.artifact_id;
-                candidate.price.stable_id =
-                    victim_catalog.stable_id;
-                candidate.price.identity_known = true;
-                candidate.price.mandatory_anchor =
-                    victim_catalog.mandatory_anchor ||
-                    victim_catalog.recovery_pinned;
-                candidate.price.hard_leased = server_cache_lease_is_hard(
-                    victim_catalog.lease);
-                uint32_t weight = 0;
-                GGML_ASSERT(server_cache_retention_weight_milli(
-                    victim_catalog.lease.cls ==
-                        server_cache_lease_class::soft,
-                    context.main_family,
-                    SERVER_CACHE_HOST_WEIGHT_SCALE, weight));
-                candidate.price.weight_milli = weight;
-            }
-            local.push_back(std::move(candidate));
-            prices.push_back(local.back().price);
-            if (!close) {
-                previous_index = index;
-            }
-        }
-    } catch (...) {
-        return false;
-    }
-    if (local.empty()) {
-        return false;
-    }
-
-    const auto * calib = common_cache_plan_calib_find(
-        context.authority->calibration_profile);
-    while (!local.empty()) {
-        const auto plan = server_cache_plan_checkpoint_thinning(
-            prices, calib);
-        if (!plan.selected) {
-            context.thinning_refusal = plan.reason;
-            if (!server_cache_checkpoint_refusal_state_changed(context, plan.reason)) {
-                return false;
-            }
-            common_cache_plan_destruction_receipt receipt;
-            receipt.state = common_cache_plan_destruction_state::refused;
-            receipt.reason = plan.reason;
-            receipt.effects = common_cache_plan_destruction_effect_bit(
-                common_cache_plan_destruction_effect::
-                    checkpoint_member_drop);
-            receipt.admission_sequence =
-                ++context.authority->destruction_quote_sequence;
-            context.authority->observe_host_destruction(receipt, true);
-            if (context.destruction) {
-                context.destruction->note_checkpoint_thin_refused();
-                if (plan.protection !=
-                        server_cache_checkpoint_protection::none) {
-                    switch (plan.protection) {
-                        case server_cache_checkpoint_protection::
-                                 seam_heuristic:
-                            context.destruction->
-                                note_checkpoint_thin_heuristic_refused();
-                            break;
-                        case server_cache_checkpoint_protection::
-                                 mandatory_anchor:
-                            context.destruction->
-                                note_checkpoint_thin_mandatory_refused();
-                            break;
-                        case server_cache_checkpoint_protection::
-                                 hard_lease:
-                            context.destruction->
-                                note_checkpoint_thin_hard_lease_refused();
-                            break;
-                        case server_cache_checkpoint_protection::none:
-                        case server_cache_checkpoint_protection::_count:
-                            break;
-                    }
-                }
-            }
-            emit_checkpoint_destruction(context,
-                receipt, 0, 0,
-                SERVER_CACHE_HOST_WEIGHT_SCALE, UINT32_MAX);
-            return false;
-        }
-        const auto chosen = std::find_if(
-            local.begin(), local.end(), [&](const auto & candidate) {
-                return candidate.price.ordinal == plan.ordinal;
-            });
-        if (chosen == local.end()) {
-            return false;
-        }
-        const auto chosen_index = size_t(chosen - local.begin());
-        server_cache_checkpoint_iterator next;
-        if (checkpoint_drop_certified(context,
-                chosen->victim, chosen->recovery,
-                capacity_mode
-                    ? server_cache_destruction_reason::checkpoint_capacity
-                    : server_cache_destruction_reason::checkpoint_thin,
-                plan.price_us, plan.weight_milli,
-                plan.ordinal, next)) {
-            return true;
-        }
-        local.erase(chosen);
-        prices.erase(prices.begin() + chosen_index);
-    }
-    return false;
-}
 
 bool server_cache_checkpoint_capacity_floor(
         server_cache_checkpoint_authority_context & context,
@@ -4978,8 +4609,7 @@ void server_cache_checkpoint_publication_skipped(
     if (context.destruction) {
         context.destruction->note_checkpoint_publication_skip();
     }
-    emit_checkpoint_destruction(context,
-        receipt, 0, 0, SERVER_CACHE_HOST_WEIGHT_SCALE, UINT32_MAX);
+    emit_checkpoint_destruction(context, receipt);
 }
 
 
@@ -5150,15 +4780,9 @@ server_cache_recovery_pin acquire_host_recovery_pin(
 }
 
 struct host_trade_ranking {
-    bool price_known = false;
-    uint64_t price_us = 0;
-    uint32_t weight_milli = SERVER_CACHE_HOST_WEIGHT_SCALE;
     uint32_t ordinal = 0;
     int32_t source_id = -1;
     llama_cache_acct_artifact_id artifact_id;
-    bool zero_destruction_known = false;
-    bool zero_destruction = false;
-    bool zero_destruction_tie_break = false;
     common_cache_family_role family_role = common_cache_family_role::_count;
     common_cache_plan_payload_kind payload_kind =
         common_cache_plan_payload_kind::unavailable;
@@ -5189,10 +4813,6 @@ void server_prompt_cache_observe_host_destruction(
             llama_cache_acct_known::unavailable);
         json payload = server_json_from_ordered(server_cache_destruction_receipt_json(
             receipt, projected_bytes));
-        payload["price_us"] = ranking && ranking->price_known
-            ? json(ranking->price_us) : unavailable;
-        payload["retention_weight_milli"] = ranking
-            ? json(ranking->weight_milli) : unavailable;
         payload["rank_ordinal"] = ranking
             ? json(ranking->ordinal) : unavailable;
         payload["victim_source_id"] = ranking && ranking->source_id >= 0
@@ -5200,11 +4820,6 @@ void server_prompt_cache_observe_host_destruction(
         payload["victim_artifact_id"] = ranking &&
                 ranking->artifact_id.v != 0
             ? json(ranking->artifact_id.v) : unavailable;
-        payload["zero_destruction"] = ranking &&
-                ranking->zero_destruction_known
-            ? json(ranking->zero_destruction) : unavailable;
-        payload["zero_destruction_tie_break"] = ranking
-            ? json(ranking->zero_destruction_tie_break) : json(false);
         payload["declared_family_role"] = ranking &&
                 ranking->family_role < common_cache_family_role::_count
             ? json(ranking->family_role == common_cache_family_role::main
@@ -5521,14 +5136,11 @@ void commit_certified_host_destruction(
 
 struct host_trade_candidate {
     server_prompt_cache::iterator victim;
-    server_prompt_cache::iterator recovery;
     host_trade_ranking ranking;
     uint64_t marginal_resident_bytes = 0;
     std::vector<llama_cache_acct_op_id> release_ops;
     bool marginal_resident_known = false;
-    bool attempted = false;
     bool lease_known = false;
-    bool main_family = false;
     bool soft_leased = false;
     bool hard_leased = false;
     bool mandatory_anchor = false;
@@ -5569,24 +5181,11 @@ uint64_t server_prompt_cache_shadow_hash(uint64_t value) noexcept {
     return value ^ (value >> 31);
 }
 
-server_prompt_cache::iterator find_exact_host_recovery(
-        server_prompt_cache & cache,
-        server_prompt_cache::iterator victim) noexcept {
-    for (auto it = cache.states.begin(); it != cache.states.end(); ++it) {
-        if (it != victim && server_prompt_cache::exactly_redundant(
-                *victim, *it)) {
-            return it;
-        }
-    }
-    return cache.states.end();
-}
-
-bool host_trade_price(
+bool inspect_host_candidate(
         server_prompt_cache & cache,
         server_prompt_cache::iterator victim,
         uint32_t ordinal,
         server_cache_destruction_reason reason,
-        const common_cache_plan_calib * calib,
         host_trade_candidate & out,
         bool preview_vbr = true,
         const server_cache_destruction_artifact * prepared_artifact = nullptr) noexcept {
@@ -5596,9 +5195,7 @@ bool host_trade_price(
     out.ranking.source_id = victim->cache_plan_source_id;
     out.ranking.family_role = victim->cache_family.declared()
         ? victim->cache_family.role : common_cache_family_role::_count;
-    out.main_family = victim->main_family;
     try {
-        auto & authority = *cache.publish_authority;
         server_cache_destruction_artifact local_artifact;
         out.vbr = victim->payload.kind() ==
             server_prompt_cache_payload_kind::vbr_artifact;
@@ -5652,8 +5249,7 @@ bool host_trade_price(
             }
             out.retirement_ready = true;
             // VBR payloads use typed restore authority. They enter the
-            // avoided-prefill projection below, but never the legacy fixed
-            // calibrated exact-recovery ladder.
+            // avoided-prefill retention projection below.
             return true;
         }
         if (reason == server_cache_destruction_reason::host_capacity) {
@@ -5676,38 +5272,6 @@ bool host_trade_price(
                 checkpoint_bytes + accelerator_bytes;
         }
         out.retirement_ready = true;
-        if (!calib) {
-            return false;
-        }
-
-        out.recovery = find_exact_host_recovery(cache, victim);
-        out.ranking.zero_destruction_known = true;
-        out.ranking.zero_destruction = out.recovery != cache.states.end();
-        if (out.hard_leased) {
-            return false;
-        }
-
-        uint32_t additional_weight = SERVER_CACHE_HOST_WEIGHT_SCALE;
-        if (common_cache_family_allows_additional_weight(
-                victim->cache_family) && authority.host_retention_weight) {
-            if (!authority.host_retention_weight(
-                    authority.host_retention_weight_context,
-                    *victim, additional_weight) ||
-                additional_weight == 0) {
-                return false;
-            }
-        }
-
-        uint32_t weight = 0;
-        uint64_t price = 0;
-        if (!server_cache_host_retention_price_us(
-                *calib, victim->size(), out.soft_leased,
-                out.main_family, weight, price, additional_weight)) {
-            return false;
-        }
-        out.ranking.weight_milli = weight;
-        out.ranking.price_us = price;
-        out.ranking.price_known = true;
         return true;
     } catch (...) {
         return false;
@@ -5959,7 +5523,7 @@ host_trade_retention_capacity_projection project_host_trade_retention_capacity(
         return end;
     };
 
-    // The priced inventory already covers every ordinary physical host
+    // The inspected inventory already covers every ordinary physical host
     // entry. Join those artifacts directly instead of repeating a sidecar
     // association lookup for every state. Incoming publications and
     // recovery-pinned entries are deliberately absent from that inventory;
@@ -6220,9 +5784,9 @@ static bool server_prompt_cache_plan_vbr_pressure(
             for (size_t i = 0; i < evidence.size(); ++i) {
                 evidence[i].candidate.lease = leases[i];
                 host_trade_candidate candidate;
-                (void) host_trade_price(
+                (void) inspect_host_candidate(
                     cache, victims[i], ordinals[i], reason,
-                    nullptr, candidate, false, &evidence[i]);
+                    candidate, false, &evidence[i]);
                 candidates.push_back(std::move(candidate));
             }
             if (candidates.empty() || (byte_pressure &&
@@ -6347,10 +5911,10 @@ static bool server_prompt_cache_plan_vbr_pressure(
         return false;
     }
     host_trade_candidate candidate;
-    (void) host_trade_price(
+    (void) inspect_host_candidate(
         cache, current, 0,
         server_cache_destruction_reason::host_capacity,
-        nullptr, candidate);
+        candidate);
     if (!candidate.retirement_ready || !candidate.lease_known ||
         candidate.hard_leased || candidate.mandatory_anchor ||
         !candidate.ranking.artifact_id.v) {
@@ -6913,7 +6477,7 @@ void server_prompt_cache::observe_retention_pressure_choice(
     }
 }
 
-bool server_prompt_cache::destroy_priced_host_entry(
+bool server_prompt_cache::destroy_retention_host_entry(
         server_cache_destruction_reason reason,
         iterator incoming,
         iterator & legacy_floor,
@@ -6943,14 +6507,14 @@ bool server_prompt_cache::destroy_priced_host_entry(
         if (!host_trade_substrate_warned) {
             host_trade_substrate_warned = true;
             SRV_WRN("%s\n",
-                    "host retention pricing unavailable: lifecycle lease/accounting substrate is incomplete");
+                    "host retention policy unavailable: lifecycle lease/accounting substrate is incomplete");
         }
         for (auto it = states.begin(); it != states.end(); ++it) {
             if (it == incoming) {
                 continue;
             }
-            // Without the complete lease/accounting substrate, no learned
-            // authority may inspect or retire a VBR capability. Keep it as
+            // Without the complete lease/accounting substrate, retention
+            // authority may not retire a VBR capability. Keep it as
             // durable retained coverage instead of bypassing a potentially
             // hard lease through the fixed-state terminal.
             if (!it->payload.fixed_state_restorable()) {
@@ -6970,20 +6534,10 @@ bool server_prompt_cache::destroy_priced_host_entry(
         return false;
     }
 
-    // lease boundary is an execution-time lease boundary. Expire first, then inspect
-    // each immutable host artifact once for pricing. Soft protection raises
-    // price; only a hard lease makes a candidate ineligible. If every priced
-    // candidate fails certification, the caller deliberately executes the
-    // historical FIFO victim so the user's configured bound remains real.
+    // Expire leases before inspecting each immutable host artifact. Hard
+    // leases remain ineligible; if retention evidence is incomplete, use the
+    // oldest eligible entry so the configured capacity remains a real bound.
     lease_obs->lifecycle_point();
-    // The retained calibration profile prices pageable-host bytes. It has no
-    // lawful token-yield currency, so token pressure proceeds directly to
-    // The retention-capacity policy's exact token denominator (or the deterministic FIFO floor).
-    const auto * calib = reason ==
-            server_cache_destruction_reason::host_capacity
-        ? common_cache_plan_calib_find(
-              publish_authority->calibration_profile)
-        : nullptr;
     std::vector<host_trade_candidate> candidates;
     try {
         candidates.reserve(states.size());
@@ -6998,10 +6552,9 @@ bool server_prompt_cache::destroy_priced_host_entry(
                 continue;
             }
             host_trade_candidate candidate;
-            (void) host_trade_price(
-                *this, it, ordinal, reason, calib, candidate, false);
+            (void) inspect_host_candidate(
+                *this, it, ordinal, reason, candidate, false);
             if (candidate.hard_leased) {
-                candidate.attempted = true;
                 const uint64_t quote_sequence =
                     ++publish_authority->destruction_quote_sequence;
                 observe_host_trade_refusal(
@@ -7059,8 +6612,8 @@ bool server_prompt_cache::destroy_priced_host_entry(
 
     // Exact shared-owner aliases are zero-value logical cleanup, not a
     // positive-byte retention-capacity alternative. Execute the first lawful alias before
-    // calibrated or learned victim selection; the outer pressure loop then
-    // remeasures and prices the now-exclusive survivor. This preserves pins,
+    // retention selection; the outer pressure loop then remeasures the
+    // now-exclusive survivor. This preserves pins,
     // hard leases, and incoming protection while ensuring redundant aliases
     // cannot mask a more valuable unique entry.
     const auto alias = std::find_if(
@@ -7086,156 +6639,6 @@ bool server_prompt_cache::destroy_priced_host_entry(
             &released_bytes, &released_tokens);
     }
 
-    const auto stable_key = [](const host_trade_candidate & candidate) {
-        // Keep B's planner-key shape explicit even though this inventory has
-        // only the host provider; later mixed-provider trades retain ordering.
-        return std::make_tuple(
-            uint8_t(common_cache_plan_provider::host_cache_entry),
-            candidate.victim->cache_plan_source_id,
-            candidate.ranking.ordinal);
-    };
-    while (true) {
-        uint64_t minimum = std::numeric_limits<uint64_t>::max();
-        for (const auto & candidate : candidates) {
-            if (!candidate.attempted && candidate.ranking.price_known) {
-                minimum = std::min(minimum, candidate.ranking.price_us);
-            }
-        }
-        if (minimum == std::numeric_limits<uint64_t>::max()) {
-            break;
-        }
-        const long double floor = std::max<long double>(
-            (long double) minimum * COMMON_CACHE_PLAN_TIE_REL_FLOOR,
-            COMMON_CACHE_PLAN_TIE_ABS_FLOOR_US);
-        host_trade_candidate * chosen = nullptr;
-        bool saw_zero = false;
-        bool saw_destructive = false;
-        for (auto & candidate : candidates) {
-            if (candidate.attempted || !candidate.ranking.price_known ||
-                (long double) candidate.ranking.price_us >
-                    (long double) minimum + floor) {
-                continue;
-            }
-            saw_zero |= candidate.ranking.zero_destruction;
-            saw_destructive |= !candidate.ranking.zero_destruction;
-            if (!chosen ||
-                std::make_tuple(!candidate.ranking.zero_destruction,
-                                stable_key(candidate)) <
-                std::make_tuple(!chosen->ranking.zero_destruction,
-                                stable_key(*chosen))) {
-                chosen = &candidate;
-            }
-        }
-        const bool mixed_destruction_tie = saw_zero && saw_destructive;
-        GGML_ASSERT(chosen != nullptr);
-        chosen->attempted = true;
-        chosen->ranking.zero_destruction_tie_break =
-            mixed_destruction_tie && chosen->ranking.zero_destruction;
-        if (required_victim.v &&
-            chosen->ranking.artifact_id != required_victim) {
-            return false;
-        }
-
-        const uint64_t quote_sequence =
-            ++publish_authority->destruction_quote_sequence;
-        auto certified = certify_host_destruction(
-            *this,
-            chosen->victim,
-            chosen->recovery,
-            quote_sequence,
-            true,
-            false,
-            &chosen->ranking);
-        if (!certified.ready) {
-            if (destruction_obs) {
-                if (certified.quote.receipt.reason ==
-                        common_cache_plan_destruction_reason::
-                            hard_lease_blocked) {
-                    destruction_obs->note_host_trade_veto();
-                } else {
-                    destruction_obs->note_host_trade_refused();
-                }
-            }
-            if (certified.quote.receipt.reason ==
-                    common_cache_plan_destruction_reason::
-                        hard_lease_blocked) {
-                chosen->hard_leased = true;
-            } else if (certified.quote.receipt.reason ==
-                    common_cache_plan_destruction_reason::
-                        lease_unavailable) {
-                chosen->lease_known = false;
-            }
-            continue;
-        }
-
-        if (destruction_obs) {
-            destruction_obs->host_trade_attempted++;
-        }
-
-        const auto admission = server_prompt_cache_observe_drop(
-            *this, *chosen->victim, reason);
-        const uint64_t victim_bytes = chosen->victim->size();
-        const size_t victim_tokens =
-            size_t(chosen->victim->prompt.n_tokens());
-        const std::thread::id scheduler_owner = std::this_thread::get_id();
-        if (observe_retention_shadow) {
-            observe_retention_pressure_choice(
-                reason, incoming, chosen->victim, competition_wave_valid);
-        }
-        SRV_WRN(
-            " - removing priced host entry source_id=%d (size = %.3f MiB)\n",
-            chosen->victim->cache_plan_source_id,
-            chosen->victim->size() / (1024.0 * 1024.0));
-        server_prompt_cache_destroy_entry_impl(*this, chosen->victim);
-        // lease boundary uses the same no-interleaving terminal as recovery proof. Pricing and all
-        // fallible recovery work completed before the physical erase; the raw
-        // list mutation has no callback/C writer, and capability commit is the
-        // immediately following operation on update_slots' owner thread.
-        commit_certified_host_destruction(
-            *this, certified, scheduler_owner, &chosen->ranking);
-        if (destruction_obs) {
-            destruction_obs->note_host_trade_executed(
-                admission.sequence,
-                certified.projected_bytes,
-                chosen->main_family,
-                chosen->soft_leased,
-                chosen->ranking.zero_destruction_tie_break);
-        }
-        if (recovery_pin_excluded) {
-            emit_host_pressure_floor_outcome(
-                *this, "priced_evicted", chosen->ranking.artifact_id,
-                chosen->ranking.source_id);
-        }
-        released_bytes = reason ==
-                server_cache_destruction_reason::host_capacity
-            ? certified.projected_bytes : victim_bytes;
-        released_tokens = victim_tokens;
-        return true;
-    }
-
-    // Candidates without a fitted/complete price never join a partial
-    // optimum. Emit one typed refusal per skipped victim, then retain the
-    // exact historical FIFO terminal. No new request is refused merely
-    // because destruction evidence is incomplete.
-    if (reason == server_cache_destruction_reason::host_capacity) {
-        for (auto & candidate : candidates) {
-            if (candidate.vbr || candidate.attempted ||
-                candidate.ranking.price_known) {
-                continue;
-            }
-            candidate.attempted = true;
-            const uint64_t quote_sequence =
-                ++publish_authority->destruction_quote_sequence;
-            observe_host_trade_refusal(
-                *this,
-                quote_sequence,
-                common_cache_plan_destruction_reason::capacity_refused,
-                &candidate.ranking);
-            if (destruction_obs) {
-                destruction_obs->note_host_trade_unpriced();
-            }
-        }
-    }
     for (const auto & candidate : candidates) {
         if (candidate.lease_known && !candidate.hard_leased &&
             candidate.retirement_ready &&
@@ -7254,8 +6657,8 @@ bool server_prompt_cache::destroy_priced_host_entry(
 
     // Retention capacity replaces only the lawful lifecycle fallback. Host capacity uses
     // exact resident payload bytes; token pressure uses exact prompt tokens.
-    // The calibrated/certified byte ladder above, hard leases, pins, and
-    // incoming publication retain precedence. Reproject on every victim;
+    // Hard leases, pins, and incoming publication retain precedence.
+    // Reproject on every victim;
     // record only the first decision in a multi-removal competition wave.
     if (retention_capacity_authority &&
         (reason == server_cache_destruction_reason::host_capacity ||
@@ -7411,7 +6814,7 @@ bool server_prompt_cache::evict_front_under_pressure(
     common_cache_plan_destruction_reason floor_reason =
         common_cache_plan_destruction_reason::capacity_refused;
     bool recovery_pin_excluded = false;
-    if (destroy_priced_host_entry(
+    if (destroy_retention_host_entry(
             reason, incoming, legacy_floor, floor_reason,
             recovery_pin_excluded, competition_wave_valid,
             observe_retention_shadow, released_bytes,
@@ -7733,10 +7136,10 @@ bool server_prompt_cache::destroy_vbr_pair(
             admission.sequence,
             status == vbr_artifact_prepared_retire_status::retired
                 ? bytes : 0,
-            first_main_family, first_soft_leased, false);
+            first_main_family, first_soft_leased);
         destruction_obs->note_host_trade_executed(
             admission.sequence, 0,
-            second_main_family, second_soft_leased, false);
+            second_main_family, second_soft_leased);
         destruction_obs->note_prepared_release_batch(
             sequences, 1, status !=
                 vbr_artifact_prepared_retire_status::unavailable);
@@ -9104,13 +8507,11 @@ bool server_prompt_cache::load_impl(
         server_prompt & prompt, const server_tokens & tokens_new,
         llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
         const std::string & adapter_config_key, common_cache_plan_record * rec,
-        int32_t required_source_id,
         common_cache_family_binding * restored_family,
         server_prompt_cache_restore_shape & restore_shape) {
     restore_shape = server_prompt_cache_restore_shape::none;
     if constexpr (!Observed) {
         (void) rec;
-        (void) required_source_id;
     }
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
@@ -9129,12 +8530,12 @@ bool server_prompt_cache::load_impl(
 
     // find the most similar cached prompt, that would also preserve the most context.
     // Observer transport [observer, noexcept]: ONE row per visited entry, keyed by its
-    // request-local immutable source id; every evaluated survivor starts as a cost loser and
+    // request-local immutable source id; every evaluated survivor starts unselected and
     // the shipped winner is promoted to accepted after the scan. find_or_add returning
     // nullptr = inventory overflow — the provider's state latches and rows stop, the
     // shipped scan is untouched.
     for (auto it = states.begin(); it != states.end(); ++it) {
-        // Keep fixed-state inventory byte-identical to the planner. VBR nodes
+        // Keep fixed-state inventory consistent with the diagnostic scan. VBR nodes
         // use the typed restore selector; reject them before assigning a
         // bounded fixed source ID or scanning their long prefix here.
         if (!it->payload.fixed_state_restorable()) {
@@ -9144,14 +8545,6 @@ bool server_prompt_cache::load_impl(
         [[maybe_unused]] int32_t obs_source = -1;
         if constexpr (Observed) {
             if (cache_plan_get_source_id(*it, obs_source)) {
-                // Required-provider authority evaluated every host row before
-                // mutation. Save-before-load may deduplicate the list, but a
-                // surviving node keeps its request-local id; skip non-selected
-                // states before their O(context) token LCP.
-                if (required_source_id >= 0 &&
-                    obs_source != required_source_id) {
-                    continue;
-                }
                 row = rec->find_or_add(
                     common_cache_plan_provider::host_cache_entry,
                     obs_source, COMMON_CACHE_PLAN_PHASE_HOST_SCAN,
@@ -9164,9 +8557,6 @@ bool server_prompt_cache::load_impl(
                 rec->inventory_states[size_t(
                     common_cache_plan_provider::host_cache_entry)] =
                     common_cache_plan_inventory_state::overflowed;
-                if (required_source_id >= 0) {
-                    continue;
-                }
             }
         }
 
@@ -9198,26 +8588,6 @@ bool server_prompt_cache::load_impl(
 
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
-            continue;
-        }
-
-        if constexpr (Observed) {
-            if (required_source_id >= 0) {
-                // primary cache planner exact-provider authority: the planner already selected
-                // this complete host plan. Preserve all structural/identity
-                // guards above, but do not re-run the legacy two-axis choice.
-                it_best = it;
-                f_keep_best = f_keep_cur;
-                f_sim_best = f_sim_cur;
-                obs_source_best = obs_source;
-                obs_lcp_sel = lcp_cur;
-                reuse_lcp_best = lcp_cur;
-                continue;
-            }
-        }
-
         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
@@ -9242,7 +8612,7 @@ bool server_prompt_cache::load_impl(
             if (win) {
                 win->payload_kind =
                     common_cache_plan_payload_kind::fixed_state;
-                win->accept(); // shipped winner: promote over the scan-time cost-loser default
+                win->accept(); // mark the actual scan winner
                 win->lcp_tokens    = llama_cache_acct_value::measured((uint64_t) obs_lcp_sel);
                 // bytes the restore actually installs (main+draft state) — NOT entry
                 // size(), which also sums every retained checkpoint.
@@ -9254,11 +8624,6 @@ bool server_prompt_cache::load_impl(
     }
 
     if (it_best == states.end()) {
-        if constexpr (Observed) {
-            if (required_source_id >= 0) {
-                return false;
-            }
-        }
         // nothing better than the slot's current state; leave the slot as-is
         return true;
     }
@@ -9340,21 +8705,20 @@ bool server_prompt_cache::load_impl(
     return true;
 }
 
-template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_family_binding *, server_prompt_cache_restore_shape &);
-template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_family_binding *, server_prompt_cache_restore_shape &);
+template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, common_cache_family_binding *, server_prompt_cache_restore_shape &);
+template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, common_cache_family_binding *, server_prompt_cache_restore_shape &);
 
 bool server_prompt_cache::load(
         server_prompt & prompt, const server_tokens & tokens_new,
         llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
         const std::string & adapter_config_key,
         server_prompt_cache_restore_shape & restore_shape,
-        common_cache_plan_record * rec, int32_t required_source_id,
+        common_cache_plan_record * rec,
         common_cache_family_binding * restored_family) {
-    GGML_ASSERT(rec != nullptr || required_source_id < 0);
     // One dispatch outside every loop: the off path is the original loop.
     return rec != nullptr
-        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, required_source_id, restored_family, restore_shape)
-        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, required_source_id, restored_family, restore_shape);
+        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, restored_family, restore_shape)
+        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, restored_family, restore_shape);
 }
 
 void server_prompt_cache::update() {
@@ -9488,19 +8852,19 @@ bool server_prompt_cache::enforce_quality_anchor_budget(
                     server_prompt_cache_payload_kind::vbr_artifact) {
                 continue;
             }
-            host_trade_candidate priced;
-            (void) host_trade_price(
+            host_trade_candidate candidate;
+            (void) inspect_host_candidate(
                 *this, it, ordinal,
                 server_cache_destruction_reason::host_capacity,
-                nullptr, priced);
+                candidate);
             const auto found = std::lower_bound(
                 row_index.begin(), row_index.end(),
                 std::pair<uint64_t, size_t> {
-                    priced.ranking.artifact_id.v, 0 });
-            if (!priced.ranking.artifact_id.v ||
+                    candidate.ranking.artifact_id.v, 0 });
+            if (!candidate.ranking.artifact_id.v ||
                 found == row_index.end() ||
-                found->first != priced.ranking.artifact_id.v ||
-                !priced.lease_known) {
+                found->first != candidate.ranking.artifact_id.v ||
+                !candidate.lease_known) {
                 return refuse_or_discard_incoming();
             }
             auto & row = rows[found->second];
@@ -9510,11 +8874,11 @@ bool server_prompt_cache::enforce_quality_anchor_budget(
             if (it->payload.vbr_has_quality_anchor()) {
                 row.eligible =
                     it->payload.vbr_anchor_resident_bytes() != 0 &&
-                    !priced.hard_leased && !priced.mandatory_anchor &&
+                    !candidate.hard_leased && !candidate.mandatory_anchor &&
                     it->recovery_pins == 0;
                 have_anchor_binding = true;
             }
-            bindings.push_back({ priced.ranking.artifact_id, it });
+            bindings.push_back({ candidate.ranking.artifact_id, it });
         }
         if (!have_anchor_binding || !server_live_retention_prepare(
                 rows.data(), rows.size(), competition_epoch)) {
@@ -9585,10 +8949,10 @@ bool server_prompt_cache::enforce_quality_anchor_budget(
                 return refuse_or_discard_incoming();
             }
             host_trade_candidate current;
-            (void) host_trade_price(
+            (void) inspect_host_candidate(
                 *this, binding->state, 0,
                 server_cache_destruction_reason::host_capacity,
-                nullptr, current);
+                current);
             if (!current.lease_known || current.hard_leased ||
                 current.mandatory_anchor ||
                 current.ranking.artifact_id != artifact) {

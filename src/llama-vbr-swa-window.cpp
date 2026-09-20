@@ -1,4 +1,5 @@
 #include "llama-vbr-swa-window.h"
+#include "llama-vbr-precision.h"
 
 #include "llama-hparams.h"
 #include "llama-kv-cache-iswa.h"
@@ -305,11 +306,13 @@ class vbr_swa_window_planner {
             const auto resolved = vbr_downward_resolve_recipe(ggml_type(saved.current_type), t->type, t->type, true, recipe);
             if (resolved == vbr_downward_recipe_status::equal_tier) {
                 if (gen.domain != saved.domain || gen.last_source_type != saved.last_source_type ||
+                    gen.effective_type != saved.effective_type ||
                     gen.promote_hops != saved.promote_hops || gen.last_transition != saved.last_transition) { return false; }
             } else if (resolved == vbr_downward_recipe_status::resolved) {
                 // No live unit-wide history adoption or promotion reconstruction.
                 // The last adjacent edge must match the live destination's loss history.
                 if (saved.promote_hops || gen.promote_hops ||
+                    gen.effective_type != vbr_precision_merge(saved.effective_type, t->type) ||
                     saved.domain != recipe.edges[0].source_domain ||
                     gen.domain != recipe.edges[recipe.n_edges-1].target_domain ||
                     gen.last_source_type != recipe.edges[recipe.n_edges-1].source_type ||

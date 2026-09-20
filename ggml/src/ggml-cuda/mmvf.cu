@@ -4,6 +4,52 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
+static __global__ void qwen35_recurrent_gates_f16(
+        const half * alpha_weight, const half * beta_weight, const float * input,
+        const float * dt, const float * a, float * gate, float * beta, int ncols, int nrows) {
+#ifdef FP16_AVAILABLE
+    const int row = blockIdx.x, token = blockIdx.z, tid = threadIdx.x;
+    const bool is_beta = blockIdx.y != 0;
+    const half2 * w = reinterpret_cast<const half2 *>((is_beta ? beta_weight : alpha_weight) + row * ncols);
+    const float2 * x = reinterpret_cast<const float2 *>(input + token * ncols);
+    half2 sumh = make_half2(0.0f, 0.0f);
+    // Match the ordinary 256-thread F16 MMVF dot, including activation casts.
+    for (int col = tid; col < ncols / 2; col += 256) {
+        const float2 value = x[col];
+        sumh += w[col] * make_half2(value.x, value.y);
+    }
+    float sum = __low2float(sumh) + __high2float(sumh);
+    sum = warp_reduce_sum<32>(sum);
+    __shared__ float partial[32];
+    if (tid >= 8 && tid < 32) partial[tid] = 0.0f;
+    if (tid % 32 == 0) partial[tid / 32] = sum;
+    __syncthreads();
+    if (tid < 32) sum = warp_reduce_sum<32>(partial[tid]);
+    if (tid == 0) {
+        const int index = token * nrows + row;
+        if (is_beta) beta[index] = 1.0f / (1.0f + expf(-sum));
+        else {
+            const float biased = sum + dt[row];
+            const float softplus = biased > 20.0f ? biased : logf(1.0f + expf(biased));
+            gate[index] = softplus * a[row];
+        }
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+
+void ggml_cuda_op_qwen35_recurrent_gates_f16(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * alpha_weight, const ggml_tensor * beta_weight,
+        const ggml_tensor * input, const ggml_tensor * dt, const ggml_tensor * a,
+        ggml_tensor * gate, ggml_tensor * beta) {
+    qwen35_recurrent_gates_f16<<<dim3(alpha_weight->ne[1], 2, input->ne[1]), 256, 0, ctx.stream()>>>(
+        static_cast<const half *>(alpha_weight->data), static_cast<const half *>(beta_weight->data),
+        static_cast<const float *>(input->data), static_cast<const float *>(dt->data),
+        static_cast<const float *>(a->data), static_cast<float *>(gate->data),
+        static_cast<float *>(beta->data), alpha_weight->ne[0], alpha_weight->ne[1]);
+}
+
 template <int block_size, int fixed_ncols = 0>
 static __global__ void qwen35_recurrent_gates_bf16(
         const nv_bfloat16 * alpha_weight, const nv_bfloat16 * beta_weight,

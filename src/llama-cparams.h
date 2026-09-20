@@ -89,6 +89,8 @@ struct llama_cparams {
 
     // DFlash: top-K candidates per position (1 = argmax only, >1 = tree branching)
     int dflash_topk = 1;
+    // Runtime proposal lattice width; zero uses the model's configured maximum.
+    int dflash_block_size = 0;
 
     // Upstream block-diffusion drafter (arch "dflash"): build the in-graph top-K/argmax
     // tail (t_logits_argmax) on the decode graph so the draft loop reads K ids+logprobs

@@ -52,11 +52,6 @@ struct common_time_meas {
     int64_t & t_acc;
 };
 
-// Defined by common-cache-plan.h. Fixed underlying type permits common_params
-// to carry the closed value without introducing the common.h <-> checkpoint-
-// shadow include cycle.
-enum class common_cache_plan_authority_level : uint8_t;
-
 struct common_adapter_lora_info {
     std::string path;
     float scale;
@@ -920,7 +915,7 @@ struct common_params {
     bool cache_debug = false;
 
     // Trusted-local, single-principal cache-plan preview surface. This flag
-    // only exposes the route; ordinary requests allocate no observer/planner
+    // only exposes the route; ordinary requests allocate no observer
     // state merely because it is enabled.
     bool cache_plan_preflight = false;
 
@@ -928,10 +923,6 @@ struct common_params {
     // startup enables its required cache-lifecycle authority; this flag also
     // registers the reviewed routes.
     bool cache_control_api = false;
-
-    // Graduated cache-plan authority request. Non-off levels remain
-    // observation-only until the corresponding authority ratchet closes.
-    common_cache_plan_authority_level cache_plan_authority{}; // zero = off
 
     // Cache-lifecycle authority substrate (accounting-gated admission). The
     // parser value records an explicit request; server initialization also

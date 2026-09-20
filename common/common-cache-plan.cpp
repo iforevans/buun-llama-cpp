@@ -1,11 +1,20 @@
 #include "common-cache-plan.h"
-#include "common-cache-plan-estimate.h" // tie-floor constants echoed into shadow JSON
 
 #include <nlohmann/json.hpp>
 
-#include <stdexcept>
 
 using json = nlohmann::ordered_json;
+
+std::string common_cache_plan_sha256_hex_digest(const std::array<uint8_t, 32> & digest) {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(digest.size()*2);
+    for (uint8_t byte : digest) {
+        out.push_back(hex[byte >> 4]);
+        out.push_back(hex[byte & 0x0f]);
+    }
+    return out;
+}
 
 bool common_cache_plan_projected_release_bytes(
         const std::vector<common_cache_plan_yield_domain> & domains,
@@ -136,76 +145,6 @@ const char * common_cache_plan_selection_name(common_cache_plan_selection s) {
     return "invalid";
 }
 
-const char * common_cache_plan_authority_level_name(common_cache_plan_authority_level level) {
-    switch (level) {
-        case common_cache_plan_authority_level::off:        return "off";
-        case common_cache_plan_authority_level::by_id:      return "by_id";
-        case common_cache_plan_authority_level::similarity: return "similarity";
-        case common_cache_plan_authority_level::route_home: return "route_home";
-        case common_cache_plan_authority_level::lru:        return "lru";
-        case common_cache_plan_authority_level::_count:     break;
-    }
-    return "invalid";
-}
-
-common_cache_plan_authority_level common_cache_plan_authority_level_parse(
-        const std::string & value) {
-    if (value == "off") {
-        return common_cache_plan_authority_level::off;
-    }
-    if (value == "by_id") {
-        return common_cache_plan_authority_level::by_id;
-    }
-    if (value == "similarity") {
-        return common_cache_plan_authority_level::similarity;
-    }
-    if (value == "route_home") {
-        return common_cache_plan_authority_level::route_home;
-    }
-    if (value == "lru") {
-        return common_cache_plan_authority_level::lru;
-    }
-    throw std::invalid_argument("invalid cache-plan authority level: " + value);
-}
-
-const char * common_cache_plan_authority_state_name(common_cache_plan_authority_state state) {
-    switch (state) {
-        case common_cache_plan_authority_state::shadow:          return "shadow";
-        case common_cache_plan_authority_state::authoritative:   return "authoritative";
-        case common_cache_plan_authority_state::fallback_legacy: return "fallback_legacy";
-        case common_cache_plan_authority_state::_count:          break;
-    }
-    return "invalid";
-}
-
-const char * common_cache_plan_authority_fallback_name(
-        common_cache_plan_authority_fallback reason) {
-    switch (reason) {
-        case common_cache_plan_authority_fallback::none: return "none";
-        case common_cache_plan_authority_fallback::tier_not_enabled:
-            return "tier_not_enabled";
-        case common_cache_plan_authority_fallback::no_profile: return "no_profile";
-        case common_cache_plan_authority_fallback::profile_unfitted:
-            return "profile_unfitted";
-        case common_cache_plan_authority_fallback::invalid_calibration:
-            return "invalid_calibration";
-        case common_cache_plan_authority_fallback::incomplete_evidence:
-            return "incomplete_evidence";
-        case common_cache_plan_authority_fallback::stale_capability:
-            return "stale_capability";
-        case common_cache_plan_authority_fallback::destruction_authority_required:
-            return "destruction_authority_required";
-        case common_cache_plan_authority_fallback::budget_or_lease_unavailable:
-            return "budget_or_lease_unavailable";
-        case common_cache_plan_authority_fallback::destruction_not_certified:
-            return "destruction_not_certified";
-        case common_cache_plan_authority_fallback::internal_fault:
-            return "internal_fault";
-        case common_cache_plan_authority_fallback::_count: break;
-    }
-    return "invalid";
-}
-
 const char * common_cache_plan_destruction_state_name(
         common_cache_plan_destruction_state state) {
     switch (state) {
@@ -234,7 +173,7 @@ const char * common_cache_plan_destruction_reason_name(
         case common_cache_plan_destruction_reason::effect_drift: return "effect_drift";
         case common_cache_plan_destruction_reason::release_evidence_unavailable: return "release_evidence_unavailable";
         case common_cache_plan_destruction_reason::recovery_unavailable: return "recovery_unavailable";
-        case common_cache_plan_destruction_reason::profile_unfitted: return "profile_unfitted";
+        case common_cache_plan_destruction_reason::redundant_checkpoint: return "redundant_checkpoint";
         case common_cache_plan_destruction_reason::capacity_refused: return "capacity_refused";
         case common_cache_plan_destruction_reason::mutation_failed: return "mutation_failed";
         case common_cache_plan_destruction_reason::internal_fault: return "internal_fault";
@@ -344,7 +283,7 @@ void common_cache_plan_destruction_counters::observe(
         common_cache_plan_selection tier,
         const common_cache_plan_destruction_receipt & receipt,
         bool observe_classification) noexcept {
-    // Unlike the one-receipt authority observer, destruction quoting calls this once per candidate.
+    // Preview quoting can observe several candidate effects for one request.
     // The server boundary publishes the selected/finalized receipt exactly once.
     const size_t t = size_t(tier);
     if (t >= n_tiers) {
@@ -393,109 +332,6 @@ void common_cache_plan_destruction_counters::observe(
     }
 }
 
-static common_cache_plan_authority_fallback planner_fallback(
-        common_cache_plan_planner_status status) noexcept {
-    switch (status) {
-        case common_cache_plan_planner_status::ok:
-        case common_cache_plan_planner_status::not_attempted:
-            return common_cache_plan_authority_fallback::none;
-        case common_cache_plan_planner_status::no_profile:
-            return common_cache_plan_authority_fallback::no_profile;
-        case common_cache_plan_planner_status::profile_unfitted:
-            return common_cache_plan_authority_fallback::profile_unfitted;
-        case common_cache_plan_planner_status::invalid_calibration:
-            return common_cache_plan_authority_fallback::invalid_calibration;
-        case common_cache_plan_planner_status::incomplete_evidence:
-            return common_cache_plan_authority_fallback::incomplete_evidence;
-        case common_cache_plan_planner_status::internal_fault:
-            return common_cache_plan_authority_fallback::internal_fault;
-        case common_cache_plan_planner_status::_count:
-            break;
-    }
-    return common_cache_plan_authority_fallback::internal_fault;
-}
-
-void common_cache_plan_derive_shadow_authority(
-        common_cache_plan_record & rec,
-        common_cache_plan_authority_level configured_level,
-        common_cache_plan_authority_fallback fallback_reason) noexcept {
-    auto & receipt = rec.authority;
-    receipt = {};
-    receipt.configured_level = configured_level;
-    receipt.state = common_cache_plan_authority_state::shadow;
-    receipt.planner_plan_candidate =
-        rec.planner_status == common_cache_plan_planner_status::ok
-            ? rec.shadow_choice : -1;
-    if (receipt.planner_plan_candidate >= 0 &&
-        uint32_t(receipt.planner_plan_candidate) < rec.n_inventory) {
-        receipt.decision_tier =
-            rec.inventory[size_t(receipt.planner_plan_candidate)].origin_tier;
-    }
-    receipt.fallback_reason = fallback_reason ==
-            common_cache_plan_authority_fallback::none
-        ? planner_fallback(rec.planner_status) : fallback_reason;
-}
-
-void common_cache_plan_finalize_shadow_authority(common_cache_plan_record & rec) noexcept {
-    if (!rec.planner_precomputed) {
-        common_cache_plan_derive_shadow_authority(
-            rec, common_cache_plan_authority_level::off,
-            common_cache_plan_authority_fallback::none);
-        // Observer-only records predate authority fallbacks: preserve their
-        // schema-v5 meaning even when the shadow planner itself refused.
-        rec.authority.fallback_reason =
-            common_cache_plan_authority_fallback::none;
-    }
-    auto & receipt = rec.authority;
-    receipt.legacy_tier = rec.selection;
-    // Preserve a pre-mutation legacy counterfactual through every later
-    // fallback. A similarity retarget can demote after switching slots; its
-    // shipped plan then belongs to the planner target even though the state is
-    // fallback_legacy. Only records that never computed a counterfactual may
-    // derive one from the final shipped plan.
-    if (receipt.legacy_plan_candidate < 0) {
-        receipt.legacy_plan_candidate = rec.shipped_plan_candidate;
-    }
-    receipt.executed_plan_candidate = rec.shipped_plan_candidate;
-    receipt.disagreed = receipt.legacy_plan_candidate >= 0 &&
-                        receipt.planner_plan_candidate >= 0 &&
-                        receipt.legacy_plan_candidate != receipt.planner_plan_candidate;
-}
-
-void common_cache_plan_authority_counters::observe(
-        const common_cache_plan_authority_receipt & receipt,
-        bool qualified) noexcept {
-    last_receipt = receipt;
-    has_receipt = true;
-
-    const size_t tier = size_t(receipt.legacy_tier);
-    if (tier >= size_t(common_cache_plan_selection::_count)) {
-        return;
-    }
-    observed[tier]++;
-    if (receipt.planner_plan_candidate >= 0) {
-        (receipt.disagreed ? disagree : agree)[tier]++;
-    }
-    const size_t decision_tier = size_t(receipt.decision_tier);
-    if (qualified && decision_tier < size_t(common_cache_plan_selection::_count)) {
-        authority_eligible[decision_tier]++;
-    }
-    if (receipt.state == common_cache_plan_authority_state::authoritative) {
-        if (decision_tier < size_t(common_cache_plan_selection::_count)) {
-            if (!qualified) {
-                authority_eligible[decision_tier]++;
-            }
-            authority_executed[decision_tier]++;
-        }
-    } else if (receipt.state == common_cache_plan_authority_state::fallback_legacy) {
-        fallback_legacy[tier]++;
-        const size_t reason = size_t(receipt.fallback_reason);
-        if (reason < size_t(common_cache_plan_authority_fallback::_count)) {
-            fallback_reason[reason]++;
-        }
-    }
-}
-
 const char * common_cache_plan_inventory_state_name(common_cache_plan_inventory_state s) {
     switch (s) {
         case common_cache_plan_inventory_state::unobserved: return "unobserved";
@@ -504,20 +340,6 @@ const char * common_cache_plan_inventory_state_name(common_cache_plan_inventory_
             return "truncated_by_shipped_short_circuit";
         case common_cache_plan_inventory_state::overflowed: return "overflowed";
         case common_cache_plan_inventory_state::_count:     break;
-    }
-    return "invalid";
-}
-
-const char * common_cache_plan_planner_status_name(common_cache_plan_planner_status st) {
-    switch (st) {
-        case common_cache_plan_planner_status::not_attempted:       return "not_attempted";
-        case common_cache_plan_planner_status::ok:                  return "ok";
-        case common_cache_plan_planner_status::no_profile:          return "no_profile";
-        case common_cache_plan_planner_status::profile_unfitted:    return "profile_unfitted";
-        case common_cache_plan_planner_status::invalid_calibration: return "invalid_calibration";
-        case common_cache_plan_planner_status::incomplete_evidence: return "incomplete_evidence";
-        case common_cache_plan_planner_status::internal_fault:      return "internal_fault";
-        case common_cache_plan_planner_status::_count:              break;
     }
     return "invalid";
 }
@@ -690,7 +512,7 @@ void common_cache_plan_compose_chains(common_cache_plan_record & rec) {
             chain = rec.add_chain(common_cache_plan_provider::host_cache_entry,
                                   host_ord, int32_t(i));
             if (!chain) {
-                break; // derived_plans_incomplete latched; planner will refuse
+                break; // derived_plans_incomplete records the missing chain
             }
             chain->note_reject(COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL);
         }
@@ -791,78 +613,6 @@ static json cache_plan_yield_json(const common_cache_plan_yield_record & yield) 
     };
 }
 
-static json cache_plan_destruction_json(
-        const common_cache_plan_destruction_receipt & receipt) {
-    json effects = json::array();
-    for (uint8_t raw = uint8_t(common_cache_plan_destruction_effect::none) + 1;
-         raw < uint8_t(common_cache_plan_destruction_effect::_count); ++raw) {
-        const auto effect = common_cache_plan_destruction_effect(raw);
-        if (!common_cache_plan_destruction_effect_has(receipt.effects, effect)) {
-            continue;
-        }
-        effects.push_back({
-            { "effect", common_cache_plan_destruction_effect_name(effect) },
-            { "action_class", common_cache_plan_destruction_class_name(
-                                  common_cache_plan_destruction_class_for_effect(effect)) },
-            { "physical_reason", common_cache_plan_destruction_physical_reason_name(
-                                      common_cache_plan_destruction_physical_reason_for_effect(effect)) },
-        });
-    }
-    json attention = json::array();
-    for (const auto artifact : receipt.selected_attention) {
-        attention.push_back(artifact.v);
-    }
-    json recurrent = json::array();
-    for (const auto artifact : receipt.selected_recurrent) {
-        recurrent.push_back(artifact.v);
-    }
-    const auto digest_json = [](const auto & digest) -> json {
-        return digest.valid()
-            ? json(common_cache_plan_sha256_hex_digest(digest.bytes()))
-            : json(common_cache_acct_known_name(
-                  llama_cache_acct_known::unavailable));
-    };
-    json recovery_source = common_cache_acct_known_name(
-        llama_cache_acct_known::unavailable);
-    if (receipt.recovery_source_artifact_id.v != 0 &&
-        receipt.recovery_source_manifest_digest.valid()) {
-        recovery_source = json {
-            { "artifact_id", receipt.recovery_source_artifact_id.v },
-            { "manifest_digest", digest_json(
-                  receipt.recovery_source_manifest_digest) },
-        };
-    }
-    return json {
-        { "policy_version", receipt.policy_version },
-        { "state", common_cache_plan_destruction_state_name(receipt.state) },
-        { "reason", common_cache_plan_destruction_reason_name(receipt.reason) },
-        { "payload_kind", receipt.payload_kind ==
-                common_cache_plan_payload_kind::unavailable
-            ? json(nullptr)
-            : json(common_cache_plan_payload_kind_name(receipt.payload_kind)) },
-        { "effects", std::move(effects) },
-        { "lease_verdict", common_cache_plan_destruction_lease_verdict_name(receipt.lease_verdict) },
-        { "displaced_fate", common_cache_plan_displaced_fate_name(receipt.displaced_fate) },
-        { "recovery_citation", common_cache_plan_recovery_citation_name(receipt.recovery_citation) },
-        { "recovery_source", std::move(recovery_source) },
-        { "post_finalize_comparison", common_cache_plan_destruction_comparison_name(receipt.post_finalize_comparison) },
-        { "plan_candidate", receipt.plan_candidate >= 0
-              ? json(receipt.plan_candidate)
-              : json(common_cache_acct_known_name(
-                    llama_cache_acct_known::unavailable)) },
-        { "admission_sequence", receipt.admission_sequence },
-        { "quote_duration_us", receipt.quote_duration_us },
-        { "quote_accounting_serial", receipt.quote_accounting_serial },
-        { "actual_accounting_serial", receipt.actual_accounting_serial },
-        { "manifest_digest", digest_json(receipt.manifest_digest) },
-        { "union_effect_digest", digest_json(receipt.union_effect_digest) },
-        { "selected", json {
-            { "attention", std::move(attention) },
-            { "recurrent", std::move(recurrent) },
-        } },
-    };
-}
-
 // phase-bit spellings (single source; CI scans ban replicas like the other name tables)
 static json cache_plan_phases_json(uint8_t phases_seen) {
     static constexpr struct { uint8_t bit; const char * name; } bits[] = {
@@ -940,40 +690,6 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
             }
             jc["components"] = std::move(comps);
         }
-        // per-candidate economics only once an estimator produced them — absence on the wire
-        // IS the typed-unavailable state; emitting five unavailable slots per row would bloat
-        // every pre-planner record
-        bool any_estimated = c.predicted_total_us.state == llama_cache_acct_known::known;
-        for (const auto & term : c.cost_terms) {
-            any_estimated = any_estimated || term.estimated_us.state == llama_cache_acct_known::known
-                                          || term.raw.state          == llama_cache_acct_known::known;
-        }
-        if (any_estimated) {
-            json terms = json::object();
-            for (const auto & term : c.cost_terms) {
-                // wire discipline: absence IS the typed-unavailable state, per term — the
-                // D-owned kinds (transfer/eviction) would otherwise add two dead objects
-                // to every estimated row (kind->unit is fixed schema, nothing is lost)
-                if (term.raw.state          != llama_cache_acct_known::known &&
-                    term.estimated_us.state != llama_cache_acct_known::known) {
-                    continue;
-                }
-                json jt = {
-                    { "raw",          common_cache_plan_value_json(term.raw) },
-                    { "unit",         common_cache_acct_unit_name(term.raw_unit) },
-                    { "estimated_us", common_cache_plan_value_json(term.estimated_us) },
-                };
-                // the estimator version is metadata OF an estimate: emitting it while the
-                // estimate is unavailable would fabricate evidence
-                if (term.estimated_us.state == llama_cache_acct_known::known) {
-                    jt["estimator_version"] = term.estimator_version;
-                }
-                terms[common_cache_acct_cost_kind_name(term.kind)] = std::move(jt);
-            }
-            jc["cost_terms"]         = std::move(terms);
-            jc["predicted_total_us"] =
-                common_cache_plan_value_json(c.predicted_total_us);
-        }
         cands.push_back(std::move(jc));
     }
 
@@ -1025,9 +741,6 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
         { "n_replayed_tokens", common_cache_plan_value_json(rec.n_replayed_tokens) },
         { "ttft_us",           common_cache_plan_value_json(rec.ttft_us) },
     };
-    if (!rec.calibration_profile.empty()) {
-        out["calibration_profile"] = rec.calibration_profile;
-    }
     if (finalized) {
         const int32_t sel = rec.selected[size_t(rec.chosen)];
         if (sel >= 0) {
@@ -1038,49 +751,7 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
         if (rec.shipped_plan_candidate >= 0) {
             out["shipped_plan_candidate"] = rec.shipped_plan_candidate;
         }
-        out["planner_status"] = common_cache_plan_planner_status_name(rec.planner_status);
         out["yield"] = cache_plan_yield_json(rec.yield);
-        out["destruction"] = cache_plan_destruction_json(rec.destruction);
-    }
-    out["authority"] = json {
-        { "policy_version",          rec.authority.policy_version },
-        { "configured_level",        common_cache_plan_authority_level_name(
-                                           rec.authority.configured_level) },
-        { "legacy_tier",             common_cache_plan_selection_name(
-                                           rec.authority.legacy_tier) },
-        { "decision_tier",           common_cache_plan_selection_name(
-                                           rec.authority.decision_tier) },
-        { "state",                   common_cache_plan_authority_state_name(
-                                           rec.authority.state) },
-        { "legacy_plan_candidate",   cache_plan_ordinal_json(
-                                           rec.authority.legacy_plan_candidate) },
-        { "planner_plan_candidate",  cache_plan_ordinal_json(
-                                           rec.authority.planner_plan_candidate) },
-        { "executed_plan_candidate", cache_plan_ordinal_json(
-                                           rec.authority.executed_plan_candidate) },
-        { "fallback_reason",         common_cache_plan_authority_fallback_name(
-                                           rec.authority.fallback_reason) },
-        { "disagreed",               rec.authority.disagreed },
-    };
-    // shadow-planner result: an object when computed, the typed unavailable name otherwise
-    // (string-sentinel follows the acct-value wire convention used record-wide). The tie
-    // floors are chooser SEMANTICS: without them on the wire, logs spanning builds with
-    // different floors would merge into one silently-mixed agreement rate.
-    if (rec.shadow_choice >= 0) {
-        json ties = json::array();
-        for (uint32_t i = 0; i < rec.n_shadow_ties; i++) {
-            ties.push_back(rec.shadow_tie_set[i]);
-        }
-        out["shadow"] = json {
-            { "choice",  rec.shadow_choice },
-            { "tie_set", std::move(ties) },
-            { "tie_floor", json {
-                { "rel",    COMMON_CACHE_PLAN_TIE_REL_FLOOR },
-                { "abs_us", COMMON_CACHE_PLAN_TIE_ABS_FLOOR_US },
-            } },
-        };
-    } else {
-        out["shadow"] = common_cache_acct_known_name(llama_cache_acct_known::unavailable);
     }
     if (rec.sim_best_any_known) {
         out["sim_best_any"] = rec.sim_best_any;

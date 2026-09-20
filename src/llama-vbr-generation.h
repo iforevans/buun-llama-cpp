@@ -68,6 +68,8 @@ struct vbr_unit_generation {
     uint8_t             promote_hops     = 0;
     vbr_repr_transition last_transition  = vbr_repr_transition::initial;
     uint8_t             flags            = 0;
+    // Conservative precision of retained values, independent of container.
+    int32_t             effective_type   = -1;
 };
 
 enum class vbr_generation_stamp_kind : uint8_t {

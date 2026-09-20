@@ -1837,6 +1837,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    hadamard_rotations(params.hadamard_rotations),
+    hadamard_inverses (params.hadamard_inverses),
     tree_mask        (params.tree_mask),
     tree_parent_ids           (params.tree_parent_ids),
     tree_ssm_intermediates    (params.tree_ssm_intermediates),
@@ -1882,12 +1884,44 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+ggml_tensor * llm_graph_context::build_hadamard_input(ggml_tensor * w, ggml_tensor * cur) const {
+    if (!hadamard_rotations || hadamard_rotations->empty()) {
+        return cur;
+    }
+    const auto it = hadamard_rotations->find(w);
+    if (it == hadamard_rotations->end()) {
+        return cur;
+    }
+    const auto & t = it->second;
+    const hadamard_input_key key { cur, t.rot, t.signs, t.perm_hd, t.perm_nk, t.perm_rep };
+    const auto cached = hadamard_inputs.find(key);
+    if (cached != hadamard_inputs.end()) {
+        return cached->second;
+    }
+    if (t.perm_rep > 1) {
+        // Tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order.
+        cur = ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur);
+        const int64_t ne1 = cur->ne[1], ne2 = cur->ne[2], ne3 = cur->ne[3];
+        cur = ggml_reshape_4d(ctx0, cur, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
+        cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3));
+        cur = ggml_reshape_4d(ctx0, cur, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
+    }
+    if (t.signs) {
+        cur = ggml_mul(ctx0, cur, t.signs);
+    }
+    cur = llama_mul_mat_hadamard(ctx0, cur, t.rot);
+    hadamard_inputs.emplace(key, cur);
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s,
           ggml_tensor * in_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+
+    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
     if (in_s) {
         const bool fp8_scale = w->type == GGML_TYPE_F8_E4M3 &&
@@ -1965,7 +1999,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * w_in_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+
+    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur_mm, ids);
 
     if (ggml_type_is_exl3(w->type)) {
         // EXL3 experts: per-expert output scales (svh, F16 [n, n_expert]) and input signs
@@ -2818,6 +2854,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     return moe_out;
 }
 
+// Restore Hadamard-latent embedding rows to the primal basis after lookup.
+// Shared drafters also use this path, including their noise-token views.
+ggml_tensor * llm_graph_context::build_get_rows_embd(ggml_tensor * tok_embd, ggml_tensor * tokens) const {
+    ggml_tensor * cur = ggml_get_rows(ctx0, tok_embd, tokens);
+    if (hadamard_inverses) {
+        const auto it = hadamard_inverses->find(tok_embd);
+        if (it != hadamard_inverses->end()) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
+            if (it->second.signs) {
+                cur = ggml_mul(ctx0, cur, it->second.signs);
+            }
+        }
+    }
+    return cur;
+}
+
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
@@ -2844,7 +2896,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     {
         auto & cur = inps[0];
 
-        cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        cur = build_get_rows_embd(tok_embd, inp->tokens);
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {
@@ -4117,6 +4169,17 @@ ggml_tensor * llm_graph_context::build_rs_in(
         ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
         return ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1],
                             (size_t) kv_state->get_head() * states->nb[1]);
+    }
+
+    // With no reset or extra-state copies, nothing needs this gather before
+    // the recurrent consumer. Let graph traversal place it beside that op so
+    // a backend can combine the indexed read with the recurrence. Keep the
+    // ordinary schedule for multiple devices, host state and larger batches.
+    if (n_seqs == 1 && ubatch.n_tokens > 1 && ubatch.n_tokens <= 16 &&
+        kv_state->get_n_rs() == (uint32_t) n_seqs && kv_state->get_rs_z() == -1 &&
+        ggml_backend_sched_get_n_backends(sched) == 2 && cparams.offload_kqv &&
+        s->buffer != nullptr && !ggml_backend_buffer_is_host(s->buffer)) {
+        return ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, s, state_size, s->ne[1]), inp->s_copy_main);
     }
 
     return build_rs(inp, s, state_size, n_seqs);

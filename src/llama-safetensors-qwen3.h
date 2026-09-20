@@ -3,6 +3,7 @@
 #include "llama-safetensors-importer.h"
 #include "llama-safetensors-quant.h"
 #include "llama-safetensors.h"
+#include "llama-safetensors-tensor.h"
 
 #include <filesystem>
 #include <memory>
@@ -33,6 +34,8 @@ class llama_safetensors_qwen3_importer final : public llama_safetensors_importer
     void                 validate_complete() const override;
 
   private:
+    std::optional<llama_safetensors_source_name> map_source(const std::string & target_name) const;
+    llama_safetensors_tensor_binding map_tensor(const std::string & target_name) const;
     std::filesystem::path                             model_dir_;
     llama_safetensors_json                            config_;
     llama_safetensors_json                            text_config_;

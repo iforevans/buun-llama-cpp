@@ -31,7 +31,6 @@
 namespace {
 
 struct baked_representation_identity_cache_entry {
-    int32_t type = -1;
     bool value_side = false;
     int32_t meansub_model_id = -1;
     std::array<uint8_t, 32> digest = {};
@@ -93,6 +92,10 @@ const char * representation_override(
         int32_t type,
         bool value_side) {
     switch (type) {
+        case GGML_TYPE_TURBO2_0:
+            return std::getenv("TURBO_CB_T2");
+        case GGML_TYPE_TURBO3_0:
+            return std::getenv("TURBO_CB_T3");
         case GGML_TYPE_TURBO8_0:
             return std::getenv("TURBO_CB_T8");
         case GGML_TYPE_TURBO4_0:
@@ -140,7 +143,6 @@ std::array<uint8_t, 32> representation_rotation_identity(
 }
 
 std::array<uint8_t, 32> representation_meansub_identity(
-        int32_t type,
         bool value_side,
         int32_t meansub_model_id,
         const vbr_explicit_representation_policy & policy,
@@ -149,9 +151,11 @@ std::array<uint8_t, 32> representation_meansub_identity(
     baked = false;
     llama_sha256_writer writer;
     static constexpr char domain_label[] =
-        "buun.vbr.codec-meansub/v1";
+        "buun.vbr.mean-table/v2";
     writer.string(domain_label, sizeof(domain_label) - 1);
-    writer.u32(uint32_t(type));
+    // Mean compatibility is independent of the row codec. Codec id/version,
+    // codebook and rotation identities still authenticate each endpoint.
+    writer.u32(uint32_t(meansub_model_id));
     writer.u32(value_side);
 
     const char * disabled = std::getenv("TURBO_MEANSUB_OFF");
@@ -164,22 +168,21 @@ std::array<uint8_t, 32> representation_meansub_identity(
         value_side ? "TURBO_VMEAN_SUB" : "TURBO_KMEAN_SUB");
     if (path != nullptr && path[0] != '\0') {
         return representation_hash_file_or_marker(
-            "buun.vbr.codec-meansub-file/v1",
-            path, uint32_t(type), value_side, policy, ok);
+            "buun.vbr.mean-table-file/v2",
+            path, uint32_t(meansub_model_id), value_side, policy, ok);
     }
 
     // Built-in mean tables are immutable for the life of the process. Cache
     // their exact representation digest after checking the mutable environment
     // overrides above, so request-path import validation never re-hashes the
-    // full dense table. Keeping the final digest preserves the wire identity.
+    // full dense table.
     std::lock_guard<std::mutex> lock(
         g_baked_representation_identity_mutex);
     const auto cached = std::find_if(
         g_baked_representation_identity_cache.begin(),
         g_baked_representation_identity_cache.end(),
         [&](const baked_representation_identity_cache_entry & entry) {
-            return entry.type == type &&
-                   entry.value_side == value_side &&
+            return entry.value_side == value_side &&
                    entry.meansub_model_id == meansub_model_id;
         });
     if (cached != g_baked_representation_identity_cache.end()) {
@@ -215,7 +218,7 @@ std::array<uint8_t, 32> representation_meansub_identity(
         size_t(max_layers)*size_t(max_channels)*sizeof(float));
     const auto digest = writer.finish();
     g_baked_representation_identity_cache.push_back({
-        type, value_side, meansub_model_id, digest,
+        value_side, meansub_model_id, digest,
     });
     g_baked_representation_identity_hashes.fetch_add(
         1, std::memory_order_relaxed);
@@ -819,7 +822,9 @@ bool vbr_explicit_capture_representation_identity(
                 context);
         output = {};
         output.codec_id = uint32_t(current_type) + 1;
-        output.codec_version = 1;
+        // Version 2 separates mean-table compatibility from tier identity.
+        // Older captured representations must not be reinterpreted as v2.
+        output.codec_version = 2;
         bool ok = true;
         output.codebook_digest =
             representation_hash_file_or_marker(
@@ -831,7 +836,7 @@ bool vbr_explicit_capture_representation_identity(
                 current_type, value_side);
         output.meansub_digest =
             representation_meansub_identity(
-                current_type, value_side, meansub_model_id,
+                value_side, meansub_model_id,
                 policy, ok, output.meansub_baked);
         return ok;
     } catch (...) {
@@ -1072,6 +1077,7 @@ public:
                 descriptor.representation.source_loss_history;
             target.checkpoint_codec_hops =
                 descriptor.representation.checkpoint_codec_hops;
+            target.effective_type = descriptor.representation.effective_type;
             target.recoverability = descriptor.recoverability;
             target.side = descriptor.side;
             target.layout = descriptor.layout;
@@ -1376,15 +1382,18 @@ public:
         return attention_index == live.children.size();
     }
 
-    static bool negotiate_import_destination(
+    static bool project_import_destination(
             const std::vector<llama_memory_tree_child> & tree,
             const vbr_artifact_package_view & package,
-            vbr_import_schedule_quote & quote,
-            uint64_t selected_frontier) noexcept {
-        quote.destination_ = {};
+            vbr_import_destination_projection & output,
+            uint64_t selected_frontier,
+            uint64_t incoming_cells,
+            llama_seq_id destination) noexcept {
+        output = {};
         try {
             struct child_state {
                 llama_kv_cache * cache = nullptr;
+                uint32_t restore_watermark = 0;
                 vbr_import_destination_child input;
                 llama_kv_cache::vbr_import_destination_pricing pricing;
                 std::vector<llama_memory_vbr_physical_growth> physical;
@@ -1400,14 +1409,25 @@ public:
                 }
                 const uint64_t parent_wm = package.manifest().controller_policy[
                     tree_child.child_id].wm_cells;
-                const uint64_t wm = selected_frontier != 0
+                const uint64_t frontier = selected_frontier != 0
                     ? selected_frontier : parent_wm;
-                if (parent_wm == 0 || parent_wm > UINT32_MAX || wm == 0 ||
-                    wm > parent_wm || wm > UINT32_MAX) {
+                const uint64_t prefix_cells = selected_frontier != 0
+                    ? selected_frontier : package.manifest().token_block.tokens.size();
+                if (parent_wm == 0 || parent_wm > UINT32_MAX || frontier == 0 ||
+                    frontier > parent_wm || incoming_cells > UINT32_MAX || prefix_cells > UINT32_MAX) {
                     return false;
                 }
+                // Price the destination for the incoming request, not the
+                // artifact's precision or the maximum context. The copied
+                // prefix remains bounded independently by its saved frontier.
                 child_state state;
                 state.cache = tree_child.attention;
+                const uint32_t wm = state.cache->vbr_import_watermark_cells(
+                    uint32_t(std::max(prefix_cells, incoming_cells)), uint32_t(prefix_cells),
+                    0, destination);
+                state.restore_watermark = state.cache->vbr_import_watermark_cells(
+                    uint32_t(std::max(prefix_cells, incoming_cells)), uint32_t(prefix_cells),
+                    uint32_t(frontier), destination);
                 if (!state.cache->vbr_import_destination_input(
                         uint32_t(wm), state.input) ||
                     !state.cache->vbr_import_destination_pricing_begin(
@@ -1499,17 +1519,47 @@ public:
             for (const auto & child : children) {
                 inputs.push_back(child.input);
             }
-            quote.destination_ = vbr_select_import_destination(
+            output = vbr_select_import_destination(
                 inputs, &context, measure);
-            return (quote.destination_.feasible() &&
+            if (output.feasible() && std::any_of(children.begin(), children.end(),
+                    [](const child_state & child) { return child.restore_watermark != child.input.watermark_cells; })) {
+                // Source holes/provisional placement may require more backing,
+                // but must NEVER buy capacity by lowering the independently
+                // selected precision. Check the frozen vector; otherwise miss.
+                llama_memory_vbr_preflight_tree actual;
+                if (!actual.reset(children.size())) { return false; }
+                for (size_t i = 0; i < children.size(); ++i) {
+                    auto & child = children[i];
+                    const auto fit = child.cache->vbr_import_destination_preflight(
+                        output.final_types[i], child.restore_watermark, &child.physical);
+                    if (!fit.active || !actual.set_leaf(i, fit, child.physical)) { return false; }
+                }
+                if (!actual.build()) { return false; }
+                if (!actual.preflight().fits) {
+                    output.status = vbr_import_destination_status::exhausted;
+                    output.max_deficit = actual.preflight().max_deficit;
+                }
+            }
+            return (output.feasible() &&
                     vbr_import_destination_projection_coherent(
-                        inputs, quote.destination_)) ||
-                quote.destination_.status ==
+                        inputs, output)) ||
+                output.status ==
                     vbr_import_destination_status::exhausted;
         } catch (...) {
-            quote.destination_ = {};
+            output = {};
             return false;
         }
+    }
+
+    static bool negotiate_import_destination(
+            const std::vector<llama_memory_tree_child> & tree,
+            const vbr_artifact_package_view & package,
+            vbr_import_schedule_quote & quote,
+            uint64_t selected_frontier,
+            uint64_t incoming_cells,
+            llama_seq_id destination) noexcept {
+        return project_import_destination(tree, package, quote.destination_,
+            selected_frontier, incoming_cells, destination);
     }
 
     static bool capture_metadata(
@@ -1756,6 +1806,7 @@ public:
                     plan.generation.last_source_type, identity);
             descriptor.representation.source_loss_history =
                 plan.generation.promote_hops;
+            descriptor.representation.effective_type = plan.generation.effective_type;
             descriptor.side = plan.is_v
                 ? vbr_artifact_side::value : vbr_artifact_side::key;
             descriptor.n_stream = plan.n_stream;
@@ -2100,6 +2151,7 @@ public:
                 writer.u64(generation.publish_seq);
                 writer.u64(uint64_t(generation.current_type));
                 writer.u64(uint64_t(generation.last_source_type));
+                writer.u64(uint64_t(generation.effective_type));
                 writer.u64(uint64_t(generation.domain));
                 writer.u64(generation.promote_hops);
                 writer.u64(uint64_t(generation.last_transition));
@@ -2172,7 +2224,8 @@ static bool import_target_snapshot_core(
     const vbr_import_schedule_quote * authenticated_schedule,
     std::array<uint8_t, 32> * transform_tree_digest = nullptr,
     const std::vector<llama_memory_tree_child> * canonical_tree = nullptr,
-    uint64_t selected_frontier = 0)
+    uint64_t selected_frontier = 0,
+    uint64_t incoming_cells = 0)
     noexcept;
 
 
@@ -2218,8 +2271,13 @@ vbr_explicit_prepare_occupied_replacement_guard(
                 memory, destination, recovery, bindings, true,
                 accounting_serial, representation_context,
                 representation_identity, target,
-                nullptr, nullptr, &recovery_quote, nullptr, nullptr, &tree) ||
-            target.destination_sequence_absent) {
+                nullptr, nullptr, &recovery_quote, nullptr, nullptr, &tree)) {
+            // The tree is supported, but a stale recovery representation may
+            // no longer describe it after retiering. This is not permission
+            // to transform rollback bytes; the caller must capture it anew.
+            return vbr_occupied_replacement_guard_status::representation_mismatch;
+        }
+        if (target.destination_sequence_absent) {
             return vbr_occupied_replacement_guard_status::unsupported_tree;
         }
         if (external_companions) {
@@ -2924,7 +2982,7 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
             } else {
                 projected.token_block.tokens = manifest_request.token_block;
             }
-            projected.generation.version = 1;
+            projected.generation.version = 2;
             projected.generation.status =
                 vbr_checkpoint_generation_status::complete;
             bool dependencies_available = true;
@@ -3827,6 +3885,25 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
     }
 }
 
+bool vbr_explicit_import_destination_preflight(
+        llama_memory_i & memory,
+        llama_seq_id destination,
+        const vbr_artifact_package_view & package,
+        uint64_t selected_frontier,
+        uint64_t incoming_cells,
+        vbr_import_destination_projection & output) noexcept {
+    output = {};
+    try {
+        std::vector<llama_memory_tree_child> tree;
+        return destination >= 0 && package &&
+            llama_memory_tree_collect(&memory, tree) &&
+            vbr_live_capture_adapter::project_import_destination(
+                tree, package, output, selected_frontier, incoming_cells, destination);
+    } catch (...) {
+        return false;
+    }
+}
+
 uint64_t vbr_explicit_import_policy_epoch(
         llama_memory_i & memory) noexcept {
     try {
@@ -3916,7 +3993,8 @@ static bool import_target_snapshot_core(
         const vbr_import_schedule_quote * authenticated_schedule,
         std::array<uint8_t, 32> * transform_tree_digest,
         const std::vector<llama_memory_tree_child> * canonical_tree,
-        uint64_t selected_frontier) noexcept {
+        uint64_t selected_frontier,
+        uint64_t incoming_cells) noexcept {
     output = {};
     if (transform_projection) {
         *transform_projection = {};
@@ -4055,40 +4133,40 @@ static bool import_target_snapshot_core(
             }
             negotiated = authenticated_schedule;
         } else {
-            auto * destination = schedule_quote != nullptr
+            auto * quote = schedule_quote != nullptr
                 ? schedule_quote : &local_schedule;
-            if (!vbr_quote_import_schedule(output, package, *destination)) {
+            if (!vbr_quote_import_schedule(output, package, *quote)) {
                 output = {};
                 return false;
             }
             if (!vbr_live_capture_adapter::negotiate_import_destination(
-                    tree, package, *destination, selected_frontier)) {
+                    tree, package, *quote, selected_frontier, incoming_cells, destination)) {
                 output = {};
-                *destination = {};
+                *quote = {};
                 return false;
             }
-            if (!destination->destination().feasible()) {
+            if (!quote->destination().feasible()) {
                 // Exhausted negotiation is useful report evidence, but it is
                 // never an actionable import target.
                 return schedule_quote != nullptr;
             }
-            const auto & selected = destination->destination();
+            const auto & selected = quote->destination();
             if (!vbr_live_capture_adapter::apply_import_destination(
                     tree, package, selected,
                     representation_context, representation_identity,
                     representation_cache, output,
                     selected_projection)) {
                 output = {};
-                *destination = {};
+                *quote = {};
                 return false;
             }
             if (!vbr_rebind_import_schedule_quote(
-                    output, package, selected, *destination)) {
+                    output, package, selected, *quote)) {
                 output = {};
-                *destination = {};
+                *quote = {};
                 return false;
             }
-            negotiated = destination;
+            negotiated = quote;
         }
         const auto schedule_status = negotiated->status();
         const bool upward_actionable =
@@ -4150,7 +4228,8 @@ vbr_explicit_import_target_schedule_snapshot(
         vbr_downward_policy_projection & downward_projection,
         bool & downward_required,
         vbr_import_schedule_quote & schedule_quote,
-        uint64_t selected_frontier) noexcept {
+        uint64_t selected_frontier,
+        uint64_t incoming_cells) noexcept {
     downward_projection = {};
     vbr_downward_policy_projection transform_projection;
     if (!import_target_snapshot_core(
@@ -4158,7 +4237,7 @@ vbr_explicit_import_target_schedule_snapshot(
         accounting_serial, representation_context, representation_identity,
         output, &transform_projection,
             &downward_required, &schedule_quote, nullptr, nullptr, nullptr,
-            selected_frontier)) {
+            selected_frontier, incoming_cells)) {
         return vbr_import_target_snapshot_status::unavailable;
     }
     if (downward_required) {
@@ -4615,7 +4694,7 @@ vbr_explicit_capture_result vbr_prepare_explicit_manifest(
         package.manifest.token_block.tokens = std::move(request.token_block);
         package.manifest.identity_policy_order_digest =
             identity_policy_order_digest;
-        package.manifest.generation.version = 1;
+        package.manifest.generation.version = 2;
         package.manifest.generation.status =
             vbr_checkpoint_generation_status::complete;
         package.manifest.generation.identity_policy_order_digest =

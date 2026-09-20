@@ -28,16 +28,18 @@ static common_moe_cache_fit_shape_input shape(
 int main() {
     constexpr size_t MiB = 1024*1024;
 
-    expect(common_fit_extra_context_size(8192, 2, true, 0) == 4096,
-            "implicit MTP fit must follow target per-sequence context");
+    expect(common_fit_extra_context_size(8192, 2, true, 0) == 8192,
+            "implicit MTP fit must cover all target streams");
     expect(common_fit_extra_context_size(8192, 2, false, 0) == 8192,
             "ordinary draft fit must continue following total target context");
     expect(common_fit_extra_context_size(8192, 2, true, 6144) == 6144,
             "explicit draft context must remain fixed during fit");
     expect(common_fit_extra_context_size(8192, 0, true, 0) == 8192,
             "missing stream inventory must fail closed to one stream");
-    expect(common_fit_extra_context_size(513, 2, true, 0) == 512,
-            "implicit MTP fit must mirror target context padding before splitting");
+    expect(common_fit_extra_context_size(513, 2, true, 0) == 1024,
+            "implicit MTP fit must cover per-stream target padding");
+    expect(common_fit_extra_context_size(1025, 3, true, 0) == 1536,
+            "implicit MTP fit must mirror division before padding with odd stream counts");
     expect(common_fit_extra_context_size(513, 1, true, 0) == 768,
             "implicit unified MTP fit must mirror target context padding");
 
@@ -87,7 +89,7 @@ int main() {
         expect(result.success, "linked required and optional extras should aggregate");
         expect(result.measurement_counts == std::vector<size_t>({1, 2, 1, 2, 2}),
                 "fixed extras should cache while shared/borrowed/size-changing extras refresh and missing optional extras retire");
-        expect(result.aggregate_bytes_by_device == std::vector<size_t>({15474, 15586}),
+        expect(result.aggregate_bytes_by_device == std::vector<size_t>({27762, 27874}),
                 "linked extras should sum every device and host-style destination exactly once");
 
         llama_context_params required_cparams = llama_context_default_params();

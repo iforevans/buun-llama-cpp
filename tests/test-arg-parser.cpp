@@ -51,6 +51,16 @@ static void test(void) {
         assert(implicit.n_seq_max == 2);
         assert(implicit.kv_unified);
 
+        // Split target: two 16K streams need a 32K shared draft pool. Extra
+        // backup sequence IDs must not multiply that physical capacity.
+        for (uint32_t sequences : { 2u, 4u }) {
+            const auto shared = common_speculative_mtp_context_params_resolve(
+                32768, 0, sequences, false);
+            assert(shared.n_ctx == 32768);
+            assert(shared.n_seq_max == sequences);
+            assert(shared.kv_unified);
+        }
+
         const auto explicit_split = common_speculative_mtp_context_params_resolve(
             4096, 8192, 3, false);
         assert(explicit_split.n_ctx == 8192);

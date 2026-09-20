@@ -996,7 +996,7 @@ Same as the `/v1/embeddings` endpoint.
 ]
 ```
 
-### POST `/cache/plan`: Preview cache reuse and displacement
+### POST `/cache/plan`: Preview cache reuse
 
 This opt-in endpoint is enabled with `--cache-plan-preflight`. It is available
 only on a loopback/Unix-socket, single-model server with at most one configured
@@ -1006,13 +1006,22 @@ API key. The request accepts the native `prompt` form plus `id_slot`,
 The response is a point-in-time, read-only estimate. It is **not** a reservation
 or claim: `authoritative` is always `false`, `reservation` is always `none`, and
 `valid_until` is always `null`. Cache contents may change before the following
-completion. The preview models production mutability. In particular, with
-`--cache-debug` enabled but `--cache-lifecycle` disabled, its destruction view
-may intentionally differ from the more permissive debug shadow record.
+completion. The preview describes available cache candidates and the ordinary
+reuse policy; it does not project displacement, estimate latency, or select a
+calibrated execution path.
+The former static calibration tables and `--cache-plan-authority` have been removed.
+Normal retention, recovery protections, and checkpoint limits remain enabled.
+Positive prefix matches in the fixed-state host cache have no minimum token-count
+or source-coverage cutoff. They still go through normal candidate selection and
+state/checkpoint validation; a matching prefix alone does not guarantee reuse.
 
-`predicted_ttft_us` covers fitted cache-path work only, not tokenization,
-queueing, generation, or unrelated contention. The response exposes coarse
-reuse and destruction classes but no slot/source/artifact identifiers, digests,
+Preflight schema 2 uses `selection` instead of the old `planner` object. Debug
+`CACHE_PLAN` schema 10 likewise omits calibrated predictions and hypothetical
+destruction/authority receipts. Consumers should check `schema_version`; actual
+lifecycle protection events remain in the dedicated cache diagnostics.
+
+The response exposes coarse
+reuse classes but no slot/source/artifact identifiers, digests,
 accounting domains, serials, or lease identities. Every response carries
 `Cache-Control: no-store`, and request/response bodies are excluded from server
 request logs and `--log-prompts-dir` output.

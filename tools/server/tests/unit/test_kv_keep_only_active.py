@@ -26,6 +26,8 @@ def create_server():
     server.server_slots = True
     server.cache_ram = 100
     server.kv_unified = True
+    server.ctk = "f16"
+    server.ctv = "f16"
     server.debug = True
     fd, server.log_path = tempfile.mkstemp(suffix='.log')
     os.close(fd)
@@ -42,7 +44,8 @@ LONG_PROMPT = (
 
 
 # idle slot cleared on launch should restore from cache-ram
-def test_clear_and_restore():
+@pytest.mark.parametrize("pinned", [False, True])
+def test_clear_and_restore(pinned):
     global server
     server.start()
     log = LogReader(server.log_path)
@@ -74,6 +77,7 @@ def test_clear_and_restore():
     res = server.make_request("POST", "/completion", data={
         "prompt": LONG_PROMPT,
         "cache_prompt": True,
+        **({"id_slot": 0} if pinned else {}),
     })
     assert res.status_code == 200
     assert "updating prompt cache" in log.drain()

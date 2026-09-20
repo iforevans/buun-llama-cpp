@@ -2,29 +2,12 @@
 
 #include "llama-sha256.h"
 #include "llama-vbr-identity-digest.h"
+#include "llama-vbr-precision.h"
 
 #include <algorithm>
 #include <functional>
 #include <numeric>
 #include <utility>
-
-namespace {
-
-constexpr std::array<ggml_type, 6> TIERS = {
-    GGML_TYPE_F16,
-    GGML_TYPE_TURBO8_0,
-    GGML_TYPE_TURBO4_0,
-    GGML_TYPE_TURBO3_TCQ,
-    GGML_TYPE_TURBO2_TCQ,
-    GGML_TYPE_TURBO1_TCQ,
-};
-
-int tier_rank(ggml_type type) noexcept {
-    const auto it = std::find(TIERS.begin(), TIERS.end(), type);
-    return it == TIERS.end() ? -1 : int(it - TIERS.begin());
-}
-
-} // namespace
 
 vbr_repr_domain vbr_downward_tier_domain(ggml_type type) noexcept {
     return type == GGML_TYPE_F16 || type == GGML_TYPE_TURBO8_0
@@ -57,9 +40,9 @@ vbr_downward_recipe_status vbr_downward_resolve_recipe(
     if (!movable) {
         return vbr_downward_recipe_status::nonmovable;
     }
-    const int source = tier_rank(source_type);
-    const int target = tier_rank(target_type);
-    const int floor = tier_rank(floor_type);
+    const int source = vbr_precision_rank(source_type);
+    const int target = vbr_precision_rank(target_type);
+    const int floor = vbr_precision_rank(floor_type);
     if (source < 0 || target < 0 || floor < 0) {
         return vbr_downward_recipe_status::unsupported_type;
     }
@@ -73,8 +56,8 @@ vbr_downward_recipe_status vbr_downward_resolve_recipe(
         return vbr_downward_recipe_status::below_floor;
     }
     for (int i = source; i < target; ++i) {
-        const ggml_type a = TIERS[size_t(i)];
-        const ggml_type b = TIERS[size_t(i + 1)];
+        const ggml_type a = VBR_TURBO_PRECISION_LADDER[size_t(i)];
+        const ggml_type b = VBR_TURBO_PRECISION_LADDER[size_t(i + 1)];
         out.edges[out.n_edges++] = { a, b, vbr_downward_tier_domain(a), vbr_downward_tier_domain(b),
             vbr_downward_tier_domain(a) == vbr_repr_domain::tapped };
     }
@@ -729,8 +712,8 @@ vbr_downward_transform_status vbr_downward_execute_edges(
             // value with a valid type chain but lying capture_stash_before would
             // otherwise run tapped edges stashless through a permissive adapter.
             if ((i > 0 && recipe.edges[i - 1].target_type != edge.source_type) ||
-                tier_rank(edge.source_type) < 0 ||
-                tier_rank(edge.target_type) != tier_rank(edge.source_type) + 1 ||
+                vbr_precision_rank(edge.source_type) < 0 ||
+                vbr_precision_rank(edge.target_type) != vbr_precision_rank(edge.source_type) + 1 ||
                 edge.source_domain != vbr_downward_tier_domain(edge.source_type) ||
                 edge.target_domain != vbr_downward_tier_domain(edge.target_type) ||
                 edge.capture_stash_before !=

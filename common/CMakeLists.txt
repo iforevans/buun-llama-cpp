@@ -70,8 +70,6 @@ add_library(${TARGET}
     chat.h
     common-cache-plan.cpp
     common-cache-plan.h
-    common-cache-plan-estimate.cpp
-    common-cache-plan-estimate.h
     common-retention-sidecar.cpp
     common-retention-sidecar.h
     common.cpp
@@ -116,6 +114,8 @@ add_library(${TARGET}
     sampling.h
     speculative.cpp
     speculative.h
+    speculative-dflash-adaptive.h
+    speculative-mtp-adaptive.h
     subproc.cpp
     subproc.h
     suffix-tree.cpp
@@ -146,13 +146,8 @@ set_target_properties(${TARGET} PROPERTIES
 )
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
-# common-cache-plan-estimate.cpp hashes calibration identity file
-# CONTENT with the internal SHA-256 primitive and — deliberately — resolves schedule paths
-# through the SAME runtime resolver the VBR reader uses (llama-vbr-config.h), so identity
-# can never drift from behavior. That makes this TU depend on libllama at link time, which
-# libcommon already does. The retention codec and MTP derivative cache use only
-# the internal SHA-256 primitive and carry no process-local accounting handles.
-set_source_files_properties(common-cache-plan-estimate.cpp common-retention-sidecar.cpp mtp-vocab-trim.cpp
+# The retention codec and MTP derivative cache use the internal SHA-256 primitive.
+set_source_files_properties(common-retention-sidecar.cpp mtp-vocab-trim.cpp
     PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
 set_source_files_properties(arg.cpp fit.cpp
     PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)

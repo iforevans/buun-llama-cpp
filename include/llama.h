@@ -159,6 +159,9 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_F8_E4M3       = 42, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4         = 43, // except 1d tensors
 
+        LLAMA_FTYPE_MOSTLY_PQ2_0 = 141,
+        LLAMA_FTYPE_MOSTLY_PQ2_0_LEGACY = 142,
+        LLAMA_FTYPE_MOSTLY_PTQ1_0 = 143,
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
 
@@ -1339,6 +1342,10 @@ extern "C" {
 
     // DFlash: set top-K for drafter (1 = argmax, >1 = top-K candidates per position)
     LLAMA_API void llama_set_dflash_topk(struct llama_context * ctx, int k);
+    // Runtime DFlash2 proposal width: [3, configured model block size], or zero
+    // to restore the model default. Does not change the model or reserved
+    // maximum capacity. Call between decodes.
+    LLAMA_API void llama_set_dflash_block_size(struct llama_context * ctx, int n);
 
     // Upstream block-diffusion drafter (arch "dflash"): build the in-graph top-K/argmax
     // tail on the drafter's decode graph. When enabled, the full-vocab logits transfer

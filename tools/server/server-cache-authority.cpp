@@ -6,7 +6,7 @@
 
 #include <algorithm>
 #include <array>
-#include <cmath>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <tuple>
@@ -215,169 +215,29 @@ bool execute_shared_payload_claims(
 
 } // namespace
 
-bool server_cache_weighted_price_us(
-        long double base_us,
-        uint32_t weight_milli,
-        uint64_t & out) noexcept {
-    out = 0;
-    const long double weighted = base_us * weight_milli /
-        SERVER_CACHE_HOST_WEIGHT_SCALE;
-    if (!std::isfinite((double) weighted) || weighted < 0.0L ||
-        weighted > (long double) std::numeric_limits<long long>::max()) {
+bool server_cache_checkpoint_publication_redundant(
+        const std::list<common_prompt_checkpoint> & checkpoints,
+        const common_prompt_checkpoint & incoming,
+        int checkpoint_task_id,
+        uint64_t max_replay_tokens) noexcept {
+    if (checkpoints.size() < 2 ||
+        !server_cache_checkpoint_bounded_replay(
+            checkpoints.back(), incoming, max_replay_tokens)) {
         return false;
     }
-    out = uint64_t(std::llround(weighted));
-    return true;
-}
-
-bool server_cache_retention_weight_milli(
-        bool soft_leased,
-        bool main_family,
-        uint32_t additional_weight_milli,
-        uint32_t & weight_milli) noexcept {
-    weight_milli = SERVER_CACHE_HOST_WEIGHT_SCALE;
-    return (!soft_leased || server_cache_multiply_retention_weight(
-                weight_milli, SERVER_CACHE_HOST_SOFT_LEASE_WEIGHT)) &&
-           (!main_family || server_cache_multiply_retention_weight(
-                weight_milli, SERVER_CACHE_HOST_MAIN_FAMILY_WEIGHT)) &&
-           server_cache_multiply_retention_weight(
-                weight_milli, additional_weight_milli);
-}
-
-bool server_cache_host_retention_price_us(
-        const common_cache_plan_calib & calib,
-        uint64_t bytes,
-        bool soft_leased,
-        bool main_family,
-        uint32_t & weight_milli,
-        uint64_t & price_us,
-        uint32_t additional_weight_milli) noexcept {
-    price_us = 0;
-    if (!server_cache_retention_weight_milli(
-            soft_leased, main_family, additional_weight_milli,
-            weight_milli)) {
-        return false;
-    }
-    double restore_us = 0.0;
-    double workspace_us = 0.0;
-    return common_cache_plan_restore_us(
-               calib, bytes, restore_us, workspace_us) &&
-           server_cache_weighted_price_us(
-               (long double) restore_us + workspace_us,
-               weight_milli, price_us);
-}
-
-server_cache_checkpoint_trade_plan server_cache_plan_checkpoint_thinning(
-        const std::vector<server_cache_checkpoint_trade_input> & candidates,
-        const common_cache_plan_calib * calib) noexcept {
-    server_cache_checkpoint_trade_plan out;
-    if (!calib || !std::isfinite(calib->replay_us_per_token) ||
-        calib->replay_us_per_token < 0.0) {
-        out.reason = common_cache_plan_destruction_reason::profile_unfitted;
-        return out;
-    }
-    common_cache_plan_destruction_reason refusal =
-        common_cache_plan_destruction_reason::recovery_unavailable;
-    server_cache_checkpoint_protection protection =
-        server_cache_checkpoint_protection::none;
-    try {
-        for (const auto & candidate : candidates) {
-            if (candidate.artifact.v == 0 || !candidate.identity_known ||
-                candidate.payload_bytes == 0 ||
-                candidate.weight_milli == 0) {
-                refusal =
-                    common_cache_plan_destruction_reason::manifest_incomplete;
-                continue;
-            }
-            if (candidate.seam_heuristic_protected ||
-                candidate.mandatory_anchor) {
-                refusal =
-                    common_cache_plan_destruction_reason::mandatory_anchor;
-                if (candidate.seam_heuristic_protected) {
-                    protection =
-                        server_cache_checkpoint_protection::seam_heuristic;
-                } else if (protection !=
-                        server_cache_checkpoint_protection::seam_heuristic) {
-                    protection =
-                        server_cache_checkpoint_protection::mandatory_anchor;
-                }
-                continue;
-            }
-            if (candidate.hard_leased) {
-                refusal =
-                    common_cache_plan_destruction_reason::hard_lease_blocked;
-                if (protection ==
-                        server_cache_checkpoint_protection::none) {
-                    protection =
-                        server_cache_checkpoint_protection::hard_lease;
-                }
-                continue;
-            }
-            if (!candidate.recovery_available ||
-                candidate.recovery_ordinal == UINT32_MAX) {
-                refusal =
-                    common_cache_plan_destruction_reason::recovery_unavailable;
-                continue;
-            }
-            double restore_us = 0.0;
-            double workspace_us = 0.0;
-            if (!common_cache_plan_restore_us(
-                    *calib, candidate.payload_bytes,
-                    restore_us, workspace_us)) {
-                refusal =
-                    common_cache_plan_destruction_reason::capacity_refused;
-                continue;
-            }
-            const long double replay_us =
-                (long double) candidate.replay_tokens *
-                calib->replay_us_per_token;
-            const long double base = replay_us + restore_us + workspace_us;
-            uint64_t price = 0;
-            if (!server_cache_weighted_price_us(
-                    base, candidate.weight_milli, price)) {
-                refusal =
-                    common_cache_plan_destruction_reason::capacity_refused;
-                continue;
-            }
-            const auto key = std::make_tuple(
-                price, candidate.stable_id, candidate.ordinal);
-            const auto best = std::make_tuple(
-                out.price_us, out.stable_id, out.ordinal);
-            if (!out.selected || key < best) {
-                out.selected = true;
-                out.ordinal = candidate.ordinal;
-                out.recovery_ordinal = candidate.recovery_ordinal;
-                out.price_us = price;
-                out.stable_id = candidate.stable_id;
-                out.weight_milli = candidate.weight_milli;
-                out.protection =
-                    server_cache_checkpoint_protection::none;
-                out.reason = common_cache_plan_destruction_reason::none;
-            }
+    // Preserve the former unfitted-profile publication policy: a close,
+    // non-current-task incumbent must exist before suppressing an incoming
+    // checkpoint. No incumbent is destroyed or priced.
+    auto previous = checkpoints.begin();
+    for (auto it = std::next(previous); it != checkpoints.end(); ++it) {
+        const bool close = it->n_tokens >= previous->n_tokens &&
+            uint64_t(it->n_tokens - previous->n_tokens) <= max_replay_tokens;
+        if (close && it->id_task != checkpoint_task_id) {
+            return true;
         }
-    } catch (...) {
-        out = {};
-        out.reason = common_cache_plan_destruction_reason::internal_fault;
+        previous = it;
     }
-    if (!out.selected) {
-        out.protection = protection;
-        out.reason = refusal;
-        switch (protection) {
-            case server_cache_checkpoint_protection::seam_heuristic:
-            case server_cache_checkpoint_protection::mandatory_anchor:
-                out.reason =
-                    common_cache_plan_destruction_reason::mandatory_anchor;
-                break;
-            case server_cache_checkpoint_protection::hard_lease:
-                out.reason =
-                    common_cache_plan_destruction_reason::hard_lease_blocked;
-                break;
-            case server_cache_checkpoint_protection::none:
-            case server_cache_checkpoint_protection::_count:
-                break;
-        }
-    }
-    return out;
+    return false;
 }
 
 bool server_cache_checkpoint_bounded_replay(

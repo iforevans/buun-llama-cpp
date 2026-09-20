@@ -61,6 +61,13 @@ nonzero temperature, `top_k` from 1 to 64, and `--spec-draft-p-min 0` (the defau
 It uses the same runtime for embedded GGUF MTP, native safetensors MTP, and MTP
 sidecars, and works with adaptive draft depth. No additional flag is needed.
 
+For a single recursive MTP head with a separate draft cache and the default
+maximum of three draft tokens, depth adapts between two and three. Low acceptance
+reduces depth; improved acceptance or a periodic probe can raise it again, including
+when an answer transitions from prose to code. Slots adapt independently and keep
+their learned depth across requests, with recovery re-armed at each new request.
+This does not increase the configured maximum or reserve additional KV capacity.
+
 Greedy requests, positive draft-confidence thresholds, Mirostat/adaptive-p,
 and shared-cache or chained-head MTP retain the existing drafting path. The
 probability-aware path preserves the target sampling distribution, not the exact
@@ -112,6 +119,12 @@ PLE convolution histories are included in partial rollback. For byte-for-byte
 speculative/non-speculative comparisons, also pass `--ctx-checkpoints 0` so server
 prompt-checkpoint recomputation does not introduce an independent numerical change.
 
+CopySpec can also be combined with MTP using `--spec-type draft-mtp,copyspec`.
+Both use the same per-sequence lifecycle, including with multiple server slots.
+Copied suffixes do not count as MTP predictions when adjusting adaptive depth;
+MTP's sampled proposal probabilities still apply to its own prefix. CopySpec is
+explicit rather than automatic, since its benefit depends on input repetition.
+
 ### DFlash (`draft-dflash`)
 
 DFlash produces an entire block of draft tokens in a single forward pass (block diffusion) and
@@ -137,7 +150,7 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 #### DFlash2
 
 DFlash2 sidecars use the shared `draft-dflash` runtime. Their learned grouped
-convolutions and candidate selector are detected from GGUF metadata. Every
+convolutions and candidate selector are detected from model metadata. Every
 backbone position and the selector's complete adjacent-candidate score lattice
 run in parallel; only the final path walk is sequential. At nonzero temperature,
 the selector also supplies its proposal probabilities to exact p/q speculative
@@ -151,11 +164,27 @@ llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2-Q8_0.gguf \
     -fa on --jinja
 ```
 
+Qwen `DFlash2DraftModel` safetensors directories can also be passed directly to
+`-md`, including `r0b0tlab/Qwen3.8-27B-DFlash2-EXL3-4.00bpw`. No GGUF conversion or
+tokenizer copy is needed: the sidecar consumes target token IDs and shares the
+target's embedding/output tensors when they are absent from the sidecar. The
+target may itself be GGUF or a supported safetensors directory. For example,
+after downloading both repositories:
+
+```bash
+llama-server -m /models/Qwen3.8-27B-EXL3-4.00bpw \
+    -md /models/Qwen3.8-27B-DFlash2-EXL3-4.00bpw -ngl 99 -ngld 99 -fa on
+```
+
+This native sidecar support currently covers the Qwen NeoX-RoPE backbone; it
+does not imply support for Gemma DFlash or arbitrary draft architectures.
+
 The server detects DFlash2 from the sidecar, so `-md` does not require an
-explicit `--spec-type`. Unless `--spec-draft-n-max` is supplied, it also selects
-the sidecar's fastest measured full draft depth. The released Qwen3.8 sidecar
+explicit `--spec-type`. Unless `--spec-draft-n-max` is supplied, it permits
+adaptive depth up to the configured block size minus one. The released Qwen3.8 sidecar
 advertises an eight-position block; the runtime defaults that geometry to the
-faster measured `anchor + 12` block. `--spec-dflash-default` remains a compatible
+`anchor + 12` block tuned on GGUF drafters. The fastest width depends on the
+drafter quantization, workload, and hardware. `--spec-dflash-default` remains a compatible
 spelling. Set
 `GGML_DFLASH2_BLOCK_SIZE_OVERRIDE=8` to restore the checkpoint metadata, or use
 another value from 3 through 64 for experimentation:
@@ -172,8 +201,14 @@ server slot, and batches armed slots into one drafter decode. The legacy
 supported; the sidecar itself falls back to layer placement and can be pinned
 with `--spec-draft-device`. Adaptive depth is enabled by default; set
 `GGML_DFLASH_DRAFT_ADAPTIVE=0` to hold every cycle at the configured maximum.
+The adaptive controller measures intermediate verification depths, including
+seven and two proposals when the configured limits permit them. With one slot,
+it also shrinks the drafter's proposal block to match; multi-slot drafting keeps
+the shared block geometry while adapting each slot's verification depth. Timing
+calibration can be reused within a context-depth band, but acceptance history
+and depth decisions reset with each request.
 By default, DFlash2 matches the server's resolved main sampling temperature
-(the target GGUF default, or an explicit `--temp`). Use `--spec-draft-temp T`
+(the target model default, or an explicit `--temp`). Use `--spec-draft-temp T`
 to override it; an explicit value of `0` keeps greedy draft proposals. Legacy
 DFlash sidecars retain their greedy default.
 

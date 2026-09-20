@@ -2,11 +2,13 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "gguf.h"
 
 #undef NDEBUG
 #include <assert.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <math.h>
 #include <stdio.h>
 #include <string>
@@ -236,6 +238,7 @@ static int test_vec_dot_q(bool verbose) {
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_0_G128 ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                type == GGML_TYPE_PTQ1_0 ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
@@ -261,7 +264,7 @@ static int test_vec_dot_q(bool verbose) {
                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
                 : type == GGML_TYPE_Q1_0
                 ? MAX_DOT_PRODUCT_ERROR_BINARY
-                : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_0_G128
+                : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_0_G128 || type == GGML_TYPE_PTQ1_0
                 ? MAX_DOT_PRODUCT_ERROR_TERNARY
                 : type == GGML_TYPE_NVFP4
                 ? MAX_DOT_PRODUCT_ERROR_FP4
@@ -287,6 +290,42 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
+static void test_bonsai_codecs() {
+    constexpr int width = 384, rows = 3, count = width * rows;
+    std::vector<float> input(count), pq(count), ptq(count);
+    for (int i = 0; i < count; ++i) {
+        input[i] = (i / 128) * 0.125f * ((i * 17 % 3) - 1);
+    }
+    for (const auto type : {GGML_TYPE_Q2_0_G128, GGML_TYPE_PTQ1_0}) {
+        std::vector<uint8_t> packed(ggml_row_size(type, width) * rows);
+        const size_t written = ggml_quantize_chunk(type, input.data(), packed.data(), 0, rows, width, nullptr);
+        assert(written == packed.size());
+        assert(ggml_validate_row_data(type, packed.data(), packed.size()));
+        auto & output = type == GGML_TYPE_PTQ1_0 ? ptq : pq;
+        ggml_get_type_traits(type)->to_float(packed.data(), output.data(), count);
+        assert(output == input);
+
+        ggml_context * ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
+        assert(ctx);
+        ggml_tensor * tensor = ggml_new_tensor_1d(ctx, type, width);
+        ggml_set_name(tensor, "bonsai");
+        gguf_context * file = gguf_init_empty();
+        gguf_add_tensor(file, tensor);
+        std::vector<uint8_t> metadata(gguf_get_meta_size(file));
+        gguf_get_meta_data(file, metadata.data());
+        // Header, tensor name length/name, dimension count and one dimension.
+        uint32_t wire_type = 0;
+        memcpy(&wire_type, metadata.data() + 24 + 8 + strlen("bonsai") + 4 + 8, sizeof(wire_type));
+        assert(wire_type == (type == GGML_TYPE_PTQ1_0 ? 143u : 142u));
+        gguf_context * restored = gguf_init_from_buffer(metadata.data(), metadata.size(), {true, nullptr});
+        assert(restored && gguf_get_tensor_type(restored, 0) == type);
+        gguf_free(restored);
+        gguf_free(file);
+        ggml_free(ctx);
+    }
+    assert(pq == ptq);
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -303,6 +342,7 @@ int main(int argc, char * argv[]) {
     }
 
     ggml_cpu_init();
+    test_bonsai_codecs();
 
     int num_failed = 0;
 

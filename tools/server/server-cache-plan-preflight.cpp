@@ -26,23 +26,6 @@ const char * preflight_status_name(
     return "invalid";
 }
 
-const char * expected_path_name(
-        server_cache_plan_preflight_expected_path path) noexcept {
-    switch (path) {
-        case server_cache_plan_preflight_expected_path::legacy:
-            return "legacy";
-        case server_cache_plan_preflight_expected_path::
-                 planner_if_still_current:
-            return "planner_if_still_current";
-        case server_cache_plan_preflight_expected_path::
-                 conditional_on_destruction_certification:
-            return "conditional_on_destruction_certification";
-        case server_cache_plan_preflight_expected_path::_count:
-            break;
-    }
-    return "invalid";
-}
-
 const char * target_relation_name(
         server_cache_plan_preflight_target_relation relation) noexcept {
     switch (relation) {
@@ -52,8 +35,6 @@ const char * target_relation_name(
             return "forced_slot";
         case server_cache_plan_preflight_target_relation::same_as_legacy:
             return "same_as_legacy";
-        case server_cache_plan_preflight_target_relation::retarget:
-            return "retarget";
         case server_cache_plan_preflight_target_relation::_count:
             break;
     }
@@ -71,75 +52,6 @@ const char * cache_hit_name(
         case server_cache_plan_preflight_cache_hit::_count:  break;
     }
     return "invalid";
-}
-
-const char * assessment_name(
-        common_cache_plan_destruction_state state) noexcept {
-    switch (state) {
-        case common_cache_plan_destruction_state::not_required:
-            return "not_required";
-        case common_cache_plan_destruction_state::quoted:
-            return "eligible_at_snapshot";
-        case common_cache_plan_destruction_state::refused:
-            return "blocked";
-        case common_cache_plan_destruction_state::failed:
-            return "unavailable";
-        case common_cache_plan_destruction_state::certified:
-        case common_cache_plan_destruction_state::executed:
-        case common_cache_plan_destruction_state::_count:
-            break;
-    }
-    // A read-only preview cannot produce certified/executed.
-    return "unavailable";
-}
-
-const char * protection_name(
-        common_cache_plan_destruction_lease_verdict verdict) noexcept {
-    switch (verdict) {
-        case common_cache_plan_destruction_lease_verdict::unleased:
-            return "none";
-        case common_cache_plan_destruction_lease_verdict::soft_leased:
-            return "weighted";
-        case common_cache_plan_destruction_lease_verdict::hard_leased:
-        case common_cache_plan_destruction_lease_verdict::mandatory_recovery:
-            return "hard";
-        case common_cache_plan_destruction_lease_verdict::unavailable:
-            return "unavailable";
-        case common_cache_plan_destruction_lease_verdict::_count:
-            break;
-    }
-    return "unavailable";
-}
-
-json public_cost_term(const llama_cache_acct_cost_term & term) {
-    const char * quantity = common_cache_acct_unit_name(term.raw_unit);
-    return json {
-        { quantity, public_value(term.raw) },
-        { "estimated_us", public_value(term.estimated_us) },
-    };
-}
-
-json public_effects(common_cache_plan_destruction_effect_set effects) {
-    json out = json::array();
-    for (uint8_t raw =
-             uint8_t(common_cache_plan_destruction_effect::none) + 1;
-         raw < uint8_t(common_cache_plan_destruction_effect::_count);
-         ++raw) {
-        const auto effect = common_cache_plan_destruction_effect(raw);
-        if (!common_cache_plan_destruction_effect_has(effects, effect)) {
-            continue;
-        }
-        out.push_back({
-            { "effect", common_cache_plan_destruction_effect_name(effect) },
-            { "action_class", common_cache_plan_destruction_class_name(
-                  common_cache_plan_destruction_class_for_effect(effect)) },
-            { "physical_reason",
-              common_cache_plan_destruction_physical_reason_name(
-                  common_cache_plan_destruction_physical_reason_for_effect(
-                      effect)) },
-        });
-    }
-    return out;
 }
 
 } // namespace
@@ -175,177 +87,61 @@ server_cache_plan_preflight_semantics server_cache_plan_preflight_semantics_for(
     out.completion_semantics = is_preflight || native_completion;
     out.host_lookup_enabled = update_cache && prompt_cache_available &&
                               out.completion_semantics && adapter_matches;
-    out.recovery_citation = prompt_cache_available && out.completion_semantics
-        ? common_cache_plan_recovery_citation::prospective
-        : common_cache_plan_recovery_citation::unavailable;
     return out;
-}
-
-static bool tier_enabled(const common_cache_plan_record & rec) noexcept {
-    const auto decision = server_cache_plan_level_of(rec.selection);
-    return decision != common_cache_plan_authority_level::off &&
-           decision != common_cache_plan_authority_level::_count &&
-           server_cache_plan_level_enabled(
-               rec.authority.configured_level, decision);
-}
-
-server_cache_plan_preflight_expected_path
-server_cache_plan_preflight_derive_expected_path(
-        const common_cache_plan_record & rec,
-        bool planner_inputs_current) noexcept {
-    if (!planner_inputs_current ||
-        rec.planner_status != common_cache_plan_planner_status::ok ||
-        !server_cache_plan_shadow_choice_valid(rec)) {
-        return server_cache_plan_preflight_expected_path::legacy;
-    }
-    if (!tier_enabled(rec)) {
-        return server_cache_plan_preflight_expected_path::legacy;
-    }
-    if (rec.destruction.plan_candidate == rec.shadow_choice &&
-        rec.destruction.effects != 0 &&
-        rec.destruction.state ==
-            common_cache_plan_destruction_state::quoted) {
-        return server_cache_plan_preflight_expected_path::
-            conditional_on_destruction_certification;
-    }
-    if (rec.destruction.plan_candidate == rec.shadow_choice &&
-        rec.destruction.effects != 0) {
-        return server_cache_plan_preflight_expected_path::legacy;
-    }
-    return server_cache_plan_preflight_expected_path::
-        planner_if_still_current;
-}
-
-static llama_cache_acct_value term_raw(
-        const common_cache_plan_candidate & candidate,
-        llama_cache_acct_cost_kind kind) noexcept {
-    return candidate.cost_terms[size_t(kind)].raw;
 }
 
 bool server_cache_plan_preflight_build_view(
         const common_cache_plan_record & rec,
         int32_t legacy_target_slot_id,
-        bool planner_inputs_current,
         server_cache_plan_preflight_view & out) noexcept {
     try {
         out = {};
         out.status = server_cache_plan_preflight_status::ok;
-        out.planner_status = rec.planner_status;
-        out.configured_level = rec.authority.configured_level;
         out.selection_tier = rec.selection;
-        out.fallback_reason = rec.authority.fallback_reason;
-        if (rec.planner_status == common_cache_plan_planner_status::ok &&
-            !planner_inputs_current) {
-            out.fallback_reason =
-                common_cache_plan_authority_fallback::stale_capability;
-        } else if (rec.planner_status ==
-                       common_cache_plan_planner_status::ok &&
-                   !tier_enabled(rec)) {
-            out.fallback_reason =
-                common_cache_plan_authority_fallback::tier_not_enabled;
-        }
         out.prompt_tokens = rec.n_prompt_tokens;
-        out.expected_path = server_cache_plan_preflight_derive_expected_path(
-            rec, planner_inputs_current);
-
         for (uint32_t i = 0; i < rec.n_inventory; ++i) {
             const auto & candidate = rec.inventory[i];
-            if (candidate.reason == COMMON_CACHE_PLAN_REASON_NONE) {
-                continue;
-            }
-            auto found = std::find_if(
-                out.miss_reasons.begin(), out.miss_reasons.end(),
+            if (candidate.reason == COMMON_CACHE_PLAN_REASON_NONE) continue;
+            auto found = std::find_if(out.miss_reasons.begin(), out.miss_reasons.end(),
                 [&](const auto & row) {
-                    return row.provider == candidate.provider &&
-                           row.reason == candidate.reason;
+                    return row.provider == candidate.provider && row.reason == candidate.reason;
                 });
             if (found == out.miss_reasons.end()) {
-                out.miss_reasons.push_back({
-                    candidate.provider, candidate.reason, 1,
-                });
+                out.miss_reasons.push_back({ candidate.provider, candidate.reason, 1 });
             } else {
                 found->count++;
             }
         }
-
-        if (rec.planner_status != common_cache_plan_planner_status::ok ||
-            !server_cache_plan_shadow_choice_valid(rec)) {
-            return true;
-        }
-        const auto & selected = rec.inventory[size_t(rec.shadow_choice)];
+        // The inventory builder records the shipped selector's snapshot choice.
+        // Do not substitute a hypothetical optimum or infer a missing provider.
+        const int32_t chosen = rec.destruction_legacy_plan_candidate;
+        if (rec.inventory_saturated() || chosen < 0 || uint32_t(chosen) >= rec.n_inventory) return true;
+        const auto & selected = rec.inventory[size_t(chosen)];
+        if (!selected.viable() || selected.target_slot_id != legacy_target_slot_id) return true;
         out.provider = selected.provider;
         out.provider_available = true;
         out.target_relation = rec.selection == common_cache_plan_selection::by_id
             ? server_cache_plan_preflight_target_relation::forced_slot
-            : (selected.target_slot_id == legacy_target_slot_id
-                ? server_cache_plan_preflight_target_relation::same_as_legacy
-                : server_cache_plan_preflight_target_relation::retarget);
-        out.cost_terms = selected.cost_terms;
-        for (const auto & term : selected.cost_terms) {
-            if (term.estimated_us.state == llama_cache_acct_known::known) {
-                out.estimator_version = term.estimator_version;
-                break;
-            }
-        }
-        out.predicted_replay_tokens = term_raw(
-            selected, llama_cache_acct_cost_kind::replay);
-        out.predicted_restore_bytes = term_raw(
-            selected, llama_cache_acct_cost_kind::restore);
-        out.predicted_ttft_us = selected.predicted_total_us;
+            : server_cache_plan_preflight_target_relation::same_as_legacy;
+        out.reuse_tokens = selected.provider == common_cache_plan_provider::cold_replay
+            ? llama_cache_acct_value::measured(0) : selected.lcp_tokens;
         if (out.prompt_tokens.state == llama_cache_acct_known::known &&
-            out.predicted_replay_tokens.state ==
-                llama_cache_acct_known::known &&
-            out.predicted_replay_tokens.value <= out.prompt_tokens.value) {
-            out.predicted_reuse_tokens = llama_cache_acct_value::measured(
-                out.prompt_tokens.value - out.predicted_replay_tokens.value);
+            out.reuse_tokens.state == llama_cache_acct_known::known &&
+            out.reuse_tokens.value <= out.prompt_tokens.value) {
+            out.replay_tokens = llama_cache_acct_value::measured(
+                out.prompt_tokens.value - out.reuse_tokens.value);
+            out.cache_hit = out.reuse_tokens.value == 0
+                ? server_cache_plan_preflight_cache_hit::miss
+                : out.replay_tokens.value == 0
+                    ? server_cache_plan_preflight_cache_hit::full
+                    : server_cache_plan_preflight_cache_hit::partial;
         }
-        if (selected.provider == common_cache_plan_provider::cold_replay) {
-            out.cache_hit = server_cache_plan_preflight_cache_hit::miss;
-        } else if (out.predicted_replay_tokens.state ==
-                       llama_cache_acct_known::known) {
-            out.cache_hit = out.predicted_replay_tokens.value == 0
-                ? server_cache_plan_preflight_cache_hit::full
-                : server_cache_plan_preflight_cache_hit::partial;
-        }
-
-        if (rec.destruction.plan_candidate == rec.shadow_choice ||
-            rec.destruction.state ==
-                common_cache_plan_destruction_state::not_required) {
-            out.destruction.state = rec.destruction.state;
-            out.destruction.reason = rec.destruction.reason;
-            out.destruction.effects = rec.destruction.effects;
-            out.destruction.protection = rec.destruction.lease_verdict;
-            out.destruction.displaced_fate = rec.destruction.displaced_fate;
-            out.destruction.recovery = rec.destruction.recovery_citation;
-            uint64_t projected = 0;
-            const auto quote = std::find_if(
-                rec.destruction_quotes.begin(), rec.destruction_quotes.end(),
-                [&](const auto & candidate) {
-                    return candidate.receipt.plan_candidate == rec.shadow_choice;
-                });
-            if (quote != rec.destruction_quotes.end() &&
-                common_cache_plan_projected_release_bytes(
-                    quote->projected_domains, projected)) {
-                out.destruction.projected_release_bytes =
-                    llama_cache_acct_value::measured(projected);
-            }
-            out.destruction.estimated_destruction_us =
-                selected.cost_terms[size_t(
-                    llama_cache_acct_cost_kind::eviction)].estimated_us;
-        } else {
-            // A receipt for another candidate says nothing about the selected
-            // union. Report that evidence gap instead of implying the selected
-            // candidate carried a malformed manifest.
-            out.destruction.state =
-                common_cache_plan_destruction_state::failed;
-            out.destruction.reason =
-                common_cache_plan_destruction_reason::
-                    release_evidence_unavailable;
-        }
+        out.restore_bytes = selected.provider == common_cache_plan_provider::cold_replay ||
+                            selected.provider == common_cache_plan_provider::live_slot
+            ? llama_cache_acct_value::measured(0) : selected.payload_bytes;
         return true;
     } catch (...) {
         out = {};
-        out.status = server_cache_plan_preflight_status::internal_fault;
         return false;
     }
 }
@@ -361,84 +157,35 @@ json server_cache_plan_preflight_json(
         });
     }
 
-    const auto & terms = view.cost_terms;
-    json planner = {
-        { "status", common_cache_plan_planner_status_name(
-              view.planner_status) },
-        { "configured_level", common_cache_plan_authority_level_name(
-              view.configured_level) },
-        { "selection_tier", common_cache_plan_selection_name(
-              view.selection_tier) },
-        { "expected_path", expected_path_name(view.expected_path) },
-        { "fallback_reason", common_cache_plan_authority_fallback_name(
-              view.fallback_reason) },
+    json selection = {
+        { "selection_tier", common_cache_plan_selection_name(view.selection_tier) },
         { "provider", view.provider_available
-              ? json(common_cache_plan_provider_name(view.provider))
-              : json(nullptr) },
+              ? json(common_cache_plan_provider_name(view.provider)) : json(nullptr) },
         { "target_relation", view.target_relation ==
                   server_cache_plan_preflight_target_relation::unavailable
-              ? json(nullptr)
-              : json(target_relation_name(view.target_relation)) },
-        { "cache_hit", view.cache_hit ==
-                  server_cache_plan_preflight_cache_hit::unavailable
+              ? json(nullptr) : json(target_relation_name(view.target_relation)) },
+        { "cache_hit", view.cache_hit == server_cache_plan_preflight_cache_hit::unavailable
               ? json(nullptr) : json(cache_hit_name(view.cache_hit)) },
         { "prompt_tokens", public_value(view.prompt_tokens) },
-        { "predicted_reuse_tokens",
-          public_value(view.predicted_reuse_tokens) },
-        { "predicted_replay_tokens",
-          public_value(view.predicted_replay_tokens) },
-        { "predicted_restore_bytes",
-          public_value(view.predicted_restore_bytes) },
-        { "predicted_ttft_us", public_value(view.predicted_ttft_us) },
-        { "estimate_scope", "cache_path_only" },
-        { "estimator_version", view.estimator_version == 0
-              ? json(nullptr) : json(view.estimator_version) },
-        { "cost_terms", {
-            { "replay", public_cost_term(terms[size_t(
-                  llama_cache_acct_cost_kind::replay)]) },
-            { "restore", public_cost_term(terms[size_t(
-                  llama_cache_acct_cost_kind::restore)]) },
-            { "workspace", public_cost_term(terms[size_t(
-                  llama_cache_acct_cost_kind::workspace)]) },
-            { "transfer", public_cost_term(terms[size_t(
-                  llama_cache_acct_cost_kind::transfer)]) },
-            { "eviction", public_cost_term(terms[size_t(
-                  llama_cache_acct_cost_kind::eviction)]) },
-        } },
-    };
-
-    const auto & destruction = view.destruction;
-    json destruction_json = {
-        { "required", destruction.effects != 0 },
-        { "assessment", assessment_name(destruction.state) },
-        { "reason", common_cache_plan_destruction_reason_name(
-              destruction.reason) },
-        { "effects", public_effects(destruction.effects) },
-        { "protection", protection_name(destruction.protection) },
-        { "displaced_fate", common_cache_plan_displaced_fate_name(
-              destruction.displaced_fate) },
-        { "recovery", common_cache_plan_recovery_citation_name(
-              destruction.recovery) },
-        { "projected_release_bytes",
-          public_value(destruction.projected_release_bytes) },
-        { "estimated_destruction_us",
-          public_value(destruction.estimated_destruction_us) },
+        { "reuse_tokens", public_value(view.reuse_tokens) },
+        { "replay_tokens", public_value(view.replay_tokens) },
+        { "restore_bytes", public_value(view.restore_bytes) },
     };
 
     return json {
         { "object", "cache_plan_preflight" },
-        { "schema_version", 1 },
+        { "schema_version", 2 },
         { "cache_plan_schema_version", COMMON_CACHE_PLAN_SCHEMA_VERSION },
         { "authoritative", false },
         { "reservation", "none" },
         { "valid_until", nullptr },
         { "status", preflight_status_name(view.status) },
-        { "planner", std::move(planner) },
-        { "destruction", std::move(destruction_json) },
+        { "selection", std::move(selection) },
         { "miss_reasons", std::move(miss_reasons) },
         { "limitations", json::array({
             "point_in_time",
             "no_reservation",
+            "displacement_not_projected",
             "queue_and_contention_not_modeled",
             "post_generation_maintenance_not_modeled",
         }) },

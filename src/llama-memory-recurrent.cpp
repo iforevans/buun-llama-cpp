@@ -110,6 +110,7 @@ class vbr_recurrent_prepared_image final :
     std::unique_ptr<vbr_recurrent_parsed_image> recovery;
     bool destination_was_empty = false;
     size_t replacement_physical = 0;
+    uint32_t replacement_source_row = 0;
     llama_pos replacement_position = -1;
     uint64_t replacement_binding_epoch = 0;
 
@@ -151,7 +152,7 @@ class vbr_recurrent_prepared_image final :
             llama_seq_id destination, size_t & physical,
             uint32_t & row) noexcept {
         if (destination < 0 || uint32_t(destination) >= target.n_seq_max ||
-            target.used != 1) {
+            target.used == 0) {
             return false;
         }
         physical = target.cells.size();
@@ -164,8 +165,17 @@ class vbr_recurrent_prepared_image final :
             }
             physical = i;
         }
-        if (physical == target.cells.size()) {
+        if (physical == target.cells.size() ||
+            target.cells[physical].seq_id.size() != 1) {
             return false;
+        }
+        // Replacement writes only this sequence's row. Other live sequences
+        // may remain in the controller, but must not alias the overwritten row.
+        for (size_t i = 0; i < target.cells.size(); ++i) {
+            if (i != physical && !target.cells[i].is_empty() &&
+                target.cells[i].src == int32_t(physical)) {
+                return false;
+            }
         }
         uint32_t rollback = 0;
         if (target.n_rs_seq != 0) {
@@ -292,7 +302,7 @@ class vbr_recurrent_prepared_image final :
         try {
             if (destination < 0 ||
                 uint32_t(destination) >= target.n_seq_max ||
-                expected.target != &target || target.used != 1 ||
+                expected.target != &target ||
                 expected.r.size() != target.r_l.size() ||
                 expected.p.size() != target.p_l.size() ||
                 expected.s.size() != target.s_l.size()) {
@@ -385,7 +395,7 @@ class vbr_recurrent_prepared_image final :
             !parsed_compatible(*target, *parsed) ||
             !live_matches(*target, destination, *recovery) ||
             !live_location(*target, destination, physical, row) ||
-            row != physical) {
+            target->size == 0 || row%target->size != physical) {
             return false;
         }
         // Occupied import already owns the controller operation exclusively.
@@ -398,6 +408,7 @@ class vbr_recurrent_prepared_image final :
         image->destination = destination;
         image->destination_was_empty = false;
         image->replacement_physical = physical;
+        image->replacement_source_row = row;
         image->replacement_position = parsed->position;
         image->replacement_binding_epoch = target->tensor_binding_epoch_;
         image->recovery.reset(static_cast<vbr_recurrent_parsed_image *>(
@@ -458,7 +469,8 @@ class vbr_recurrent_prepared_image final :
             target->tensor_binding_epoch_ ==
                 image->replacement_binding_epoch &&
             live_location(*target, image->destination, physical, row) &&
-            physical == image->replacement_physical && row == physical &&
+            physical == image->replacement_physical &&
+            row == image->replacement_source_row &&
             target->cells[physical].pos == image->recovery->position;
     }
 
@@ -470,6 +482,12 @@ class vbr_recurrent_prepared_image final :
         }
         if (image.destination_was_empty) {
             return true;
+        }
+        // A pending speculative rollback reads a snapshot plane. Preparation
+        // overwrote only the base row; until publish resets rs_idx, the old
+        // live row and its rollback history remain untouched.
+        if (image.replacement_source_row != image.replacement_physical) {
+            return image.recovery != nullptr;
         }
         return image.recovery &&
             image.replacement_physical <= UINT32_MAX &&

@@ -42,6 +42,7 @@ struct vbr_checkpoint_unit_generation {
     vbr_repr_domain     domain           = vbr_repr_domain::full;
     uint8_t             promote_hops     = 0;
     vbr_repr_transition last_transition  = vbr_repr_transition::initial;
+    int32_t             effective_type   = -1;
 };
 
 enum class checkpoint_child_dependency_mode : uint8_t {
@@ -82,7 +83,7 @@ struct vbr_checkpoint_generation_controller {
 };
 
 struct vbr_checkpoint_generation_record {
-    uint32_t                                          version = 1;
+    uint32_t                                          version = 2;
     vbr_checkpoint_generation_status                  status  = vbr_checkpoint_generation_status::generation_unknown;
     std::array<uint8_t, 32>                           identity_policy_order_digest = {};
     std::vector<vbr_checkpoint_generation_controller> controllers;
@@ -94,7 +95,8 @@ struct vbr_checkpoint_generation_record {
 inline bool operator==(const vbr_checkpoint_unit_generation & lhs, const vbr_checkpoint_unit_generation & rhs) {
     return lhs.repr_gen == rhs.repr_gen && lhs.current_type == rhs.current_type &&
            lhs.last_source_type == rhs.last_source_type && lhs.domain == rhs.domain &&
-           lhs.promote_hops == rhs.promote_hops && lhs.last_transition == rhs.last_transition;
+           lhs.promote_hops == rhs.promote_hops && lhs.last_transition == rhs.last_transition &&
+           lhs.effective_type == rhs.effective_type;
 }
 
 inline bool operator==(const vbr_generation_page_ref & lhs, const vbr_generation_page_ref & rhs) {

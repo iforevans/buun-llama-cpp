@@ -492,7 +492,8 @@ extern "C" {
         GGML_TYPE_EXL3N_6 = 88,
         GGML_TYPE_EXL3N_7 = 89,
         GGML_TYPE_EXL3N_8 = 90,
-        GGML_TYPE_COUNT   = 91,
+        GGML_TYPE_PTQ1_0 = 91, // Prism ternary group-128; GGUF wire id 143
+        GGML_TYPE_COUNT   = 92,
     };
 
     // EXL3 helpers: the type encodes the bit width and the codebook.
@@ -626,6 +627,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PTQ1_0 = 129,
     };
 
     // available tensor operations:

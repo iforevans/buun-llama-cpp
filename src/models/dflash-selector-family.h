@@ -111,26 +111,26 @@ llm_dflash_selector_family llm_dflash_selector_family_from_loader(
         uint32_t n_layer,
         const Loader & loader) {
     bool has_fork_tensor =
-        loader.get_tensor_meta_exact("selector.hidden_proj.weight") != nullptr ||
-        loader.get_tensor_meta_exact("selector.pred_codebook") != nullptr ||
-        loader.get_tensor_meta_exact("selector.succ_codebook") != nullptr;
+        loader.has_tensor_exact("selector.hidden_proj.weight") ||
+        loader.has_tensor_exact("selector.pred_codebook") ||
+        loader.has_tensor_exact("selector.succ_codebook");
     bool has_compat_tensor =
-        loader.get_tensor_meta_exact("selector_hidden.weight") != nullptr ||
-        loader.get_tensor_meta_exact("selector_predecessor.weight") != nullptr ||
-        loader.get_tensor_meta_exact("selector_successor.weight") != nullptr;
+        loader.has_tensor_exact("selector_hidden.weight") ||
+        loader.has_tensor_exact("selector_predecessor.weight") ||
+        loader.has_tensor_exact("selector_successor.weight");
 
     for (uint32_t il = 0; il < n_layer && !(has_fork_tensor && has_compat_tensor); ++il) {
         const std::string prefix = "blk." + std::to_string(il);
         has_fork_tensor |=
-            loader.get_tensor_meta_exact((prefix + ".attn_conv.base").c_str()) != nullptr ||
-            loader.get_tensor_meta_exact((prefix + ".attn_conv.proj.weight").c_str()) != nullptr ||
-            loader.get_tensor_meta_exact((prefix + ".ffn_conv.base").c_str()) != nullptr ||
-            loader.get_tensor_meta_exact((prefix + ".ffn_conv.proj.weight").c_str()) != nullptr;
+            loader.has_tensor_exact((prefix + ".attn_conv.base").c_str()) ||
+            loader.has_tensor_exact((prefix + ".attn_conv.proj.weight").c_str()) ||
+            loader.has_tensor_exact((prefix + ".ffn_conv.base").c_str()) ||
+            loader.has_tensor_exact((prefix + ".ffn_conv.proj.weight").c_str());
         has_compat_tensor |=
-            loader.get_tensor_meta_exact((prefix + ".attn_conv_base").c_str()) != nullptr ||
-            loader.get_tensor_meta_exact((prefix + ".attn_conv_proj.weight").c_str()) != nullptr ||
-            loader.get_tensor_meta_exact((prefix + ".ffn_conv_base").c_str()) != nullptr ||
-            loader.get_tensor_meta_exact((prefix + ".ffn_conv_proj.weight").c_str()) != nullptr;
+            loader.has_tensor_exact((prefix + ".attn_conv_base").c_str()) ||
+            loader.has_tensor_exact((prefix + ".attn_conv_proj.weight").c_str()) ||
+            loader.has_tensor_exact((prefix + ".ffn_conv_base").c_str()) ||
+            loader.has_tensor_exact((prefix + ".ffn_conv_proj.weight").c_str());
     }
 
     return llm_dflash_selector_family_from_identity(

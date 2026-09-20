@@ -708,7 +708,11 @@ bool ggml_cuda_mul_mat_int8_channel(
         CUDA_CHECK(cudaGetLastError());
     };
 
-    if (cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE && m == 1 && k % 16 == 0) {
+    // SM75's vector kernel wins on bandwidth-bound projections; small shapes
+    // still favor cuBLAS. Keep the separately qualified Ampere dispatch intact.
+    const bool turing_gemv = cc == GGML_CUDA_CC_TURING && k * n >= int64_t(5120) * 5120;
+    if ((turing_gemv || (cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE)) &&
+            m == 1 && k % 16 == 0) {
         constexpr int threads = 64;
         if (scale->type == GGML_TYPE_F32) {
             gemv_i8_channel<<<n, threads, 0, stream>>>(

@@ -67,15 +67,9 @@ std::optional<llama_safetensors_source_name> map_target_source(
     return llama_safetensors_map_decoder_tensor(prefix, match[2].str());
 }
 
-llama_safetensors_tensor_binding map_target(const llama_safetensors_quant_adapters & quant,
-                                            uint32_t                                 n_layer,
-                                            const std::string &                      source_prefix,
-                                            const std::string &                      target_name) {
-    auto source = map_target_source(n_layer, source_prefix, target_name);
-    if (!source) {
-        throw std::runtime_error("unsupported Qwen3 target tensor '" + target_name + "'");
-    }
-    return llama_safetensors_bind_tensor(quant, std::move(*source));
+bool is_dflash2(const llama_safetensors_json & config) {
+    return config.value("architectures", std::vector<std::string>{}) ==
+        std::vector<std::string>{"DFlash2DraftModel"};
 }
 
 void validate_model_contract(const llama_safetensors_json & config) {
@@ -148,6 +142,7 @@ llama_safetensors_qwen3_importer::llama_safetensors_qwen3_importer(const std::fi
     config_(std::move(config)) {
     const std::string model_type = config_.value("model_type", std::string());
     const bool is_vl = model_type == "qwen3_vl";
+    const bool is_draft = is_dflash2(config_);
     // Classic Hugging Face Mistral checkpoints use the Llama execution
     // architecture and the same Q/K RoPE row permutation. Newer Mistral3/4
     // architectures have different tensor and graph contracts and are not
@@ -155,13 +150,25 @@ llama_safetensors_qwen3_importer::llama_safetensors_qwen3_importer(const std::fi
     const bool is_llama = model_type == "llama" || model_type == "mistral";
     text_config_ = is_vl ? config_.at("text_config") : config_;
     source_prefix_ = is_vl ? "model.language_model." : "model.";
-    architecture_ = is_vl ? "qwen3vl" : is_llama ? "llama" : model_type;
+    architecture_ = is_draft ? "dflash" : is_vl ? "qwen3vl" : is_llama ? "llama" : model_type;
     validate_model_contract(text_config_);
     n_layer_                                      = text_config_.at("num_hidden_layers").get<uint32_t>();
     n_head_                                       = text_config_.at("num_attention_heads").get<uint32_t>();
     n_head_kv_                                    = text_config_.at("num_key_value_heads").get<uint32_t>();
     head_dim_                                     = text_config_.value(
         "head_dim", text_config_.at("hidden_size").get<uint32_t>() / n_head_);
+    registry_ = llama_safetensors_registry::load(model_dir_, io_mode);
+    quant_    = std::make_unique<llama_safetensors_quant_adapters>(config_, registry_);
+    if (is_draft) {
+        // Published sidecars omit the tokenizer and shared embedding/head. They
+        // consume target token IDs; ordinary DFlash setup attaches shared tensors.
+        source_prefix_ = registry_.find("model.hidden_norm.weight") ? "model." : "";
+        if (model_type != "qwen3" || !config_.value("rope_is_neox_style", true) ||
+            config_.contains("final_logit_softcapping") || config_.at("dflash_config").contains("final_logit_softcapping")) {
+            throw std::runtime_error("native DFlash2 currently requires the Qwen NeoX-RoPE backbone");
+        }
+        return;
+    }
     generation_                                   = llama_safetensors_read_json(model_dir_ / "generation_config.json");
     tokenizer_                                    = llama_safetensors_read_tokenizer_json(model_dir_ / "tokenizer.json");
     const llama_safetensors_json tokenizer_config = llama_safetensors_read_json(model_dir_ / "tokenizer_config.json");
@@ -172,13 +179,46 @@ llama_safetensors_qwen3_importer::llama_safetensors_qwen3_importer(const std::fi
     if (tokenizer_config.contains("chat_template") && tokenizer_config.at("chat_template").is_string()) {
         chat_template_ = tokenizer_config.at("chat_template").get<std::string>();
     }
-    registry_ = llama_safetensors_registry::load(model_dir_, io_mode);
-    quant_    = std::make_unique<llama_safetensors_quant_adapters>(config_, registry_);
+}
+
+std::optional<llama_safetensors_source_name> llama_safetensors_qwen3_importer::map_source(
+        const std::string & name) const {
+    if (architecture_ == "dflash") {
+        if (name == "enc.output_norm.weight") return plain_source(source_prefix_ + "hidden_norm.weight");
+        for (const auto & item : std::array<std::pair<std::string, std::string>, 4>{{
+                {"fc", "fc"}, {"selector.hidden_proj", "candidate_selector.hidden_projection"},
+                {"selector.pred_codebook", "candidate_selector.predecessor_codebook"},
+                {"selector.succ_codebook", "candidate_selector.successor_codebook"}}}) {
+            const auto & canonical = item.first;
+            const std::string module = source_prefix_ + item.second;
+            if (name == canonical) {
+                return plain_source(registry_.find(module + ".weight") ? module + ".weight" : module);
+            }
+            if (name == canonical + ".weight") return projection_source(module, llama_safetensors_quant_role::WEIGHT);
+            if (name == canonical + ".scale") return projection_source(module, llama_safetensors_quant_role::WEIGHT_SCALE);
+            if (name == canonical + ".input_scale") return projection_source(module, llama_safetensors_quant_role::INPUT_SCALE);
+        }
+        static const std::regex conv(R"(^blk\.([0-9]+)\.(attn|ffn)_conv\.(base|proj\.weight)$)");
+        std::smatch match;
+        if (std::regex_match(name, match, conv)) {
+            if (std::stoul(match[1].str()) >= n_layer_) return std::nullopt;
+            const std::string module = source_prefix_ + "layers." + match[1].str() +
+                (match[2] == "attn" ? ".attention_conv." : ".mlp_conv.");
+            return plain_source(module + (match[3] == "base" ? "base_kernel" : "kernel_projection.weight"));
+        }
+    }
+    return map_target_source(n_layer_, source_prefix_, name);
+}
+
+llama_safetensors_tensor_binding llama_safetensors_qwen3_importer::map_tensor(const std::string & name) const {
+    auto source = map_source(name);
+    if (!source) throw std::runtime_error("unsupported " + architecture_ + " target tensor '" + name + "'");
+    return llama_safetensors_bind_tensor(*quant_, std::move(*source));
 }
 
 bool llama_safetensors_qwen3_importer::probe(const llama_safetensors_json & config) {
     const std::string model_type = config.value("model_type", std::string());
-    return model_type == "qwen2" || model_type == "qwen3" ||
+    return is_dflash2(config) || model_type == "qwen2" || model_type == "qwen3" ||
            model_type == "qwen3_vl" || model_type == "llama" ||
            model_type == "mistral";
 }
@@ -191,7 +231,7 @@ gguf_context * llama_safetensors_qwen3_importer::build_metadata() const {
                     model_dir_.filename().empty() ? "Qwen3 Safetensors" : model_dir_.filename().string());
     sink.set_u32("general.file_type", quant_->file_type());
     sink.set_u32("general.quantization_version", 2);
-    llama_safetensors_emit_sampling_defaults(sink, generation_);
+    if (architecture_ != "dflash") llama_safetensors_emit_sampling_defaults(sink, generation_);
 
     const std::string prefix = architecture_ + ".";
     sink.set_u32(prefix + "block_count", text_config_.at("num_hidden_layers").get<uint32_t>());
@@ -223,6 +263,59 @@ gguf_context * llama_safetensors_qwen3_importer::build_metadata() const {
             config_.at("vision_config").at("deepstack_visual_indexes").size()));
     }
 
+    if (architecture_ == "dflash") {
+        const auto & cfg = config_.at("dflash_config");
+        const uint32_t vocab = config_.at("vocab_size").get<uint32_t>();
+        const uint32_t mask = cfg.at("mask_token_id").get<uint32_t>();
+        const uint32_t block = cfg.at("block_size").get<uint32_t>();
+        auto layers = cfg.at("target_layer_ids").get<std::vector<uint32_t>>();
+        if (vocab == 0 || mask >= vocab || block < 3 || block > 64 || layers.empty() || layers.size() > 8) {
+            throw std::runtime_error("invalid DFlash2 vocabulary, block size, or target layers");
+        }
+        for (auto & layer : layers) {
+            if (layer >= config_.at("num_target_layers").get<uint32_t>()) {
+                throw std::runtime_error("DFlash2 target layer is out of range");
+            }
+            ++layer; // Runtime feature extraction numbers the embedding output as zero.
+        }
+        sink.set_string("tokenizer.ggml.model", "none");
+        sink.set_u32(prefix + "vocab_size", vocab);
+        sink.set_u32("tokenizer.ggml.mask_token_id", mask);
+        sink.set_u32(prefix + "block_size", block);
+        sink.set_u32_array(prefix + "target_layers", layers.data(), layers.size());
+        const auto causal = config_.value("is_causal", llama_safetensors_json());
+        sink.set_bool(prefix + "attention.causal", causal.is_null() ? cfg.value("causal", false) : causal.get<bool>());
+        for (const auto & item : {std::pair{"output_multiplier", "logit_scale"},
+                                  std::pair{"input_embedding_scale", "embedding_scale"}}) {
+            const auto value = cfg.value(item.first, config_.value(item.first, llama_safetensors_json()));
+            if (!value.is_null()) sink.set_f32(prefix + item.second, value.get<float>());
+        }
+        for (const char * key : {"conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k"}) {
+            sink.set_u32(prefix + key, cfg.at(key).get<uint32_t>());
+        }
+        const auto draft_window = cfg.value("swa_window_size", llama_safetensors_json());
+        const auto model_window = config_.value("sliding_window", llama_safetensors_json());
+        const uint32_t window = !draft_window.is_null() && draft_window.get<uint32_t>() > 0 ?
+            draft_window.get<uint32_t>() : model_window.is_null() ? 0U : model_window.get<uint32_t>();
+        if ((config_.value("use_sliding_window", false) || cfg.value("use_swa", false)) && window > 0) {
+            const auto types = config_.at("layer_types").get<std::vector<std::string>>();
+            if (types.size() != n_layer_) throw std::runtime_error("invalid DFlash2 sliding-window pattern");
+            auto pattern = std::make_unique<bool[]>(n_layer_);
+            for (uint32_t i = 0; i < n_layer_; ++i) {
+                if (types[i] != "sliding_attention" && types[i] != "full_attention") {
+                    throw std::runtime_error("unsupported DFlash2 layer type");
+                }
+                pattern[i] = types[i] == "sliding_attention";
+            }
+            sink.set_u32(prefix + "attention.sliding_window", window);
+            gguf_context * metadata = sink.release();
+            gguf_set_arr_data(metadata, (prefix + "attention.sliding_window_pattern").c_str(),
+                    GGUF_TYPE_BOOL, pattern.get(), n_layer_);
+            return metadata;
+        }
+        return sink.release();
+    }
+
     const uint32_t bos = llama_safetensors_first_token_id(generation_.at("bos_token_id"), "bos_token_id");
     const uint32_t eos = llama_safetensors_first_token_id(generation_.at("eos_token_id"), "eos_token_id");
     if (architecture_ == "llama" && std::filesystem::is_regular_file(model_dir_ / "tokenizer.model")) {
@@ -248,7 +341,7 @@ gguf_context * llama_safetensors_qwen3_importer::build_metadata() const {
 bool llama_safetensors_qwen3_importer::describe(const std::string &                  target_name,
                                                 ggml_type &                          type,
                                                 std::array<int64_t, GGML_MAX_DIMS> & ne) const {
-    auto source = map_target_source(n_layer_, source_prefix_, target_name);
+    auto source = map_source(target_name);
     if (!source) {
         return false;
     }
@@ -261,7 +354,7 @@ size_t llama_safetensors_qwen3_importer::tensor_capacity_hint() const {
 }
 
 void llama_safetensors_qwen3_importer::bind(const std::string & target_name) const {
-    llama_safetensors_consume_tensor(*quant_, map_target(*quant_, n_layer_, source_prefix_, target_name));
+    llama_safetensors_consume_tensor(*quant_, map_tensor(target_name));
 }
 
 std::optional<llama_model_tensor_file_region> llama_safetensors_qwen3_importer::file_region(
@@ -270,19 +363,19 @@ std::optional<llama_model_tensor_file_region> llama_safetensors_qwen3_importer::
         return std::nullopt;
     }
     return llama_safetensors_tensor_file_region(registry_,
-        map_target(*quant_, n_layer_, source_prefix_, destination->name), destination);
+        map_tensor(destination->name), destination);
 }
 
 bool llama_safetensors_qwen3_importer::can_stream(const std::string & target_name) const {
     if (architecture_ == "llama" && llama_rope_permuted_target(target_name)) return false;
-    const auto binding = map_target(*quant_, n_layer_, source_prefix_, target_name);
+    const auto binding = map_tensor(target_name);
     return binding.quant && quant_->can_stream(*binding.quant);
 }
 
 void llama_safetensors_qwen3_importer::stream(
         const std::string & target_name, const std::function<void(const void *, size_t)> & write) const {
     if (!can_stream(target_name)) throw std::runtime_error("unsupported Qwen3 streaming transform: " + target_name);
-    const auto binding = map_target(*quant_, n_layer_, source_prefix_, target_name);
+    const auto binding = map_tensor(target_name);
     quant_->stream(*binding.quant, write);
 }
 
@@ -293,7 +386,7 @@ bool llama_safetensors_qwen3_importer::load(
         return false;
     }
     return llama_safetensors_load_tensor_direct(
-        registry_, map_target(*quant_, n_layer_, source_prefix_, target_name), destination, check_tensor);
+        registry_, map_tensor(target_name), destination, check_tensor);
 }
 
 std::vector<uint8_t> llama_safetensors_qwen3_importer::materialize(const std::string & target_name,
@@ -301,7 +394,7 @@ std::vector<uint8_t> llama_safetensors_qwen3_importer::materialize(const std::st
                                                                    size_t              target_size) const {
     try {
         const llama_safetensors_tensor_binding binding =
-            map_target(*quant_, n_layer_, source_prefix_, target_name);
+            map_tensor(target_name);
         std::vector<uint8_t> result = llama_safetensors_materialize_tensor(
             registry_, *quant_, binding,
             target_type, target_size);

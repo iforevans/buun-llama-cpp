@@ -1,4 +1,6 @@
 #include "speculative.h"
+#include "speculative-mtp-adaptive.h"
+#include "speculative-dflash-adaptive.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1192,37 +1194,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<position_seq_state> positions;
 
     // Adaptive depth is per sequence. Ordinary DFlash retains its lightweight
-    // acceptance controller. DFlash2 measures wall time per emitted target token for
-    // full, target-only, and depth-2 verification because its full selector lattice
-    // has constant draft cost and target-side batch kernels are not monotonic in
-    // emitted depth.
+    // acceptance controller; DFlash2 measures throughput at several verify depths.
     bool adaptive = false;
     struct adaptive_seq_state {
         int32_t n_draft_last = 0;
         int32_t n_low_acc = 0;
         int32_t cap = -1; // -1 = caller/model ceiling; 0 = target-only
 
-        bool sweep = false;
-        bool sweep_pending = false;
-        int32_t hold = 0;
-        int32_t candidate = 0;
-        int32_t sample_cycles = 0;
-        int64_t sample_us = 0;
-        int32_t sample_tokens = 0;
-        double best_us_per_token = std::numeric_limits<double>::infinity();
-
+        common_speculative_dflash_adaptive dflash2;
         int64_t cycle_start_us = 0;
         int32_t cycle_tokens = 0;
-        bool cycle_is_sample = false;
-
-        int64_t full_us = 0;
-        int32_t full_tokens = 0;
-
-        int32_t recovery_cycles = 0;
-        int32_t recovery_drafts = 0;
-        int32_t recovery_accepts = 0;
+        int32_t cycle_drafted = -1;
+        int32_t cycle_accepted = 0;
     };
     std::vector<adaptive_seq_state> adpt;
+    // Timing only: request acceptance and decisions remain in adpt and reset.
+    std::vector<common_speculative_dflash_adaptive::calibration> dflash2_timings;
+    std::vector<int64_t> dflash2_timing_bucket;
 
     // Request-seeded stochastic DFlash2 proposal state, kept independently for
     // every server sequence so a batched decode cannot couple slot RNGs.
@@ -1308,9 +1296,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             mask_token_id = (llama_token) llama_model_dflash_mask_token_id(model_dft);
         }
 
-        // n_max < 0 = auto (--spec-dflash-default): the full block depth strictly wins
-        // (EXP-37i). The server resolves this at model load; this covers the other
-        // binaries (llama-cli, speculative-simple).
+        // n_max < 0 = auto (--spec-dflash-default): use the full block ceiling.
+        // Adaptive verification can choose fewer proposals. The server resolves
+        // this at model load; this covers llama-cli and speculative-simple.
         if (this->params.n_max < 0) {
             this->params.n_max = block_size > 1 ? block_size - 1 : 12;
         }
@@ -1457,6 +1445,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             adaptive = env_on("GGML_DFLASH_DRAFT_ADAPTIVE");
         }
         adpt.resize(n_seq);
+        dflash2_timings.resize(n_seq);
+        dflash2_timing_bucket.resize(n_seq, -1);
         proposal_rngs.resize(n_seq);
         proposal_uniforms.resize(n_seq);
         proposals.resize(n_seq);
@@ -1757,142 +1747,38 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return true;
     }
 
-    void dflash2_finish_adaptive_cycle(llama_seq_id seq_id, int64_t now) {
+    int32_t dflash2_adaptive_depth(llama_seq_id seq_id, int32_t n_max, llama_pos position) {
         auto & st = adpt[seq_id];
-        if (st.cycle_start_us <= 0 || st.cycle_tokens <= 0) {
-            st.cycle_start_us = 0;
-            st.cycle_tokens = 0;
-            st.cycle_is_sample = false;
-            return;
+        // Reuse single-slot shape costs only within a context-depth band;
+        // acceptance and depth decisions remain request-local.
+        int64_t bucket = 2048;
+        while (bucket < position) { bucket *= 2; }
+        if (dflash2_timing_bucket[seq_id] != bucket) {
+            dflash2_timing_bucket[seq_id] = bucket;
+            dflash2_timings[seq_id] = {};
+            st = {};
         }
-
-        const int64_t elapsed = std::max<int64_t>(1, now - st.cycle_start_us);
-        if (st.cycle_is_sample) {
-            st.sample_us += elapsed;
-            st.sample_tokens += st.cycle_tokens;
-            ++st.sample_cycles;
-        } else {
-            if (st.cap < 0) {
-                st.full_us += elapsed;
-                st.full_tokens += st.cycle_tokens;
-            }
-            if (!st.sweep && st.hold > 0 && --st.hold == 0) {
-                st.cap = -1;
-                st.n_low_acc = 0;
-                st.recovery_cycles = 0;
-                st.recovery_drafts = 0;
-                st.recovery_accepts = 0;
-                st.full_us = 0;
-                st.full_tokens = 0;
-                LOG_DBG("%s: seq %d periodic full-depth probe\n", __func__, (int) seq_id);
-            }
+        auto * timing = n_seq == 1 ? &dflash2_timings[seq_id] : nullptr;
+        const int maximum = std::min(params.n_max, block_size - 1);
+        const int before = st.dflash2.depth(maximum, params.n_min, timing);
+        const bool was_searching = st.dflash2.searching();
+        if (st.cycle_start_us > 0 && st.cycle_tokens > 0) {
+            st.dflash2.observe(ggml_time_us() - st.cycle_start_us,
+                    st.cycle_drafted, st.cycle_accepted, st.cycle_tokens);
         }
-        st.cycle_start_us = 0;
-        st.cycle_tokens = 0;
-        st.cycle_is_sample = false;
-
-        if (!st.sweep) {
-            return;
+        const int selected = st.dflash2.depth(maximum, params.n_min, timing);
+        if (selected != before || was_searching != st.dflash2.searching()) {
+            LOG_DBG("%s: seq %d depth %d -> %d (%s)\n", __func__, (int) seq_id,
+                    before, selected, st.dflash2.searching() ? "probe" : "selected");
         }
-
-        if (st.candidate == 0) {
-            if (st.sample_cycles < 4) {
-                return;
-            }
-            const double target_us_per_token =
-                (double) st.sample_us / std::max(1, st.sample_tokens);
-            if (st.best_us_per_token < 0.80 * target_us_per_token) {
-                st.cap = -1;
-                st.sweep = false;
-                st.hold = 512;
-                st.sample_cycles = 0;
-                st.sample_us = 0;
-                st.sample_tokens = 0;
-                st.full_us = 0;
-                st.full_tokens = 0;
-                LOG_DBG("%s: seq %d full %.2f vs target-only %.2f ms/token - retaining full depth\n",
-                        __func__, (int) seq_id, st.best_us_per_token / 1e3,
-                        target_us_per_token / 1e3);
-                return;
-            }
-
-            st.candidate = 1;
-            st.cap = 2;
-            st.sample_cycles = 0;
-            st.sample_us = 0;
-            st.sample_tokens = 0;
-            LOG_DBG("%s: seq %d full %.2f vs target-only %.2f ms/token - measuring depth 2\n",
-                    __func__, (int) seq_id, st.best_us_per_token / 1e3,
-                    target_us_per_token / 1e3);
-            return;
-        }
-
-        if (st.sample_cycles < 16) {
-            return;
-        }
-
-        const double depth2_us_per_token =
-            (double) st.sample_us / std::max(1, st.sample_tokens);
-        // The exhaustive panel establishes depth 2 as the robust low-match prior.
-        // Favor it inside a 5% noise band; reject it when the measured arm is clearly
-        // slower (as on medium-match prose), where full batching is decisive.
-        const bool depth2_wins = depth2_us_per_token <= 1.05 * st.best_us_per_token;
-        st.cap = depth2_wins ? 2 : -1;
-        st.sweep = false;
-        st.hold = depth2_wins ? 256 : 512;
-        st.n_low_acc = 0;
-        st.sample_cycles = 0;
-        st.sample_us = 0;
-        st.sample_tokens = 0;
-        st.recovery_cycles = 0;
-        st.recovery_drafts = 0;
-        st.recovery_accepts = 0;
-        st.full_us = 0;
-        st.full_tokens = 0;
-        LOG_DBG("%s: seq %d full %.2f vs depth-2 %.2f ms/token - selected %s\n",
-                __func__, (int) seq_id, st.best_us_per_token / 1e3,
-                depth2_us_per_token / 1e3, depth2_wins ? "depth 2" : "full depth");
-    }
-
-    void dflash2_start_adaptive_sweep(llama_seq_id seq_id) {
-        auto & st = adpt[seq_id];
-        if (st.full_tokens <= 0) {
-            st.sweep_pending = false;
-            return;
-        }
-
-        st.best_us_per_token = (double) st.full_us / st.full_tokens;
-        st.sweep = true;
-        st.sweep_pending = false;
-        st.hold = 0;
-        st.candidate = 0;
-        st.sample_cycles = 0;
-        st.sample_us = 0;
-        st.sample_tokens = 0;
-        st.cap = 0;
-        st.n_low_acc = 0;
-        st.recovery_cycles = 0;
-        st.recovery_drafts = 0;
-        st.recovery_accepts = 0;
-        st.full_us = 0;
-        st.full_tokens = 0;
-        LOG_DBG("%s: seq %d full-depth baseline %.2f ms/token - measuring target-only\n",
-                __func__, (int) seq_id, st.best_us_per_token / 1e3);
-    }
-
-    int32_t dflash2_adaptive_depth(llama_seq_id seq_id, int32_t n_max) {
-        auto & st = adpt[seq_id];
-        dflash2_finish_adaptive_cycle(seq_id, ggml_time_us());
-        if (st.sweep_pending) {
-            dflash2_start_adaptive_sweep(seq_id);
-        }
-
-        const int32_t depth = st.cap >= 0 ? std::min(st.cap, n_max) : n_max;
+        const int depth = std::min(selected, n_max);
         st.cycle_start_us = ggml_time_us();
-        st.cycle_is_sample = st.sweep;
-        if (depth == 0) {
-            // No speculative implementation owns this cycle, so accept() will not be
-            // called. The next draft invocation closes a one-target-token sample.
+        st.cycle_drafted = -1;
+        st.cycle_accepted = 0;
+        st.cycle_tokens = 0;
+        if (depth == 0 && selected == 0) {
+            // No accept callback on a target-only cycle.
+            st.cycle_drafted = 0;
             st.cycle_tokens = 1;
         }
         return depth;
@@ -2261,7 +2147,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             int32_t n_draft = n_max_eff;
             if (adaptive) {
                 if (is_dflash2) {
-                    n_draft = dflash2_adaptive_depth(seq_id, n_max_eff);
+                    n_draft = dflash2_adaptive_depth(seq_id, n_max_eff, dp.pos0);
                 } else if (adpt[seq_id].cap > 0) {
                     n_draft = std::min(adpt[seq_id].cap, n_max_eff);
                 }
@@ -2288,15 +2174,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     // committed rows at [pos0, n_past), padded to the fixed row count by
                     // repeating the last row into the scratch seq (the KV mask hides it
                     // from real attention; its cells are dropped right after the decode)
-                    stage_rows.resize(oneg_n_inject);
-                    for (int32_t i = 0; i < oneg_n_inject; ++i) {
+                    // Retain all committed history and at least one scratch
+                    // row. A shorter adaptive cap need not compute padding for
+                    // the configured maximum on every subsequent fused cycle.
+                    const int32_t n_inject = adaptive && is_dflash2
+                        ? std::min(oneg_n_inject, std::max(n_acc + 1, n_draft + 2))
+                        : oneg_n_inject;
+                    stage_rows.resize(n_inject);
+                    for (int32_t i = 0; i < n_inject; ++i) {
                         const int32_t k = std::min(i, n_acc - 1);
                         stage_rows[i] = (int32_t) seq_id * carry_rows_per_seq + k;
                         common_batch_add(batch, mask_token_id, st.pos0 + k,
                                 { i < n_acc ? seq_id : oneg_scratch_seq }, false);
                     }
                     st.pending = false;
-                    out_off    = oneg_n_inject;
+                    out_off    = n_inject;
                     trim_pos   = st.pos0;
                 }
             }
@@ -2308,7 +2200,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, trim_pos, -1);
 
             const int32_t n_block_tokens = is_dflash2
-                ? block_size
+                ? (adaptive && n_seq == 1 ? std::min(block_size, std::max(3, n_draft + 1)) : block_size)
                 : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
@@ -2328,11 +2220,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         if (out_off > 0) {
-            llama_set_dflash_inject_rows(ctx_dft, stage_rows.data(), oneg_n_inject);
-            llama_set_dflash_oneg_inject(ctx_dft, carry_handle, oneg_n_inject);
+            llama_set_dflash_inject_rows(ctx_dft, stage_rows.data(), out_off);
+            llama_set_dflash_oneg_inject(ctx_dft, carry_handle, out_off);
         }
 
         // decode all sequence's noise block in a single batch
+        if (is_dflash2) {
+            llama_set_dflash_block_size(ctx_dft, adaptive && n_seq == 1 ? n_block[0] : 0);
+        }
         const int64_t t_dec0 = ggml_time_us();
         int ret = llama_decode(ctx_dft, batch);
         if (out_off > 0) {
@@ -2502,10 +2397,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             adpt[seq_id].n_draft_last = (int32_t) result.size();
-            if (adaptive && is_dflash2 && result.empty()) {
-                // No implementation will receive accept() for an empty result.
-                adpt[seq_id].cycle_tokens = 1;
-            }
 
             // pre-gate accounting (attempted drafts only — skipped/declined seqs never
             // reach this loop): first empty is free, then backoff 1,2,4,8
@@ -2523,12 +2414,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (!adaptive || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
 
         auto & st = adpt[seq_id];
+        if (is_dflash2 && is_other) {
+            st.cycle_tokens = 0;
+        }
         const int32_t n_last = st.n_draft_last;
         st.n_draft_last = 0;
         if (n_last <= 0) {
@@ -2537,62 +2431,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const int32_t n_accepted_own = std::min<int32_t>(n_accepted, n_last);
 
         if (is_dflash2) {
-            // cycle_tokens measures total target progress, including a CopySpec
-            // extension. Adaptive acceptance, however, must only score rows the
-            // DFlash2 model itself proposed.
-            st.cycle_tokens = (int32_t) n_accepted + 1;
-            if (st.sweep) {
-                return;
-            }
-
-            const int32_t n_max = std::min(params.n_max, block_size - 1);
-            if (st.cap < 0 || st.cap >= n_max) {
-                if (st.hold > 0) {
-                    return;
-                }
-                ++st.recovery_cycles;
-                st.recovery_drafts += n_last;
-                st.recovery_accepts += n_accepted_own;
-                if (n_accepted_own <= 1) {
-                    ++st.n_low_acc;
-                } else {
-                    st.n_low_acc = 0;
-                }
-
-                const bool low_window = st.recovery_cycles >= 4 &&
-                    10 * st.recovery_accepts <= 3 * st.recovery_drafts;
-                if (low_window) {
-                    st.sweep_pending = true;
-                    st.n_low_acc = 0;
-                    st.recovery_cycles = 0;
-                    st.recovery_drafts = 0;
-                    st.recovery_accepts = 0;
-                } else if (st.recovery_cycles >= 4) {
-                    st.recovery_cycles = 0;
-                    st.recovery_drafts = 0;
-                    st.recovery_accepts = 0;
-                }
-                return;
-            }
-
-            // A shallow winner must notice when prose turns into an easy code-like
-            // region. Use a wide, high-threshold window so ordinary prose bursts do
-            // not bounce repeatedly between depth 2 and full verification.
-            ++st.recovery_cycles;
-            st.recovery_drafts += n_last;
-            st.recovery_accepts += n_accepted_own;
-            if (st.recovery_cycles >= 32) {
-                if (st.recovery_drafts > 0 &&
-                        10 * st.recovery_accepts >= 9 * st.recovery_drafts) {
-                    st.cap = -1;
-                    st.hold = 0;
-                    st.n_low_acc = 0;
-                    LOG_DBG("%s: seq %d high-match region - restoring full depth\n",
-                            __func__, (int) seq_id);
-                }
-                st.recovery_cycles = 0;
-                st.recovery_drafts = 0;
-                st.recovery_accepts = 0;
+            // Credit CopySpec's extension as target progress, but don't treat it
+            // as DFlash2 acceptance. Other implementations don't measure our cap.
+            if (!is_other) {
+                st.cycle_tokens = (int32_t) n_accepted + 1;
+                st.cycle_drafted = n_last;
+                st.cycle_accepted = n_accepted_own;
             }
             return;
         }
@@ -2742,14 +2586,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
-    // A single recurrent MTP head is commonly reused recursively.  The third
-    // recursive prediction is model-dependent: it is valuable on Qwen3.6 but
-    // not on Qwen3.8.  Probe it once per slot, then retain depth three only when
-    // its marginal acceptance pays for the larger verify graph.
+    // Reversible per-request depth control. Never grow the reserved depth,
+    // and keep independently trained heads and shared-KV assistants out.
     bool adaptive_recursive_depth = false;
-    std::vector<int32_t> adaptive_cap;
-    std::vector<int32_t> adaptive_depth3_attempts;
-    std::vector<int32_t> adaptive_depth3_accepts;
+    std::vector<common_speculative_mtp_adaptive> adaptive;
     std::vector<int32_t> adaptive_last_draft_size;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
@@ -2807,9 +2647,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const char * adaptive_env = getenv("GGML_MTP_DRAFT_ADAPTIVE");
         adaptive_recursive_depth = n_mtp_layers == 1 && !is_mem_shared && this->params.n_max == 3 &&
                                    !(adaptive_env && atoi(adaptive_env) == 0);
-        adaptive_cap.assign(n_seq, this->params.n_max);
-        adaptive_depth3_attempts.assign(n_seq, 0);
-        adaptive_depth3_accepts.assign(n_seq, 0);
+        adaptive.assign(n_seq, common_speculative_mtp_adaptive(this->params.n_min));
         adaptive_last_draft_size.assign(n_seq, 0);
 
         if (chain_heads) {
@@ -2855,6 +2693,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         proposals[seq_id].clear();
+        adaptive[seq_id].begin();
+        adaptive_last_draft_size[seq_id] = 0;
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -3158,7 +2998,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 result.push_back(id);
 
                 int32_t n_max_eff = adaptive_recursive_depth
-                    ? std::min(params.n_max, adaptive_cap[seq_id])
+                    ? std::min(params.n_max, adaptive[seq_id].depth())
                     : params.n_max;
                 if (dp.n_max > 0) {
                     n_max_eff = std::min(n_max_eff, dp.n_max);
@@ -3219,29 +3059,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
 
-        if (adaptive_recursive_depth && adaptive_last_draft_size[seq_id] == 3) {
-            adaptive_depth3_attempts[seq_id]++;
-            adaptive_depth3_accepts[seq_id] += n_accepted >= 3;
+        if (adaptive_recursive_depth) {
+            const int previous = adaptive[seq_id].depth();
+            const int drafted = adaptive_last_draft_size[seq_id];
+            // CopySpec can append a suffix while MTP still owns acceptance.
+            // Count only acceptance of MTP's own prefix for depth selection.
+            adaptive[seq_id].accept(drafted, std::min<int>(n_accepted, drafted), is_other);
             adaptive_last_draft_size[seq_id] = 0;
-
-            if (adaptive_depth3_attempts[seq_id] >= 16) {
-                const float p3 = (float) adaptive_depth3_accepts[seq_id] /
-                                 (float) adaptive_depth3_attempts[seq_id];
-                if (p3 < 0.50f) {
-                    adaptive_cap[seq_id] = 2;
-                    SPC_DBG("MTP seq %d marginal depth-3 acceptance %.3f; draft cap -> 2\n",
-                            (int) seq_id, p3);
-                }
-                adaptive_depth3_attempts[seq_id] = 0;
-                adaptive_depth3_accepts[seq_id] = 0;
+            if (previous != adaptive[seq_id].depth()) {
+                SPC_DBG("MTP seq %d adaptive draft cap %d -> %d\n", seq_id, previous, adaptive[seq_id].depth());
             }
         }
 
+        refresh_carry(seq_id, n_accepted);
+    }
+
+    // Rollback may refresh hidden rows after accept() has already recorded the
+    // outcome. It must not report a second outcome to the depth controller.
+    void refresh_carry(llama_seq_id seq_id, uint16_t n_accepted) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
         const int32_t n_rows = verify_h_rows[seq_id];
         if (n_rows <= 0) {
             return;
@@ -3265,6 +3108,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return false;
         }
         proposals[seq_id].clear();
+        adaptive[seq_id].begin();
         return common_speculative_mtp_carry_state_load(
             pending_h_lifecycle[seq_id], pending_h[seq_id], data);
     }
@@ -3281,6 +3125,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h_rows[seq_id] = 0;
         i_last[seq_id] = -1;
         adaptive_last_draft_size[seq_id] = 0;
+        adaptive[seq_id].begin();
         if (chain_heads) {
             chain_h[seq_id].clear();
         }
@@ -5410,13 +5255,8 @@ common_speculative_type common_speculative_type_from_name(const std::string & na
     return it->second;
 }
 
-std::vector<common_speculative_type> common_speculative_types_from_gguf(const std::string & path) {
-    struct gguf_init_params gguf_params = {
-        /* .no_alloc = */ true,
-        /* .ctx      = */ nullptr,
-    };
-
-    gguf_context_ptr gguf_ctx(gguf_init_from_file(path.c_str(), gguf_params));
+std::vector<common_speculative_type> common_speculative_types_from_model(const std::string & path) {
+    gguf_context_ptr gguf_ctx(llama_model_load_metadata(path.c_str()));
     if (!gguf_ctx) {
         return {};
     }
@@ -5428,6 +5268,8 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
 
     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
     if (arch != "dflash") {
+        // This tensor-directory probe remains GGUF-only. Native MTP still
+        // requires explicit selection; metadata-only native models return none.
         const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
 
         if (gguf_find_tensor(gguf_ctx.get(), ("blk." + std::to_string(block_count - 1) + ".nextn.eh_proj.weight").c_str()) >= 0) {
@@ -5659,7 +5501,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
 }
 
 common_speculative_mtp_context_params common_speculative_mtp_context_params_resolve(
-        uint32_t target_n_ctx_seq,
+        uint32_t target_n_ctx,
         int32_t explicit_draft_n_ctx,
         uint32_t requested_n_seq_max,
         bool requested_kv_unified) {
@@ -5667,7 +5509,7 @@ common_speculative_mtp_context_params common_speculative_mtp_context_params_reso
         return { (uint32_t) explicit_draft_n_ctx, requested_n_seq_max, requested_kv_unified };
     }
 
-    return { target_n_ctx_seq, requested_n_seq_max, true };
+    return { target_n_ctx, requested_n_seq_max, true };
 }
 
 bool common_speculative_mtp_context_available(const common_params_speculative & params) {
@@ -5720,7 +5562,7 @@ common_speculative_init_result::common_speculative_init_result(
 
     auto cparams_mtp = cparams;
     const auto mtp_context = common_speculative_mtp_context_params_resolve(
-        llama_n_ctx_seq(ctx_tgt), params.speculative.draft.n_ctx,
+        llama_n_ctx(ctx_tgt), params.speculative.draft.n_ctx,
         cparams_mtp.n_seq_max,
         cparams_mtp.kv_unified);
     cparams_mtp.n_ctx      = mtp_context.n_ctx;
@@ -5844,6 +5686,14 @@ common_speculative_output_limits common_speculative_get_output_limits(
     };
 }
 
+// CopySpec must share its model drafter's owner: proposal lookup, acceptance,
+// and checkpoint state all follow that owner, not just draft generation.
+static bool common_speculative_copyspec_is_shared(const common_params_speculative & params) {
+    return params.has_type(COMMON_SPECULATIVE_TYPE_COPYSPEC) &&
+        (params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+         params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP));
+}
+
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
@@ -5863,17 +5713,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
         // when adding a new type - update here the logic above
         // SUFFIX/RECYCLE/legacy DFLASH remain per-slot. CopySpec is also hosted
-        // here when paired with shared multi-seq DFlash2 so both implementations
+        // here when paired with shared multi-seq DFlash2/MTP so both implementations
         // have one owner and one per-sequence acceptance lifecycle.
         static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 15);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
-        const bool has_dflash2 = params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
-        // Unlike legacy DFlash, keep this explicit for DFlash2. Copy-heavy
+        // Unlike legacy DFlash, keep this explicit for shared drafters. Copy-heavy
         // prompts can win substantially, but CopySpec's extra extensions can
         // perturb an already strong DFlash2 cycle on ordinary generated code.
-        if (has_dflash2 && params.has_type(COMMON_SPECULATIVE_TYPE_COPYSPEC)) {
+        if (common_speculative_copyspec_is_shared(params)) {
             configs.emplace_back(COMMON_SPECULATIVE_TYPE_COPYSPEC, params);
         }
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
@@ -6105,6 +5954,14 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    common_speculative_impl_copyspec * copyspec = nullptr;
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_COPYSPEC) {
+            copyspec = static_cast<common_speculative_impl_copyspec *>(impl.get());
+            break;
+        }
+    }
+
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
@@ -6144,6 +6001,19 @@ void common_speculative_draft(common_speculative * spec) {
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
+
+                    // Extend only a freshly produced draft: inactive descriptors
+                    // may still point to a result from an earlier server cycle.
+                    // Keep the model as acceptance owner, including its exact-q
+                    // prefix and adaptive accounting for its own proposed rows.
+                    if (copyspec && impl.get() != copyspec && dp.n_max > (int32_t) result.size()) {
+                        const size_t n_before = result.size();
+                        copyspec->extend(seq_id, *dp.prompt, dp.id_last, result, dp.n_max);
+                        if (result.size() > n_before) {
+                            copyspec->n_gen_drafts++;
+                            copyspec->n_gen_tokens += result.size() - n_before;
+                        }
+                    }
                 }
             }
 
@@ -6154,34 +6024,6 @@ void common_speculative_draft(common_speculative * spec) {
 
         if (n_drafting == 0) {
             break;
-        }
-    }
-
-    // A model draft can end on a sequence that appears verbatim in the
-    // existing context. Let CopySpec extend that draft without changing the
-    // implementation that owns acceptance (and, for DFlash2, its exact-q
-    // prefix). This is the multi-sequence equivalent of the legacy per-slot
-    // composition below.
-    common_speculative_impl_copyspec * copyspec = nullptr;
-    for (auto & impl : spec->impls) {
-        if (impl->type == COMMON_SPECULATIVE_TYPE_COPYSPEC) {
-            copyspec = static_cast<common_speculative_impl_copyspec *>(impl.get());
-            break;
-        }
-    }
-    if (copyspec) {
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
-            auto & dp = dparams[seq_id];
-            if (spec->impl_last[seq_id] == copyspec || !dp.result || dp.result->empty() ||
-                    !dp.prompt || dp.n_max <= (int32_t) dp.result->size()) {
-                continue;
-            }
-            const size_t n_before = dp.result->size();
-            copyspec->extend(seq_id, *dp.prompt, dp.id_last, *dp.result, dp.n_max);
-            if (dp.result->size() > n_before) {
-                copyspec->n_gen_drafts++;
-                copyspec->n_gen_tokens += dp.result->size() - n_before;
-            }
         }
     }
 
@@ -6405,7 +6247,7 @@ common_speculative * common_speculative_init(
     {
         bool has_suffix   = params.has_type(COMMON_SPECULATIVE_TYPE_SUFFIX);
         bool has_copyspec = params.has_type(COMMON_SPECULATIVE_TYPE_COPYSPEC) &&
-            !params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
+            !common_speculative_copyspec_is_shared(params);
         bool has_recycle  = params.has_type(COMMON_SPECULATIVE_TYPE_RECYCLE);
         bool has_dflash   = params.has_type(COMMON_SPECULATIVE_TYPE_DFLASH);
 
@@ -6824,7 +6666,7 @@ void common_speculative_rollback_dft(common_speculative * spec, llama_seq_id seq
             auto * mtp = static_cast<common_speculative_impl_draft_mtp *>(impl.get());
             auto * ctx_dft = mtp->params.ctx_dft;
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past, -1);
-            mtp->accept(seq_id, n_accepted, false);
+            mtp->refresh_carry(seq_id, n_accepted);
         }
     }
 }

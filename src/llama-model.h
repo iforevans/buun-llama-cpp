@@ -671,7 +671,7 @@ struct llama_model {
     struct ggml_tensor * output_norm_enc = nullptr;
 
 
-    // NVFP4 per-tensor scale2, input_scale for LM head
+    // Quantization auxiliaries for the LM head (scales, EXL3 transforms, etc.).
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
 
@@ -714,6 +714,7 @@ struct llama_model {
     // eagle3 / dflash feature fusion layer
     struct ggml_tensor * fc   = nullptr;
     struct ggml_tensor * fc_s = nullptr;
+    struct ggml_tensor * fc_in_s = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
     // dspark
@@ -747,6 +748,18 @@ struct llama_model {
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
+
+    // Hadamard-folded GGUF weights are matched with persistent model tensors
+    // containing the activation-side transform.  The string map is populated
+    // from GGUF metadata while loading hparams; the pointer map is populated
+    // after model buffers have been allocated.  In explicit sign mode the
+    // per-width sign vectors come from GGUF metadata as well.
+    std::unordered_map<std::string, uint32_t> hadamard_weight_blocks;
+    std::unordered_map<std::string, uint32_t> hadamard_inverse_blocks;
+    std::map<uint32_t, std::vector<int32_t>> hadamard_sign_data;
+    bool hadamard_gdn_v_grouped = false;
+    llama_hadamard_rotations hadamard_rotations;
+    llama_hadamard_rotations hadamard_inverses;
 
     // list of devices used in this model
     std::vector<llama_device> devices;
@@ -911,8 +924,3 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
 // preserves tied-output models, where output points at token_embd and no
 // output.weight entry exists in the tensor map.
 ggml_tensor * llama_internal_get_shared_tensor(const llama_model * model, llm_tensor tensor);
-
-// Internal pure seam for the tied embedding/output copy plan used by
-// llama_model_share_tensors().
-bool llama_model_shared_output_needs_separate_copy(
-        bool copy_embedding, bool copy_output, bool tied_output);

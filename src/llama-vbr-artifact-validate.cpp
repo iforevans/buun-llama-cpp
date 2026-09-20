@@ -1,4 +1,5 @@
 #include "llama-vbr-artifact-validate.h"
+#include "llama-vbr-precision.h"
 
 #include "llama-cache-budget.h"
 #include "llama-vbr-identity-digest.h"
@@ -252,11 +253,14 @@ bool downward_recipe_complete(
         const vbr_artifact_unit_descriptor & source,
         vbr_repr_domain source_domain,
         const vbr_target_unit_snapshot & target) {
+    // Conversion support is local to this pair. configure_transform_plan
+    // separately authenticates the target against the canonical projection;
+    // its aggregate floor must not be interpreted as a per-unit minimum.
     vbr_downward_recipe resolved;
     const auto status = vbr_downward_resolve_recipe(
         static_cast<ggml_type>(source.current_type),
         static_cast<ggml_type>(target.current_type),
-        static_cast<ggml_type>(target.controller_floor_type),
+        static_cast<ggml_type>(target.current_type),
         target.downward_movable, resolved);
     return target.downward_supported &&
            target.downward_type == target.current_type &&
@@ -335,8 +339,7 @@ bool upward_recipe_complete(
                  target.upward_target_identity.rotation_digest) &&
              digest_nonzero(
                  target.upward_target_identity.meansub_digest))) &&
-           (source_domain != vbr_repr_domain::tapped ||
-            source.promote_hops < 2);
+           source.promote_hops < 2;
 }
 
 bool same_representation(
@@ -355,6 +358,7 @@ bool same_representation(
                target.source_loss_history &&
            source.representation.checkpoint_codec_hops ==
                target.checkpoint_codec_hops &&
+           source.representation.effective_type == target.effective_type &&
            source.codebook_digest == target.codebook_digest &&
            source.rotation_digest == target.rotation_digest &&
            source.meansub_digest == target.meansub_digest;
@@ -660,17 +664,16 @@ vbr_manifest_validation_status configure_transform_plan(
 
     plan.transform_kind = kind;
     plan.selected_target_type = target.current_type;
+    plan.target_effective_type = vbr_precision_merge(
+        descriptor.representation.effective_type, target.current_type);
     plan.source_domain = source_domain;
     plan.selected_target_domain = target.current_domain;
     plan.target_last_source_type = kind == vbr_import_transform_kind::none
         ? descriptor.last_source_type : plan.selected_target_type;
-    plan.target_promote_hops = kind == vbr_import_transform_kind::none
-        ? descriptor.promote_hops : 0;
-    if (kind == vbr_import_transform_kind::upward_same_domain &&
-        source_domain == vbr_repr_domain::tapped) {
-        plan.target_last_source_type = descriptor.current_type;
-        plan.target_promote_hops = uint8_t(descriptor.promote_hops + 1);
-    } else if (kind == vbr_import_transform_kind::upward_cross_domain) {
+    // Downward re-encoding does not replenish an artifact's promotion budget.
+    plan.target_promote_hops = descriptor.promote_hops;
+    if (kind == vbr_import_transform_kind::upward_same_domain ||
+        kind == vbr_import_transform_kind::upward_cross_domain) {
         plan.target_last_source_type = descriptor.current_type;
         plan.target_promote_hops = uint8_t(descriptor.promote_hops + 1);
     }
@@ -790,6 +793,12 @@ vbr_import_schedule_status vbr_classify_import_schedule_units(
         if (unit.source_domain != vbr_downward_tier_domain(source) ||
             unit.target_domain != vbr_downward_tier_domain(target)) {
             return vbr_import_schedule_status::unavailable;
+        }
+        // A pinned legacy side can be restored byte-for-byte alongside a
+        // dynamic sibling. It is not an edge in the TCQ transcode ladder.
+        if (source == target &&
+            (source == GGML_TYPE_TURBO2_0 || source == GGML_TYPE_TURBO3_0)) {
+            continue;
         }
         vbr_downward_recipe recipe;
         const auto relation = vbr_downward_resolve_recipe(
@@ -1834,9 +1843,13 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 return terminal_result(
                     vbr_manifest_validation_status::geometry_mismatch);
             }
-            for (size_t i = 0; i < mappings.size(); ++i) {
-                const auto & mapping = mappings[i];
-                const auto & source = placement.cells[i];
+            for (const auto & source : placement.cells) {
+                if (source.logical_position < 0 ||
+                    size_t(source.logical_position) >= mappings.size()) {
+                    return terminal_result(
+                        vbr_manifest_validation_status::ownership_mismatch);
+                }
+                const auto & mapping = mappings[size_t(source.logical_position)];
                 if (mapping.source_stream != placement.stream_index ||
                     mapping.logical_position != source.logical_position ||
                     mapping.source_physical_cell != source.physical_cell ||
@@ -1939,6 +1952,7 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                     fresh.repr_gen = 1;
                     fresh.current_type = plan.selected_target_type;
                     fresh.last_source_type = plan.target_last_source_type;
+                    fresh.effective_type = plan.target_effective_type;
                     fresh.domain = plan.selected_target_domain;
                     fresh.promote_hops = plan.target_promote_hops;
                     fresh.last_transition =
@@ -2312,6 +2326,7 @@ vbr_manifest_validation_result vbr_validate_attention_prefix_projection(
                 source_generation.repr_gen != descriptor.repr_gen ||
                 source_generation.last_source_type !=
                     descriptor.last_source_type ||
+                source_generation.effective_type != descriptor.representation.effective_type ||
                 source_generation.promote_hops != descriptor.promote_hops ||
                 source_generation.last_transition !=
                     descriptor.last_transition ||
@@ -2682,6 +2697,7 @@ vbr_manifest_validation_result vbr_validate_attention_prefix_projection(
             fresh.repr_gen = 1;
             fresh.current_type = plan.selected_target_type;
             fresh.last_source_type = plan.target_last_source_type;
+            fresh.effective_type = plan.target_effective_type;
             fresh.domain = plan.selected_target_domain;
             fresh.promote_hops = plan.target_promote_hops;
             fresh.last_transition = vbr_repr_transition::whole_import;
