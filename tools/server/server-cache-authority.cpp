@@ -284,8 +284,19 @@ server_cache_checkpoint_floor_plan server_cache_plan_checkpoint_capacity_floor(
         const std::vector<server_cache_checkpoint_floor_input> & candidates) noexcept {
     server_cache_checkpoint_floor_plan out;
     uint32_t heuristic = UINT32_MAX;
+    bool ordered = true;
+    int64_t previous = 0;
+    for (const auto & candidate : candidates) {
+        if (candidate.n_tokens <= previous) {
+            ordered = false;
+            break;
+        }
+        previous = candidate.n_tokens;
+    }
+    uint64_t best_span = UINT64_MAX;
     try {
-        for (const auto & candidate : candidates) {
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const auto & candidate = candidates[i];
             if (candidate.recovery_pinned ||
                 candidate.protection ==
                     server_cache_checkpoint_protection::mandatory_anchor ||
@@ -305,14 +316,25 @@ server_cache_checkpoint_floor_plan server_cache_plan_checkpoint_capacity_floor(
                 }
                 continue;
             }
-            out.selected = true;
-            out.ordinal = candidate.ordinal;
-            out.reason = common_cache_plan_destruction_reason::none;
-            return out;
+            // Removing an interior checkpoint merges its two replay intervals.
+            // Thin the smallest resulting interval, retaining history coverage.
+            // The incoming checkpoint replaces the latest frontier, so prefer
+            // dropping that endpoint over the earliest if no interior is free.
+            // These are preferences only: no new mandatory/pinned members.
+            const uint64_t span = !ordered ? 0 : i == 0 ? UINT64_MAX :
+                i + 1 == candidates.size() ? UINT64_MAX - 1 :
+                uint64_t(candidates[i + 1].n_tokens - candidates[i - 1].n_tokens);
+            if (!out.selected || span < best_span) {
+                out.selected = true;
+                out.ordinal = candidate.ordinal;
+                best_span = span;
+            }
         }
-        if (heuristic != UINT32_MAX) {
+        if (!out.selected && heuristic != UINT32_MAX) {
             out.selected = true;
             out.ordinal = heuristic;
+        }
+        if (out.selected) {
             out.reason = common_cache_plan_destruction_reason::none;
         }
     } catch (...) {

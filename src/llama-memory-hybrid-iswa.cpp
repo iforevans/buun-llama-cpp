@@ -1,4 +1,5 @@
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-io.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -272,7 +273,26 @@ void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id s
 
 void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     mem_attn->state_read(io, seq_id, flags);
-    mem_recr->state_read(io, seq_id, flags);
+    try {
+        mem_recr->state_read(io, seq_id, flags);
+    } catch (...) {
+        io.discard();
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            mem_attn->get_base()->state_clear(seq_id);
+        }
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY) == 0) {
+            mem_attn->get_swa()->state_clear(seq_id);
+        }
+        throw;
+    }
+}
+
+void llama_memory_hybrid_iswa::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    mem_attn->state_write_range(io, seq_id, p0, p1);
+}
+
+void llama_memory_hybrid_iswa::state_append_range(llama_io_read_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos p_limit) {
+    mem_attn->state_append_range(io, seq_id, p0, p1, p_limit);
 }
 
 llama_kv_cache_iswa * llama_memory_hybrid_iswa::get_mem_attn() const {

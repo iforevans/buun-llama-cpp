@@ -1561,6 +1561,9 @@ bool server_retention_sidecar_store::clone_exact_prefix(
             record.stamp.mapped_turn_ordinal = 0;
             record.stamp.anchor_rank = 0;
         }
+        if (record.kind != common_retention_artifact_kind::checkpoint) {
+            record.stamp.mandatory_anchor = false;
+        }
         server_cache_lease_identity checkpoint_identity;
         const server_cache_lease_identity * checkpoint_identity_ptr = nullptr;
         if (item->checkpoint_identity_known) {

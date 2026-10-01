@@ -106,7 +106,7 @@ static bool refresh_frontier(
 }
 
 static bool sample_control_store_budget(
-        void *, llama_cache_budget_config & output) noexcept {
+        void *, llama_cache_budget_config & output, uint64_t) noexcept {
     output = {};
     output.host.pageable_state =
         llama_cache_budget_capacity_state::unbounded;

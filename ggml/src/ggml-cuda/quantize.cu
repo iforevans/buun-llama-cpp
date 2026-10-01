@@ -533,7 +533,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool quantized_sum = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -581,7 +581,7 @@ static __global__ void quantize_mmq_q8_1(
     }
 
     float sum;
-    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4 && !quantized_sum) {
         sum = xi.x + xi.y + xi.z + xi.w;
 
         // Calculate sums across vals_per_sum/4 threads.
@@ -598,6 +598,19 @@ static __global__ void quantize_mmq_q8_1(
     q.z = roundf(xi.z*d_inv);
     q.w = roundf(xi.w*d_inv);
     const float d = 1.0f / d_inv;
+
+    if constexpr (quantized_sum) {
+        static_assert(ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4);
+        // MMVQ applies Q5's offset to the reconstructed Q8 activations, not to
+        // the original float sums. Preserve that correction when moving a head
+        // to MMQ; activation codes and their scales are unchanged.
+        int qsum = int(q.x) + int(q.y) + int(q.z) + int(q.w);
+#pragma unroll
+        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+            qsum += __shfl_xor_sync(0xFFFFFFFFULL, qsum, offset, WARP_SIZE);
+        }
+        sum = __half2float(__float2half(d)) * qsum;
+    }
 
     // write the block once (normal) or to each of the token's compact rows (scatter)
     const int nwrite = scatter ? n_expert_used : 1;
@@ -680,6 +693,19 @@ void quantize_mmq_q8_1_cuda(
             GGML_ABORT("fatal error");
             break;
     }
+}
+
+void quantize_mmq_q8_1_quantized_sum_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(type_src0 == GGML_TYPE_Q5_K);
+    GGML_ASSERT(ne00 % 4 == 0 && ne0 % QK8_1_MMQ == 0);
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, true>
+        <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0);
 }
 
 // scatter=true reuses the quant kernel: grid over tokens, ids = inverse map (token slot -> compact row)

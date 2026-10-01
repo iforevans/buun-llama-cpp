@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "convert.cuh"
 #include "fwht.cuh"
 #include "dequantize.cuh"
 

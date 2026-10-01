@@ -1060,6 +1060,15 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error(format("%s: failed to load model from file pointer", __func__));
         }
 
+        // An embedded GGUF's data offset is absolute in the borrowed file.
+        // Native tensor sources have their own region/alignment checks.
+        const size_t tensor_align = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+        if (use_mmap && gguf_get_data_offset(metadata) % tensor_align != 0) {
+            ggml_free(ctx);
+            throw std::runtime_error(format("%s: GGUF data section at file offset %zu is not %zu byte aligned, cannot mmap",
+                __func__, gguf_get_data_offset(metadata), tensor_align));
+        }
+
         resolve_model_architecture(*this);
 
         files.emplace_back(new llama_file(file));
@@ -1788,6 +1797,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_backend_buffer_type_t buft = nullptr;
+        bool explicit_buft = false;
 
         // check overrides
         if (tensor_buft_overrides) {
@@ -1806,6 +1816,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+                        explicit_buft = true;
                     }
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
@@ -1826,9 +1837,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // avoid using a host buffer when using mmap. Native safetensors sources cannot mmap (the
         // tensors are repacked on load) but follow the same rule: page-locking a 170 GB expert set
-        // costs ~120 s per start, and the MoE cache stages its fills through its own pinned ring.
+        // costs ~120 s per start. An explicit host-buffer override opts into that cost
+        // and resident RAM use; ordinary CPU overrides retain the mmap policy.
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if ((use_mmap || tensor_source != nullptr) && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        if (!explicit_buft && (use_mmap || tensor_source != nullptr) && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");

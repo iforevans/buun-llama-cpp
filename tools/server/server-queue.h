@@ -32,7 +32,8 @@ public:
     };
 
     // Move-only cancellation session for one synchronous idle capture. Task
-    // arrivals cancel it; they never wait for or reject normal queue work.
+    // arrivals cancel background sessions. A scheduler-owned displacement
+    // session instead finishes synchronously before mutation of its source.
     class idle_capture_session {
     public:
         idle_capture_session() noexcept = default;
@@ -199,6 +200,11 @@ public:
     // synchronous SWA frontier capture. Any real/deferred task still wins.
     idle_capture_session try_begin_prompt_boundary_capture() noexcept;
 
+    // Scheduler-only, synchronous preservation before replacing an idle slot.
+    // Queued arrivals do not interrupt this bounded transaction; explicit
+    // cancellation, shutdown, and the caller's transfer deadline still do.
+    idle_capture_session try_begin_displacement_capture() noexcept;
+
     // Worker-safe scheduler wake used only to run the registered idle
     // maintenance callback. It never fabricates a task or bypasses task
     // priority; a concurrently queued task wins and cancels the capture.
@@ -249,7 +255,9 @@ public:
     }
 
 private:
-    void cancel_idle_capture_locked() noexcept;
+    enum class capture_mode { idle, prompt_boundary, displacement };
+    idle_capture_session try_begin_capture(capture_mode mode) noexcept;
+    void cancel_idle_capture_locked(bool force = false) noexcept;
     void cleanup_pending_task(int id_target);
 
     // process all pending tasks in the queue

@@ -74,6 +74,10 @@ bool server_cache_plan_preflight_exposure_allowed(
     const std::string & hostname,
     size_t api_key_count) noexcept;
 
+bool server_cache_plan_preflight_exposure_allowed(
+    const std::vector<std::string> & hostnames,
+    size_t api_key_count) noexcept;
+
 bool server_cache_plan_preflight_request_field_allowed(
     std::string_view field) noexcept;
 

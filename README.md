@@ -220,6 +220,12 @@ devices. `--moe-cache on` forces canonical CPU expert weights immediately. `soft
 when partial expert eviction is specifically desired: it first tries spare VRAM with stock placement,
 then evicts the minimum expert footprint needed to form cache pools.
 
+For a CUDA host with enough RAM for the entire expert set, you can also benchmark
+`-ot 'exps=CUDA_Host'`. This explicitly requests pinned host weights, allowing direct
+asynchronous cache fills without an intermediate host copy. It is not the default:
+pinning can increase load time and prevents those weights from being paged out.
+Keep ordinary CPU placement for SSD-paged or RAM-constrained setups.
+
 ### EXL3 and CPU overlap
 
 EXL3 supports CPU expert execution and CUDA/HIP MoE caching. HIP also supports

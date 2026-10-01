@@ -211,8 +211,10 @@ static bool check_matrix(ggml_backend_dev_t * devices, int axis, int tokens, ggm
 
 int main(int argc, char ** argv) {
     auto * reg = ggml_backend_cuda_reg();
-    if (ggml_backend_reg_dev_count(reg) < 2) return 77;
-    ggml_backend_dev_t devices[] = {ggml_backend_reg_dev_get(reg, 0), ggml_backend_reg_dev_get(reg, 1)};
+    if (ggml_backend_reg_dev_count(reg) < 1) return 77;
+    // one GPU stands in for two devices: each still gets its own shard buffer
+    ggml_backend_dev_t devices[] = {ggml_backend_reg_dev_get(reg, 0),
+                                    ggml_backend_reg_dev_get(reg, ggml_backend_reg_dev_count(reg) > 1 ? 1 : 0)};
     if (argc > 1 && std::string(argv[1]) == "matrix") {
         if (argc < 4) return 2;
         matrix_shape shape;

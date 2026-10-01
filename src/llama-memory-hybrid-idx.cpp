@@ -347,6 +347,13 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     } catch (...) {
         // a half-restored context is the one state the indexer cannot fix by itself: attention holds new cells, the indexer old ones
         // drop what was being restored from all of them, which is a state they do agree on.
+        io.discard();
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            get_mem_attn()->state_clear(seq_id);
+            if (mem_idx) {
+                mem_idx->state_clear(seq_id);
+            }
+        }
         state_drop(seq_id);
 
         throw;
@@ -482,7 +489,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        bool causal_attn) const {
     GGML_ASSERT(mem != nullptr);
 
     GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
@@ -742,8 +750,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                     }
 
                     const int64_t block_start = query_ranked ? b*r : pos_at(0, b);
-                    cur_blk_bias[b] = block_start >= tail_start ? 1e9f :
-                        (direct && pos_at(2, b) == 0 ? -INFINITY : 0.0f);
+                    const bool incomplete = direct && pos_at(2, b) == 0;
+                    cur_blk_bias[b] = !causal_attn ? (incomplete ? 1e9f : 0.0f) :
+                        (block_start >= tail_start ? 1e9f : (incomplete ? -INFINITY : 0.0f));
                 }
 
                 if (have_dead) {
@@ -763,7 +772,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                     if (!cells.seq_has((uint32_t) cell, seq_id)) {
                         continue;
                     }
-                    if (rank <= q) {
+                    if (!causal_attn) {
+                        cur_bias[cell] = cur_cell_blk[cell] < 0 ? 1e9f : 0.0f;
+                    } else if (rank <= q) {
                         cur_bias[cell] = rank >= tail_start ? 1e9f :
                             (cur_cell_blk[cell] < 0 ? -INFINITY : 0.0f);
                     }
@@ -773,9 +784,15 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 for (int64_t j = 0; j < n_kv; ++j) {
                     float v = -INFINITY;
 
-                    if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) <= q) {
-                        v = cells.pos_get(j) >= tail_start ? 1e9f :
-                            (cur_cell_blk[j] < 0 ? -INFINITY : 0.0f);
+                    if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+                        if (!causal_attn) {
+                            const bool incomplete = cur_cell_blk[j] < 0 ||
+                                (direct && pos_at(2, cur_cell_blk[j]) == 0);
+                            v = incomplete ? 1e9f : 0.0f;
+                        } else if (cells.pos_get(j) <= q) {
+                            v = cells.pos_get(j) >= tail_start ? 1e9f :
+                                (cur_cell_blk[j] < 0 ? -INFINITY : 0.0f);
+                        }
                     }
 
                     cur_bias[j] = v;

@@ -1224,63 +1224,6 @@ uint8_t turbo_find_nearest_2bit(float val) {
     else                                return 3;
 }
 
-// === TURBO2: SET_ROWS kernel ===
-template<typename idx_t>
-static __global__ void k_set_rows_turbo2(
-        const float * __restrict__ src0, const idx_t * __restrict__ src1,
-        block_turbo2_0 * __restrict__ dst, const int64_t ne_total_groups,
-        const int64_t ne00, const int64_t ne01, const int64_t ne02,
-        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
-        const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t s10, const int64_t s11, const int64_t s12,
-        const float * __restrict__ kmean_mu,
-        const int64_t s1,  const int64_t s2,  const int64_t s3,
-        const uint3 ne00_fd, const uint3 ne01_fd, const uint3 ne02_fd,
-        const uint3 ne11_fd, const uint3 ne12_fd) {
-    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
-    if (i >= ne_total_groups) return;
-    const int64_t i_base = i * QK_TURBO2_GROUP;
-    uint32_t tmp = (uint32_t)i_base; uint2 div_mod;
-    div_mod = fast_div_modulo(tmp, ne00_fd); const int64_t i00 = div_mod.y; tmp = div_mod.x;
-    div_mod = fast_div_modulo(tmp, ne01_fd); const int64_t i01 = div_mod.y; tmp = div_mod.x;
-    div_mod = fast_div_modulo(tmp, ne02_fd); const int64_t i02 = div_mod.y; const int64_t i03 = div_mod.x;
-    const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
-    const int64_t i11 = fastmodulo((uint32_t)i02, ne11_fd);
-    const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
-    const float * grp_src = src0 + i01*s01 + i02*s02 + i03*s03 + i00;
-    block_turbo2_0 * dst_row_ptr = (block_turbo2_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
-    const int grp_idx = i00 / QK_TURBO2_GROUP;
-    const int blocks_per_group = QK_TURBO2_GROUP / QK_TURBO2;
-    float x[128]; float norm_sq = 0.0f;
-    for (int j = 0; j < 128; j++) { x[j] = grp_src[j]; norm_sq += x[j] * x[j]; }
-    // K-mean subtract (raw domain): re-derive the norm from the centered vector
-    if (kmean_mu != nullptr) {
-        norm_sq = 0.0f;
-        for (int j = 0; j < 128; j++) { x[j] -= kmean_mu[i00 + j]; norm_sq += x[j] * x[j]; }
-    }
-    float grp_norm = sqrtf(norm_sq);
-    float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
-    for (int j = 0; j < 128; j++) x[j] *= inv_norm;
-    turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
-    float recon_norm_sq = 0.0f;
-    for (int b = 0; b < blocks_per_group; b++) {
-        block_turbo2_0 & blk = dst_row_ptr[grp_idx * blocks_per_group + b];
-        const int off = b * QK_TURBO2;
-        for (int j = 0; j < QK_TURBO2 / 4; j++) blk.qs[j] = 0;
-        for (int j = 0; j < QK_TURBO2; j++) {
-            uint8_t idx = turbo_find_nearest_2bit(x[off + j]);
-            blk.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
-            float c = d_turbo_centroids_2bit[idx];
-            recon_norm_sq += c * c;
-        }
-    }
-    float recon_norm = sqrtf(recon_norm_sq);
-    float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
-    for (int b = 0; b < blocks_per_group; b++) {
-        dst_row_ptr[grp_idx * blocks_per_group + b].norm = __float2half(corrected_norm);
-    }
-}
-
 // === TURBO2: GET_ROWS dequantize ===
 #define QR_TURBO2_0 2
 static __device__ __forceinline__
@@ -1474,27 +1417,12 @@ static inline void turbo_tcq_load_kv_encode() {
         fprintf(stderr, "TCQ encode: K/V-split codebooks (K=%s V=%s) hotswap=%d\n", kp?kp:"compiled", vp?vp:"compiled", hot);
 }
 
-// TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis.
-// One block per 128-element group; block width is selected at the launch site.
+// TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis (HIP; CUDA uses
+// k_set_rows_turbo3_tcq_warp below). One block per 128-element group; block width is selected at
+// the launch site: the 128 barrier-synced ACS steps make RDNA (wave32) barrier-bound, so narrower
+// blocks win large batches and wider ones small decode batches.
 // Double-buffered cost arrays + global memory backtrace (128 syncs/group, was 384)
 template<int nt, typename idx_t>
-// minBlocks=2: the 128-step Viterbi is __syncthreads-latency-bound; a second resident block
-// per SM hides the sync stalls (pp512 tax vs turbo4 was ~4% with minBlocks=1).
-// Viterbi-encode block width. The kernel does 128 sequential s_barrier-synced ACS steps, so the
-// barrier cost scales with waves/block. AMD RDNA (wave32) is barrier-bound here: 512 thr = 16 waves
-// = expensive block barriers; 128 thr = 4 waves = cheap -> +24.5% prefill on gfx1151 (BIT-EXACT,
-// only argmin tie-break differs). NVIDIA is the opposite: the author tuned 512 on a 3090 and 128
-// regresses it (-3.3% pp / -1.7% tg on the Qwen D=128 boxmodel, same-tree A/B 2026-07-08).
-// TODO(gate-axis): the AMD branch is validated only on gfx1151/RDNA3.5. CDNA is wave64 (untested,
-// different barrier math) and discrete RDNA occupancy may differ -> A/B on the RDNA4 9070XT to decide
-// whether to narrow this to RDNA/wave32 (or a runtime warpSize check). See memory project_encode_remap_cuda_gate.
-#ifndef TCQ3_ENC_NT
-#if defined(__HIP_PLATFORM_AMD__) || defined(GGML_USE_HIP)
-#define TCQ3_ENC_NT 128   // AMD RDNA (gfx1151 validated): fewer wave32 waves -> cheaper block barriers
-#else
-#define TCQ3_ENC_NT 512   // NVIDIA: author-tuned optimum (128 regresses on the 3090)
-#endif
-#endif
 static __global__ void __launch_bounds__(nt) k_set_rows_turbo3_tcq(
         const float * __restrict__ src0, const idx_t * __restrict__ src1,
         block_turbo3_tcq * __restrict__ dst, const int64_t ne_total_groups,
@@ -1811,6 +1739,252 @@ static __global__ void __launch_bounds__(nt) k_set_rows_turbo3_tcq(
         dst_blk->norm = __float2half(corrected_norm);
     }
 }
+
+// Same encode as k_set_rows_turbo3_tcq<512>, one warp per 128-element group, bit-identical output.
+// Lane l owns the predecessor groups g = l and l + 32 and the 16 states g | out << 6, so its
+// codebook values are loop-invariant registers and each step needs only __syncwarp. The block
+// kernel spends most of each step on two block barriers and a lane-divergent __constant__
+// codebook read (serialized per address). Element i of the group lives in lane i & 31, slot i >> 5.
+#define TCQ3_WARP_COST_IDX(s) ((s) + ((s) >> 5))   // pad: the stride-8 predecessor reads hit 32 banks
+template<typename idx_t>
+static __global__ void __launch_bounds__(32) k_set_rows_turbo3_tcq_warp(
+        const float * __restrict__ src0, const idx_t * __restrict__ src1,
+        block_turbo3_tcq * __restrict__ dst, const int64_t ne_total_groups,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s10, const int64_t s11, const int64_t s12,
+        const int innerq_is_k, const float * __restrict__ kvmean_mu,
+        const int64_t s1,  const int64_t s2,  const int64_t s3,
+        const uint3 ne00_fd, const uint3 ne01_fd, const uint3 ne02_fd,
+        const uint3 ne11_fd, const uint3 ne12_fd) {
+
+    const int64_t group = blockIdx.x;
+    if (group >= ne_total_groups) return;
+    const int lane = threadIdx.x;
+
+    const int64_t i_base = group * QK_TURBO3_TCQ;
+    uint32_t tmp = (uint32_t)i_base; uint2 div_mod;
+    div_mod = fast_div_modulo(tmp, ne00_fd); const int64_t i00 = div_mod.y; tmp = div_mod.x;
+    div_mod = fast_div_modulo(tmp, ne01_fd); const int64_t i01 = div_mod.y; tmp = div_mod.x;
+    div_mod = fast_div_modulo(tmp, ne02_fd); const int64_t i02 = div_mod.y; const int64_t i03 = div_mod.x;
+    const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
+    const int64_t i11 = fastmodulo((uint32_t)i02, ne11_fd);
+    const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
+    if (dst_row < 0) return;
+    const float * grp_src = src0 + i01*s01 + i02*s02 + i03*s03 + i00;
+    block_turbo3_tcq * dst_blk = (block_turbo3_tcq *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3)
+                                  + (i00 / QK_TURBO3_TCQ);
+
+    __shared__ float x[128];
+    __shared__ float cost_a[TCQ3_WARP_COST_IDX(512)];
+    __shared__ float cost_b[TCQ3_WARP_COST_IDX(512)];
+    __shared__ uint8_t bt[128 * 64];
+
+    float v[4];
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int i = lane + 32*k;
+        v[k] = grp_src[i];
+        if (d_innerq_calibrate) {
+            atomicAdd(&d_innerq_channel_sq[i], v[k] * v[k]);
+            float abs_val = fabsf(v[k]);
+            unsigned int * addr = (unsigned int *)&d_innerq_channel_max[i];
+            unsigned int old_val = __float_as_uint(abs_val);
+            unsigned int assumed;
+            do {
+                assumed = *addr;
+                if (__uint_as_float(assumed) >= abs_val) break;
+            } while (atomicCAS(addr, assumed, old_val) != assumed);
+        }
+        if (kvmean_mu != nullptr) v[k] -= kvmean_mu[i00 + i];
+        v[k] *= d_innerq_channel_scale[i];
+    }
+    if (d_innerq_calibrate && lane == 0) atomicAdd(&d_innerq_count, 1);
+
+    // Sums of 128 squares in the block kernel's order: (i + 64 folded first, then i + 32), then
+    // the lane shuffle tree. __fmul_rn keeps the squares from contracting into the adds.
+    auto sum_sq_128 = [&](const float * q) -> float {
+        float s = (__fmul_rn(q[0], q[0]) + __fmul_rn(q[2], q[2])) + (__fmul_rn(q[1], q[1]) + __fmul_rn(q[3], q[3]));
+        s += __shfl_down_sync(0xFFFFFFFFULL, s, 16);
+        s += __shfl_down_sync(0xFFFFFFFFULL, s, 8);
+        s += __shfl_down_sync(0xFFFFFFFFULL, s, 4);
+        s += __shfl_down_sync(0xFFFFFFFFULL, s, 2);
+        s += __shfl_down_sync(0xFFFFFFFFULL, s, 1);
+        return __shfl_sync(0xFFFFFFFFULL, s, 0);
+    };
+    const float grp_norm = sqrtf(sum_sq_128(v));
+    const float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+
+    // FWHT: stages 1..16 across lanes, stages 32 and 64 across a lane's own slots.
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        v[k] *= inv_norm;
+        v[k] = v[k] * d_turbo_wht_signs1[lane + 32*k];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float other = __shfl_xor_sync(0xFFFFFFFFULL, v[k], h);
+            v[k] = (lane & h) ? (other - v[k]) : (v[k] + other);
+        }
+    }
+    {
+        float a = v[0], b = v[1]; v[0] = a + b; v[1] = a - b;
+        a = v[2]; b = v[3];       v[2] = a + b; v[3] = a - b;
+        a = v[0]; b = v[2];       v[0] = a + b; v[2] = a - b;
+        a = v[1]; b = v[3];       v[1] = a + b; v[3] = a - b;
+    }
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        v[k] *= inv_sqrt_128 * d_turbo_wht_signs2[lane + 32*k];
+        x[lane + 32*k] = v[k];
+    }
+    __syncwarp();
+    if (lane == 0) turbo_extract_append(x);
+
+    const float * cb_enc = innerq_is_k ? d_turbo3_tcq_codebook : d_turbo3_tcq_codebook_v;
+    float cb[2][8];
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+#pragma unroll
+        for (int out = 0; out < 8; out++) {
+            const int s = lane + 32*h + 64*out;
+            cb[h][out] = cb_enc[s];
+            cost_a[TCQ3_WARP_COST_IDX(s)] = 0.0f;
+        }
+    }
+    __syncwarp();
+
+    // Viterbi forward pass. The predecessor scan keeps the block kernel's order and tie rule.
+    for (int t = 0; t < 128; t++) {
+        const float * cost_rd = (t & 1) ? cost_b : cost_a;
+        float       * cost_wr = (t & 1) ? cost_a : cost_b;
+        const float xt = x[t];
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const int g = lane + 32*h;
+            float c[8];
+#pragma unroll
+            for (int p = 0; p < 8; p++) c[p] = cost_rd[TCQ3_WARP_COST_IDX((g << 3) | p)];
+            float best = c[0];
+            int best_p = 0;
+#pragma unroll
+            for (int p = 1; p < 8; p++) {
+                if (c[p] < best || (d_tcq_tiehi && c[p] == best)) {
+                    best = c[p];
+                    best_p = p;
+                }
+            }
+            bt[t * 64 + g] = (uint8_t) best_p;
+#pragma unroll
+            for (int out = 0; out < 8; out++) {
+                float dist = xt - cb[h][out];
+                dist = dist * dist;
+                cost_wr[TCQ3_WARP_COST_IDX(g | (out << 6))] = best + dist;
+            }
+        }
+        __syncwarp();
+    }
+
+    // Best final state (final costs are in cost_a after the even step count). Equal costs resolve
+    // like the block kernel's reduction over 16 warps x 32 lanes: shfl_down across warps and a
+    // shfl_xor butterfly within a warp each keep the lower bit-reversed index.
+    float best_cost = 3.4028234663852886e38f;
+    int best_key = 0x7FFFFFFF;
+    int best_state = 0;
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+#pragma unroll
+        for (int out = 0; out < 8; out++) {
+            const int s = lane + 32*h + 64*out;
+            const float c = cost_a[TCQ3_WARP_COST_IDX(s)];
+            const int key = (int)((__brev((unsigned)(s >> 5)) >> 28) << 5 | (__brev((unsigned)(s & 31)) >> 27));
+            if (c < best_cost || (c == best_cost && key < best_key)) {
+                best_cost = c; best_key = key; best_state = s;
+            }
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float oc = __shfl_xor_sync(0xFFFFFFFFULL, best_cost, offset);
+        const int   ok = __shfl_xor_sync(0xFFFFFFFFULL, best_key, offset);
+        const int   os = __shfl_xor_sync(0xFFFFFFFFULL, best_state, offset);
+        if (oc < best_cost || (oc == best_cost && ok < best_key)) {
+            best_cost = oc; best_key = ok; best_state = os;
+        }
+    }
+
+    if (d_tcq_dump_max > 0 && group < d_tcq_dump_max) {
+#pragma unroll
+        for (int k = 0; k < 4; k++) d_tcq_dump_x_buf[group * 128 + lane + 32*k] = x[lane + 32*k];
+    }
+    __syncwarp();
+
+    uint8_t * outputs = (uint8_t *)x;
+    int initial_state = 0;
+    if (lane == 0) {
+        int state = best_state;
+        for (int t = 127; t >= 0; t--) {
+            outputs[t] = (uint8_t)(state >> 6);
+            int p = bt[t * 64 + (state & 0x3F)];
+            state = ((state & 0x3F) << 3) | p;
+        }
+        initial_state = state;
+    }
+    initial_state = __shfl_sync(0xFFFFFFFFULL, initial_state, 0);
+    __syncwarp();
+
+    if (d_tcq_dump_max > 0 && group < d_tcq_dump_max) {
+#pragma unroll
+        for (int k = 0; k < 4; k++) d_tcq_dump_out_buf[group * 128 + lane + 32*k] = outputs[lane + 32*k];
+    }
+
+    float rc[4];
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int t = lane + 32*k;
+        int cur_state;
+        if (t < 2) {
+            cur_state = initial_state;
+            for (int u = 0; u <= t; u++)
+                cur_state = (cur_state >> 3) | (((int)outputs[u]) << 6);
+        } else {
+            cur_state = ((int)outputs[t - 2] & 0x7)
+                      | (((int)outputs[t - 1] & 0x7) << 3)
+                      | (((int)outputs[t]     & 0x7) << 6);
+        }
+        rc[k] = cb_enc[cur_state];
+    }
+    const float recon_norm = sqrtf(sum_sq_128(rc));
+    float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+    corrected_norm *= innerq_is_k ? d_tcq_norm_alpha : d_tcq_norm_alpha_v;
+
+    // qs: 6 initial-state bits, then 128 3-bit output symbols (49 bytes).
+    const int init_bits = (initial_state >> 3) & 0x3F;
+    for (int byte = lane; byte < 49; byte += 32) {
+        uint8_t packed = 0;
+#pragma unroll
+        for (int bit = 0; bit < 8; bit++) {
+            const int pos = byte * 8 + bit;
+            int b = 0;
+            if (pos < 6) {
+                b = (init_bits >> pos) & 1;
+            } else {
+                const int sym_bit_pos = pos - 6;
+                const int sym_idx = sym_bit_pos / 3;
+                if (sym_idx < 128) {
+                    b = (outputs[sym_idx] >> (sym_bit_pos % 3)) & 1;
+                }
+            }
+            packed |= (uint8_t)(b << bit);
+        }
+        dst_blk->qs[byte] = packed;
+    }
+    if (lane == 0) {
+        dst_blk->norm = __float2half(corrected_norm);
+    }
+}
+#undef TCQ3_WARP_COST_IDX
 
 // TCQ GET_ROWS dequantize (for non-FA paths)
 #define QR_TURBO3_TCQ 2

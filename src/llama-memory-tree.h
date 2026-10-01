@@ -21,6 +21,9 @@ struct llama_memory_tree_child {
     // Optional fixed-precision index state that must travel atomically with
     // this attention child. It is a companion, never another VBR controller.
     llama_memory_hybrid_idx * qsa_index_owner = nullptr;
+    // A sliding-window child: a sequence owns only the suffix its window keeps,
+    // so its rows are placed exactly but never projected to a shorter prefix.
+    bool window = false;
 };
 
 bool llama_memory_tree_collect(

@@ -98,7 +98,13 @@ __global__ void topk_moe_cuda(const float *         logits,
                               const float           clamp_val,
                               const float           scale_val,
                               const topk_moe_config config) {
+    const bool valid_row = blockIdx.x * blockDim.y + threadIdx.y < n_rows;
+#if defined(GGML_USE_MUSA)
+    // MUSA: every warp of a partially filled block must reach the barrier below.
+    const int row = MIN(blockIdx.x * blockDim.y + threadIdx.y, n_rows - 1);
+#else
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
+#endif // defined(GGML_USE_MUSA)
     if (row >= n_rows) {
         return;
     }
@@ -242,7 +248,9 @@ __global__ void topk_moe_cuda(const float *         logits,
         }
 
         if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-            ids[k] = max_expert;
+            if (valid_row) {
+                ids[k] = max_expert;
+            }
             if (config.with_norm) {
                 wt_sum += max_val;
             }
@@ -266,7 +274,7 @@ __global__ void topk_moe_cuda(const float *         logits,
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {
         const int idx = i * WARP_SIZE + threadIdx.x;
-        if (idx < n_expert_used) {
+        if (valid_row && idx < n_expert_used) {
             weights[idx] = output_weights[i] * scale_val;
         }
     }

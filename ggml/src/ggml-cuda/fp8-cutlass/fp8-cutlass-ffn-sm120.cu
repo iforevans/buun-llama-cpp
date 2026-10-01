@@ -17,6 +17,8 @@ struct PairedEpilogue {
     using StorePipeline      = typename Base::StorePipeline;
     using StorePipelineState = typename Base::StorePipelineState;
     using PipelineStorage    = typename Base::PipelineStorage;
+    using GmemTiledCopyC     = typename Base::GmemTiledCopyC;
+    using GmemTiledCopyD     = typename Base::GmemTiledCopyD;
     using EpilogueTile       = Shape<_128, _128>;
 
     struct TensorStorage {};

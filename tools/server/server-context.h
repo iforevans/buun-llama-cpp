@@ -41,6 +41,11 @@ server_committed_decode_reset_test_result
 server_committed_decode_reset_for_test();
 
 bool server_active_prefix_retention_for_test();
+bool server_vbr_media_publish_for_test(const server_tokens & ledger);
+bool server_vbr_restored_stem_for_test(
+    server_prompt_cache & cache, const server_prompt & prompt,
+    const std::string & execution, const std::string & adapter, bool available);
+bool server_resume_media_placement_for_test(const server_tokens & ledger);
 
 struct server_slot_frontier_logits_test_result {
     bool round_trip = false;
@@ -64,6 +69,10 @@ struct server_slot_frontier_logits_test_result {
     bool nonfinite_logits_refused = false;
     bool torn_companion_refused = false;
     bool missing_companion_is_cold = false;
+    bool resume_ledger_round_trip = false;
+    bool resume_ledger_refuses_logits = false;
+    bool resume_routes_do_not_cross = false;
+    bool resume_key_mutation_refused = false;
     bool destination_slot_rebound = false;
     bool destination_epoch_rebound = false;
     bool source_process_epoch_not_reused = false;
@@ -97,9 +106,12 @@ server_vbr_occupied_quarantine_reset_for_test();
 struct server_vbr_empty_handoff_gate {
     size_t slot_count = 0;
     uint64_t incoming_prefix = 0;
-    uint64_t incumbent_lcp = 0;
+    uint64_t incumbent_reusable = 0;
     uint64_t durable_incumbent_prefix = 0;
     bool exact_incumbent_durable = false;
+    // the occupied route refused the request before any write: no atomic route for the memory
+    // tree/layout, or no room for both conversations
+    bool occupied_route_refused = false;
     bool hard_lease = false;
     bool deferred_task = false;
     bool incumbent_supported = false;
@@ -114,7 +126,8 @@ bool server_vbr_empty_handoff_allowed(
 
 bool server_vbr_live_source_displacement_allowed(
     bool kv_unified,
-    size_t slot_count) noexcept;
+    size_t slot_count,
+    bool persistent_resume) noexcept;
 
 bool server_vbr_stem_matches_capture_source(
     bool valid,
@@ -199,6 +212,8 @@ struct server_vbr_reclaim_policy_result {
     bool successful_attempt_is_state_sealed = false;
     bool multi_fresh_pressure_isolated = false;
     bool fragmented_projection_retries_exact = false;
+    bool projected_capture_requires_idle_source = false;
+    bool stash_projection_retries_exact = false;
     bool isolated_capture_drains_without_backoff = false;
     bool unchanged_admission_refusal_is_suppressed = false;
     bool checkpoint_admission_refusals_are_independent = false;
@@ -414,7 +429,7 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_capture(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_import(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
-    std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const mtmd_helper_init_opt & init_opt, const server_http_req & req, task_response_type res_type);
+    std::unique_ptr<server_res_generator> handle_count_tokens(const server_http_req & req, task_response_type res_type);
 
     // using unique_ptr to allow late initialization of const
     std::unique_ptr<const server_context_meta> meta;

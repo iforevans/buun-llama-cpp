@@ -16,6 +16,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <limits>
 #include <set>
 #include <string>
@@ -1106,13 +1108,15 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         return false;
     }
 
-    // identical ubatch shapes from bit-exact states: a correct implementation
-    // matches bitwise, so eps only allows backend scheduling noise
+    // Identical replay shapes from exact states retain the fork's strict gate.
+    // NMSE is additional diagnostic context, not permission to relax rollback.
     constexpr float eps = 1e-7f;
 
     float    diff_max  = 0.0f;
     uint32_t seq_first = 0;
     int32_t  pos_first = -1;
+    double   nmse_ab   = 0.0;
+    double   nmse_a0   = 0.0;
     for (uint32_t i = 0; i < n_seqs*n_replay; ++i) {
         const float * l_roll = llama_get_logits_ith(ctx_roll.get(), i);
         const float * l_ref  = llama_get_logits_ith(ctx_ref.get(),  i);
@@ -1121,14 +1125,25 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
             return false;
         }
         for (int t = 0; t < n_vocab; ++t) {
-            const float diff = logit_diff(l_roll[t], l_ref[t]);
-            if (diff > eps && pos_first < 0) {
+            const float r = l_roll[t];
+            const float f = l_ref[t];
+            const float diff = logit_diff(r, f);
+            if (diff > 0.0f && pos_first < 0) {
                 seq_first = i/n_replay;
                 pos_first = p0 + (int32_t) (i%n_replay);
             }
             diff_max = std::max(diff_max, diff);
+            if (std::isfinite(r) && std::isfinite(f)) {
+                const double d = (double) r - f;
+                nmse_ab += d*d;
+                nmse_a0 += (double) r*r;
+            } else {
+                nmse_ab = std::numeric_limits<double>::infinity();
+                nmse_a0 = 1.0;
+            }
         }
     }
+    const double nmse_val = nmse_a0 == 0.0 ? (nmse_ab == 0.0 ? 0.0 : std::numeric_limits<double>::infinity()) : nmse_ab/nmse_a0;
 
     if (diff_max > eps) {
         fprintf(stderr, "%s : multi-seq split replay logits mismatch (max diff %g, first at seq %u pos %d)\n",
@@ -1136,7 +1151,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         return false;
     }
 
-    fprintf(stderr, "%s : multi-seq split replay matched (max diff %g)\n", __func__, (double) diff_max);
+    fprintf(stderr, "%s: multi-seq split replay matched (max diff %g, nmse %g)\n", __func__, (double) diff_max, nmse_val);
 
     // seq-1-only decodes must be independent of seq 0's content: diverge seq 0
     // in ctx_ref only, then compare identical seq-1-only continuations bitwise
@@ -1153,6 +1168,8 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     }
 
     float diff_tail = 0.0f;
+    double nmse_tail_ab = 0.0;
+    double nmse_tail_a0 = 0.0;
     for (uint32_t i = 0; i < n_tail && ok; ++i) {
         const llama_pos pos = p0 + (llama_pos) (n_replay + i);
         llama_batch batch_one = llama_batch_init(1, 0, 1);
@@ -1168,9 +1185,20 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         const float * l_ref  = llama_get_logits_ith(ctx_ref.get(),  0);
         ok = l_roll != nullptr && l_ref != nullptr;
         for (int t = 0; ok && t < n_vocab; ++t) {
-            diff_tail = std::max(diff_tail, logit_diff(l_roll[t], l_ref[t]));
+            const float r = l_roll[t];
+            const float f = l_ref[t];
+            diff_tail = std::max(diff_tail, logit_diff(r, f));
+            if (std::isfinite(r) && std::isfinite(f)) {
+                const double d = (double) r - f;
+                nmse_tail_ab += d*d;
+                nmse_tail_a0 += (double) r*r;
+            } else {
+                nmse_tail_ab = std::numeric_limits<double>::infinity();
+                nmse_tail_a0 = 1.0;
+            }
         }
     }
+    const double nmse_tail = nmse_tail_a0 == 0.0 ? (nmse_tail_ab == 0.0 ? 0.0 : std::numeric_limits<double>::infinity()) : nmse_tail_ab/nmse_tail_a0;
 
     if (!ok || diff_tail > eps) {
         fprintf(stderr, "%s : seq-1-only decode leaked seq 0 state (ok=%d, max diff %g)\n",
@@ -1178,7 +1206,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         return false;
     }
 
-    fprintf(stderr, "%s : seq-1-only decode independent of seq 0 (max diff %g)\n", __func__, (double) diff_tail);
+    fprintf(stderr, "%s : seq-1-only decode independent of seq 0 (max diff %g, nmse %g)\n", __func__, (double) diff_tail, nmse_tail);
     return true;
 }
 
@@ -1215,15 +1243,13 @@ static bool test_indexed_hybrid_tree_collection(const llama_model & model) {
     return true;
 }
 
-int main(int argc, char ** argv) {
+static int run_model(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     set_resize_test_fault(false);
 
     common_params params;
     params.sampling.seed = 1234;
     params.n_predict = 1;
-
-    common_init();
 
     std::vector<std::string> parser_args(argv, argv + argc);
     const auto fill_arg = std::find(parser_args.begin(), parser_args.end(), "--cache-pattern-fill");
@@ -1290,7 +1316,7 @@ int main(int argc, char ** argv) {
     // must remain distinct from the logical multi-sequence graph capacity.
     params.kv_unified = true;
 
-    ggml_backend_load_all();
+    llama_backend_init();
 
     if (shared_swa_only) {
         auto mparams = common_model_params_to_llama(params);
@@ -1346,7 +1372,7 @@ int main(int argc, char ** argv) {
 
     if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
         fprintf(stderr, "%s : skipping for non-recurrent model\n", __func__);
-        return 0;
+        return 77;
     }
 
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -1362,6 +1388,12 @@ int main(int argc, char ** argv) {
     if (!ctx_src || !ctx_test || !ctx_ref || !ctx_parallel) {
         fprintf(stderr, "%s : failed to init contexts\n", __func__);
         return 1;
+    }
+    // Hybrid is broader than the recurrent-plane owner exercised below. DS4's
+    // compressor state, for example, has its own cache and serialization tests.
+    if (get_recurrent(ctx_test.get()) == nullptr) {
+        fprintf(stderr, "%s : skipping memory without recurrent rollback planes\n", __func__);
+        return 77;
     }
     {
         auto prefix_ref = make_ctx(params, model, 3);
@@ -1400,11 +1432,10 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-
     auto * recurrent = get_recurrent(ctx_test.get());
     if (recurrent == nullptr || recurrent->n_rs_seq < 3) {
         fprintf(stderr, "%s : skipping because recurrent rollback depth is less than 3\n", __func__);
-        return 0;
+        return 77;
     }
     const uint32_t n_rs_seq = recurrent->n_rs_seq;
 
@@ -1652,15 +1683,30 @@ int main(int argc, char ** argv) {
     // A live logical sequence may occupy a high physical cell. Shrinking must
     // refuse atomically instead of truncating that recurrent state while leaving
     // the attention half reusable.
+    // Match placement and graph capacity in the no-shrink control. Comparing a
+    // high cell in a three-sequence graph to cell zero in a single-sequence graph
+    // also measures layout-dependent arithmetic, not just failure atomicity.
+    auto high_ref = make_ctx(params, model, 3);
+    if (!high_ref) {
+        return 1;
+    }
+    auto high_ref_mem = llama_get_memory(high_ref.get());
     llama_memory_clear(mem_parallel, true);
-    llama_memory_clear(llama_get_memory(ctx_ref.get()), true);
+    llama_memory_clear(high_ref_mem, true);
     if (!llama_memory_recurrent_expand(mem_parallel, 3) ||
+        !llama_memory_recurrent_expand(high_ref_mem, 3) ||
         !decode_range(ctx_parallel.get(), tokens, 0, 1, 1) ||
         !decode_range(ctx_parallel.get(), tokens, 0, 1, 2) ||
         !decode_range(ctx_parallel.get(), tokens, 0, 1, 0) ||
-        !decode_range(ctx_ref.get(), tokens, 0, 1, 0) ||
+        !decode_range(high_ref.get(), tokens, 0, 1, 1) ||
+        !decode_range(high_ref.get(), tokens, 0, 1, 2) ||
+        !decode_range(high_ref.get(), tokens, 0, 1, 0) ||
         !llama_memory_seq_rm(mem_parallel, 1, -1, -1) ||
-        !llama_memory_seq_rm(mem_parallel, 2, -1, -1)) {
+        !llama_memory_seq_rm(mem_parallel, 2, -1, -1) ||
+        !llama_memory_seq_rm(high_ref_mem, 1, -1, -1) ||
+        !llama_memory_seq_rm(high_ref_mem, 2, -1, -1) ||
+        !logits_equal(copy_logits(ctx_parallel.get(), n_vocab), copy_logits(high_ref.get(), n_vocab),
+                "high-cell no-shrink control", 0.0f)) {
         fprintf(stderr, "%s : high-cell shrink setup failed\n", __func__);
         return 1;
     }
@@ -1684,9 +1730,9 @@ int main(int argc, char ** argv) {
         !get_recurrent_epoch(recurrent_parallel, high_epoch_after) ||
         high_epoch_after != high_epoch_before ||
         !decode_range(ctx_parallel.get(), tokens, 1, 1, 0) ||
-        !decode_range(ctx_ref.get(), tokens, 1, 1, 0) ||
-        !logits_equal(copy_logits(ctx_parallel.get(), n_vocab), copy_logits(ctx_ref.get(), n_vocab),
-                "post-refused-high-cell-shrink continuation")) {
+        !decode_range(high_ref.get(), tokens, 1, 1, 0) ||
+        !logits_equal(copy_logits(ctx_parallel.get(), n_vocab), copy_logits(high_ref.get(), n_vocab),
+                "post-refused-high-cell-shrink continuation", 0.0f)) {
         fprintf(stderr, "%s : high-cell shrink was not failure-atomic\n", __func__);
         return 1;
     }
@@ -1834,4 +1880,66 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "%s : recurrent rollback-plane validity checks passed\n", __func__);
     return 0;
+}
+
+int main(int argc, char ** argv) {
+    common_init();
+    std::string models_dir;
+    std::vector<std::string> args;
+    args.emplace_back(argv[0]);
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--models") == 0) {
+            if (++i == argc) {
+                fprintf(stderr, "--models requires a directory\n");
+                return 1;
+            }
+            models_dir = argv[i];
+        } else {
+            args.emplace_back(argv[i]);
+        }
+    }
+    const auto run = [](std::vector<std::string> & values) {
+        std::vector<char *> pointers;
+        for (auto & value : values) {
+            pointers.push_back(value.data());
+        }
+        pointers.push_back(nullptr);
+        return run_model(int(values.size()), pointers.data());
+    };
+    if (models_dir.empty()) {
+        return run(args);
+    }
+    try {
+        std::vector<std::string> models;
+        for (const auto & entry : std::filesystem::directory_iterator(models_dir)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".gguf") {
+                models.push_back(entry.path().string());
+            }
+        }
+        std::sort(models.begin(), models.end());
+        size_t passed = 0, skipped = 0, failed = 0;
+        for (const auto & model : models) {
+            auto model_args = args;
+            model_args.insert(model_args.end(), { "-m", model });
+            int rc = 1;
+            try {
+                rc = run(model_args);
+            } catch (const std::exception & err) {
+                fprintf(stderr, "%s: %s\n", model.c_str(), err.what());
+            }
+            if (rc == 0) {
+                ++passed;
+            } else if (rc == 77) {
+                ++skipped;
+            } else {
+                ++failed;
+            }
+            fprintf(stderr, "%s: %s\n", model.c_str(), rc == 0 ? "PASS" : rc == 77 ? "SKIP" : "FAIL");
+        }
+        fprintf(stderr, "Rollback suite: %zu passed, %zu skipped, %zu failed\n", passed, skipped, failed);
+        return passed > 0 && failed == 0 ? 0 : 1;
+    } catch (const std::exception & err) {
+        fprintf(stderr, "Cannot enumerate models: %s\n", err.what());
+        return 1;
+    }
 }

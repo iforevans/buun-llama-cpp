@@ -5,11 +5,14 @@
 #include "llama-sha256.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <map>
 #include <new>
 #include <set>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -846,6 +849,31 @@ bool prepare_unit_id(vbr_artifact_unit_blob & blob, uint32_t format_version) {
     return blob.unit_version_id.valid();
 }
 
+// Compare the canonical schema, excluding only byte-derived evidence. Use
+// the latest wire schema so new representation fields automatically participate,
+// including fields that an older package version is not allowed to carry.
+std::array<uint8_t, 32> unit_schema_digest(
+        vbr_artifact_unit_descriptor descriptor) {
+    for (auto & shard : descriptor.shards) {
+        shard.section_checksum = {};
+    }
+    descriptor.clean_stash.payload_id = {};
+    for (auto & shard : descriptor.clean_stash.shards) {
+        shard.section_checksum = {};
+    }
+    llama_sha256_writer hash;
+    emitter out;
+    out.hash_a = &hash;
+    if (!emit_lineage(out, descriptor.lineage_uuid) ||
+        !out.u32(descriptor.logical_unit_id) || !out.u64(descriptor.repr_gen) ||
+        !emit_unit_descriptor_body(out, descriptor, VBR_UNIT_ARTIFACT_FORMAT_VERSION) ||
+        !out.u32(uint32_t(descriptor.clean_stash_state)) ||
+        !emit_clean_stash_descriptor(out, descriptor.clean_stash)) {
+        return {};
+    }
+    return hash.finish();
+}
+
 bool emit_identity(emitter & out, const vbr_artifact_identity_block & identity) {
     return out.bytes(identity.execution_identity.data(),
                      identity.execution_identity.size()) &&
@@ -1157,7 +1185,9 @@ bool placement_valid(
     }
 
     size_t next = 0;
-    std::map<std::pair<uint32_t, llama_seq_id>, std::set<llama_pos>>
+    // M-RoPE media has more cells than temporal positions. Its spatial
+    // coordinates distinguish cells at the same temporal position.
+    std::map<std::pair<uint32_t, llama_seq_id>, std::set<std::array<llama_pos, 3>>>
         logical_positions;
     for (const auto & controller : manifest.generation.controllers) {
         if (!carries_placement(controller)) {
@@ -1199,7 +1229,7 @@ bool placement_valid(
                     cell.logical_position >= manifest.identity.token_count ||
                     (i != 0 && placement.cells[i - 1].physical_cell >=
                                    cell.physical_cell) ||
-                    !source_positions.insert(cell.logical_position).second) {
+                    !source_positions.insert({cell.logical_position, cell.ext_x, cell.ext_y}).second) {
                     return false;
                 }
             }
@@ -1678,10 +1708,13 @@ bool prepared_identity_equal(
     return true;
 }
 
-bool prepare_companion(
+enum class companion_hash_kind { section, payload };
+
+bool prepare_companion_hash(
         uint32_t index,
         const std::vector<vbr_artifact_portable_topology> & topologies,
-        vbr_artifact_companion_payload & companion) {
+        vbr_artifact_companion_payload & companion,
+        companion_hash_kind kind) {
     if (companion.kind >= vbr_artifact_companion_kind::_count ||
         companion.format_version == 0 ||
         !digest_nonzero(companion.build_identity_digest) ||
@@ -1691,10 +1724,10 @@ bool prepare_companion(
         companion.payload.size != companion.payload_bytes) {
         return false;
     }
-    if (!digest_matches_source(
+    if (kind == companion_hash_kind::section) {
+        return digest_matches_source(
             DOMAIN_COMPANION, index, 0, companion.payload,
-            companion.section_checksum)) {
-        return false;
+            companion.section_checksum);
     }
     llama_sha256_writer hash;
     hash.string(DOMAIN_COMPANION, sizeof(DOMAIN_COMPANION) - 1);
@@ -1713,6 +1746,14 @@ bool prepare_companion(
     }
     companion.payload_digest = typed_digest<vbr_payload_digest>(hash);
     return companion.payload_digest.valid();
+}
+
+bool prepare_companion(
+        uint32_t index,
+        const std::vector<vbr_artifact_portable_topology> & topologies,
+        vbr_artifact_companion_payload & companion) {
+    return prepare_companion_hash(index, topologies, companion, companion_hash_kind::section) &&
+           prepare_companion_hash(index, topologies, companion, companion_hash_kind::payload);
 }
 
 bool emit_topology(emitter & out, const vbr_artifact_portable_topology & topology) {
@@ -2012,11 +2053,40 @@ bool emit_section_body_verified(
     return false;
 }
 
+size_t hash_worker_count(size_t count, uint32_t max_workers) {
+    return std::max<size_t>(1, std::min<size_t>(
+        { count, max_workers, 8, std::thread::hardware_concurrency() }));
+}
+
+// Companions follow attention units and can contain a large recurrent image.
+// Start at that end and let free workers claim more work rather than assigning
+// the companion and a fixed share of units to one worker. Results still land
+// at their canonical indices. Futures join even if thread creation or fn
+// throws; no worker may outlive the caller's data.
+template <typename F>
+void for_each_index_parallel(size_t count, size_t workers, const F & fn) {
+    std::atomic<size_t> next { 0 };
+    std::vector<std::future<void>> pending;
+    pending.reserve(workers);
+    for (size_t w = 0; w < workers; ++w) {
+        pending.push_back(std::async(std::launch::async, [&] {
+            for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < count;) {
+                fn(count - 1 - i);
+            }
+        }));
+    }
+    for (auto & worker : pending) {
+        worker.get();
+    }
+}
+
 bool prepare_sections(
         const vbr_artifact_package & package,
-        std::vector<section_descriptor> & sections) {
+        std::vector<section_descriptor> & sections,
+        uint32_t max_workers) {
     sections = section_inventory(package);
-    for (auto & section : sections) {
+    const auto prepare_one = [&](size_t i) {
+        auto & section = sections[i];
         llama_sha256_writer hash;
         hash.string(DOMAIN_SECTION, sizeof(DOMAIN_SECTION) - 1);
         hash.u32(uint32_t(section.kind));
@@ -2028,11 +2098,22 @@ bool prepare_sections(
         }
         section.size = body.count;
         section.checksum = hash.finish();
-        if (!digest_nonzero(section.checksum)) {
-            return false;
+        return digest_nonzero(section.checksum);
+    };
+    const size_t workers = hash_worker_count(sections.size(), max_workers);
+    if (workers == 1) {
+        for (size_t i = 0; i < sections.size(); ++i) {
+            if (!prepare_one(i)) {
+                return false;
+            }
         }
+        return true;
     }
-    return true;
+    std::vector<uint8_t> ok(sections.size());
+    for_each_index_parallel(sections.size(), workers, [&](size_t i) {
+        ok[i] = prepare_one(i);
+    });
+    return std::find(ok.begin(), ok.end(), 0) == ok.end();
 }
 
 std::array<uint8_t, 32> ordering_digest(
@@ -3226,7 +3307,8 @@ std::array<uint8_t, 32> vbr_artifact_logical_unit_digest(
 }
 
 vbr_artifact_status vbr_artifact_prepare(
-        vbr_artifact_package & package) noexcept {
+        vbr_artifact_package & package, uint32_t max_workers,
+        const vbr_artifact_preparation_reuse * reuse) noexcept {
     try {
         if (!artifact_version_supported(package.version) ||
             package.flags != ARTIFACT_FLAGS_V1 ||
@@ -3246,8 +3328,30 @@ vbr_artifact_status vbr_artifact_prepare(
                 return vbr_artifact_status::topology_mismatch;
             }
         }
-        for (uint32_t i = 0; i < package.unit_blobs.size(); ++i) {
+        const auto prepare_unit = [&](uint32_t i) {
             auto & blob = package.unit_blobs[i];
+            if (reuse && reuse->version == package.version && i < reuse->units.size() &&
+                reuse->units[i].unit_version_id.valid()) {
+                const auto schema = unit_schema_digest(blob.descriptor);
+                const auto & saved = reuse->units[i];
+                if (digest_nonzero(schema) &&
+                    schema == unit_schema_digest(saved.descriptor)) {
+                    auto prepared = saved;
+                    for (size_t s = 0; s < prepared.descriptor.shards.size(); ++s) {
+                        prepared.descriptor.shards[s].payload = blob.descriptor.shards[s].payload;
+                    }
+                    for (size_t s = 0; s < prepared.descriptor.clean_stash.shards.size(); ++s) {
+                        prepared.descriptor.clean_stash.shards[s].payload =
+                            blob.descriptor.clean_stash.shards[s].payload;
+                    }
+                    if (!descriptor_metadata_valid(
+                            prepared.descriptor, package.topologies, package.version, true)) {
+                        return vbr_artifact_status::content_id_mismatch;
+                    }
+                    blob = std::move(prepared);
+                    return vbr_artifact_status::ok;
+                }
+            }
             if (blob.descriptor.shards.empty() ||
                 !canonicalize_shards(blob.descriptor.shards) ||
                 !prepare_shard_checksums(i, blob.descriptor.shards)) {
@@ -3271,11 +3375,51 @@ vbr_artifact_status vbr_artifact_prepare(
                 !prepare_unit_id(blob, package.version)) {
                 return vbr_artifact_status::content_id_mismatch;
             }
-        }
-        for (uint32_t i = 0; i < package.companions.size(); ++i) {
-            if (!prepare_companion(
-                    i, package.topologies, package.companions[i])) {
-                return vbr_artifact_status::content_id_mismatch;
+            return vbr_artifact_status::ok;
+        };
+        const size_t count = package.unit_blobs.size() + package.companions.size();
+        const size_t workers = hash_worker_count(count, max_workers);
+        const auto prepare_one = [&](size_t i) {
+            if (i < package.unit_blobs.size()) {
+                return prepare_unit(uint32_t(i));
+            }
+            const size_t companion = i - package.unit_blobs.size();
+            return prepare_companion(uint32_t(companion), package.topologies,
+                       package.companions[companion])
+                ? vbr_artifact_status::ok : vbr_artifact_status::content_id_mismatch;
+        };
+        if (workers == 1) {
+            for (size_t i = 0; i < count; ++i) {
+                const auto status = prepare_one(i);
+                if (status != vbr_artifact_status::ok) {
+                    return status;
+                }
+            }
+        } else {
+            // Independent units keep canonical ordering and every byte hash;
+            // no partial metadata is published.
+            // A recurrent companion can be much larger than any attention
+            // unit. Its independent section and payload digests write distinct
+            // fields, so let the existing worker budget process them separately.
+            // Serial readers retain the original two-pass order above.
+            const size_t jobs = count + package.companions.size();
+            std::vector<vbr_artifact_status> statuses(jobs);
+            for_each_index_parallel(jobs, workers, [&](size_t i) {
+                if (i < package.unit_blobs.size()) {
+                    statuses[i] = prepare_unit(uint32_t(i));
+                    return;
+                }
+                const size_t offset = i - package.unit_blobs.size();
+                statuses[i] = prepare_companion_hash(
+                    uint32_t(offset / 2), package.topologies,
+                    package.companions[offset / 2],
+                    offset % 2 == 0 ? companion_hash_kind::section : companion_hash_kind::payload)
+                    ? vbr_artifact_status::ok : vbr_artifact_status::content_id_mismatch;
+            });
+            for (const auto status : statuses) {
+                if (status != vbr_artifact_status::ok) {
+                    return status;
+                }
             }
         }
 
@@ -3433,10 +3577,10 @@ vbr_artifact_status vbr_artifact_prepare_projected_metadata(
 }
 
 vbr_artifact_status vbr_artifact_validate_prepared_package(
-        const vbr_artifact_package & package) noexcept {
+        const vbr_artifact_package & package, uint32_t max_workers) noexcept {
     try {
         auto canonical = package;
-        const auto status = vbr_artifact_prepare(canonical);
+        const auto status = vbr_artifact_prepare(canonical, max_workers);
         if (status != vbr_artifact_status::ok) {
             return status;
         }
@@ -3452,7 +3596,9 @@ vbr_artifact_status vbr_artifact_encode(
         vbr_artifact_package & package,
         const vbr_artifact_stream_writer & output,
         uint64_t max_total_bytes,
-        uint64_t * encoded_size) noexcept {
+        uint64_t * encoded_size,
+        uint32_t max_workers,
+        const vbr_artifact_preparation_reuse * reuse) noexcept {
     if (encoded_size) {
         *encoded_size = 0;
     }
@@ -3460,13 +3606,13 @@ vbr_artifact_status vbr_artifact_encode(
         if (!output.write || max_total_bytes == 0) {
             return vbr_artifact_status::invalid_argument;
         }
-        const auto prepared = vbr_artifact_prepare(package);
+        const auto prepared = vbr_artifact_prepare(package, max_workers, reuse);
         if (prepared != vbr_artifact_status::ok) {
             return prepared;
         }
 
         std::vector<section_descriptor> sections;
-        if (!prepare_sections(package, sections)) {
+        if (!prepare_sections(package, sections, max_workers)) {
             return vbr_artifact_status::internal_error;
         }
         uint64_t total_size;
@@ -3519,7 +3665,11 @@ vbr_artifact_status vbr_artifact_encode(
             emitter body;
             body.output = &output;
             body.hash_b = &verify_section;
-            if (!emit_section_body_verified(body, package, section) ||
+            // Reused (catalog-owned) sources do not change: the section digest
+            // alone checks what is written. Others may change between the
+            // passes, so each id is derived again from the bytes written.
+            if (!(reuse ? emit_section_body(body, package, section)
+                        : emit_section_body_verified(body, package, section)) ||
                 !body.ok ||
                 body.count != section.size ||
                 verify_section.finish() != section.checksum) {

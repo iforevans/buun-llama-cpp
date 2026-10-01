@@ -303,7 +303,10 @@ static void test_segment_chain_offsets() {
     artifact_segment_chain chain;
     const uint8_t a[] = { 0, 1, 2 };
     const uint8_t b[] = { 3, 4, 5, 6, 7 };
+    const auto initial_revision = chain.content_revision();
+    CHECK(initial_revision != 0);
     CHECK(chain.append(a, sizeof(a)));
+    CHECK(chain.content_revision() != initial_revision);
     CHECK(chain.append(b, sizeof(b)));
     CHECK(chain.size() == 8);
     CHECK(chain.segment_count() == 2);
@@ -318,6 +321,47 @@ static void test_segment_chain_offsets() {
     CHECK(one == 7);
     CHECK(!chain.read(8, &one, 1));
 
+    artifact_segment_chain prefix;
+    const uint8_t first_five[] = { 0, 1, 2, 3, 4 };
+    CHECK(prefix.append(first_five, sizeof(first_five)));
+    CHECK(chain.prefix_matches(prefix));
+    auto shared = chain.with_shared_prefix(prefix);
+    CHECK(shared && read_chain(*shared) == read_chain(chain));
+    CHECK(shared && vbr_capture_stream_digest(*shared) == vbr_capture_stream_digest(chain));
+    // Aligned cuts retain complete suffix chunks; unaligned cuts copy only
+    // the boundary slice. Both remain valid after all source owners go away.
+    for (const size_t prefix_size : { size_t(3), size_t(5) }) {
+        artifact_segment_chain segmented(11);
+        CHECK(segmented.append(a, sizeof(a)));
+        CHECK(segmented.append(b, sizeof(b)));
+        CHECK(segmented.append(a, sizeof(a)));
+        artifact_segment_chain head;
+        std::vector<uint8_t> prefix_bytes(prefix_size);
+        CHECK(segmented.read(0, prefix_bytes.data(), prefix_bytes.size()));
+        CHECK(head.append(prefix_bytes.data(), prefix_bytes.size()));
+        const auto expected = read_chain(segmented);
+        const auto digest = vbr_capture_stream_digest(segmented);
+        const auto revision = segmented.content_revision();
+        const auto retained = segmented.with_shared_prefix(head);
+        CHECK(retained);
+        segmented = artifact_segment_chain();
+        head = artifact_segment_chain();
+        CHECK(retained && retained->segment_count() == 3);
+        CHECK(retained && retained->content_revision() == revision);
+        CHECK(retained && read_chain(*retained) == expected);
+        CHECK(retained && vbr_capture_stream_digest(*retained) == digest);
+    }
+    artifact_segment_chain different;
+    CHECK(different.append(b, sizeof(b)));
+    CHECK(!chain.prefix_matches(different));
+    CHECK(!chain.with_shared_prefix(different));
+    CHECK(!prefix.with_shared_prefix(chain));
+    artifact_segment_chain empty_prefix;
+    CHECK(!chain.with_shared_prefix(empty_prefix));
+    // Clearing/moving the source owner must not invalidate the shared bytes.
+    prefix = artifact_segment_chain();
+    CHECK(shared && read_chain(*shared) == read_chain(chain));
+
     artifact_segment_chain known_size(8);
     CHECK(known_size.append(a, sizeof(a)));
     const auto incomplete_digest =
@@ -328,7 +372,17 @@ static void test_segment_chain_offsets() {
     CHECK(known_size.append(b, sizeof(b)));
     CHECK(vbr_capture_stream_digest(known_size) ==
           vbr_capture_stream_digest(chain));
+    const auto full_revision = known_size.content_revision();
     CHECK(!known_size.append(&one, 1));
+    CHECK(known_size.content_revision() == full_revision);
+
+    artifact_segment_chain moved(std::move(known_size));
+    CHECK(known_size.content_revision() == 0);
+    CHECK(!known_size.append(&one, 1));
+    known_size = std::move(moved);
+    CHECK(known_size.content_revision() != 0);
+    CHECK(known_size.content_revision() != full_revision);
+    CHECK(moved.content_revision() == 0);
 
     auto incomplete = std::make_unique<artifact_segment_chain>(8);
     CHECK(incomplete->append(a, sizeof(a)));
@@ -717,6 +771,37 @@ static void test_cpu_ring_boundaries() {
     CHECK(read_chain(legacy) == read_chain(chain));
     CHECK(vbr_capture_stream_digest(legacy) == stats.streaming_digest);
     CHECK(legacy.segment_count() == stats.chunks);
+
+    // A retained ring digest must not survive later writes or replacement.
+    const uint8_t suffix = 0xa7;
+    CHECK(chain.append(&suffix, 1));
+    CHECK(legacy.append(&suffix, 1));
+    CHECK(vbr_capture_stream_digest(chain) != stats.streaming_digest);
+    CHECK(vbr_capture_stream_digest(chain) == vbr_capture_stream_digest(legacy));
+    artifact_segment_chain replacement;
+    CHECK(replacement.append(&suffix, 1));
+    chain = std::move(replacement);
+    CHECK(vbr_capture_stream_digest(chain) != stats.streaming_digest);
+
+    artifact_segment_chain incremental(source.size);
+    vbr_capture_stream_stats incremental_stats;
+    CHECK(ring->stream(source, incremental, incremental_stats) == vbr_capture_stream_status::ok);
+    CHECK(incremental_stats.streaming_digest == stats.streaming_digest);
+    CHECK(vbr_capture_stream_digest(incremental) == stats.streaming_digest);
+    artifact_segment_chain incomplete(source.size + 1);
+    CHECK(ring->stream(source, incomplete, incremental_stats) == vbr_capture_stream_status::ok);
+    CHECK(vbr_capture_stream_digest(incomplete) == (std::array<uint8_t, 32> {}));
+
+    artifact_segment_chain captured;
+    CHECK(ring->stream(source, captured, incremental_stats) == vbr_capture_stream_status::ok);
+    const uint64_t captured_revision = captured.content_revision();
+    artifact_segment_chain relocated(std::move(captured));
+    // Object-local revision numbers can coincide after a move. Mutating the
+    // new owner must never revive the old ring proof at that number.
+    while (relocated.content_revision() < captured_revision) {
+        CHECK(relocated.append(&suffix, 1));
+    }
+    CHECK(vbr_capture_stream_digest(relocated) != stats.streaming_digest);
 
     artifact_segment_chain projected;
     vbr_capture_stream_stats projected_stats;
@@ -1834,7 +1919,10 @@ static bool publish_occupied_guard_package(
         uint64_t source_capacity_override = 0,
         uint32_t proof_count = 1,
         uint8_t payload_salt = 0,
-        ggml_type representation_type = GGML_TYPE_F16) {
+        ggml_type representation_type = GGML_TYPE_F16,
+        bool shared_positions = false,
+        const llama_cache_transaction_fault & fault = {},
+        bool reverse_logical_order = false) {
     reference = {};
     view.reset();
     if (token_count == 0 || proof_count == 0 || proof_count > 4096) {
@@ -1874,12 +1962,32 @@ static bool publish_occupied_guard_package(
     manifest.manifest_id = manifest_id;
     manifest.placements.push_back(projected_placement(
         manifest_id, llama_seq_id(manifest_id), physical));
+    if (reverse_logical_order) {
+        for (uint32_t i = 0; i < token_count; ++i) {
+            manifest.placements.front().cells[i].logical_position = token_count-1-i;
+        }
+    }
     bind_projected_manifest_metadata(manifest, target);
     manifest.identity.token_count = token_count;
     manifest.identity.next_position = token_count;
     manifest.token_block.tokens.resize(token_count);
     for (uint32_t i = 0; i < token_count; ++i) {
         manifest.token_block.tokens[i] = llama_token(i + 1);
+    }
+    if (shared_positions) {
+        manifest.identity.next_position = (token_count + 3)/4;
+        auto & placement = manifest.placements.front();
+        placement.computation_frontier = manifest.identity.next_position;
+        for (size_t i = 0; i < placement.cells.size(); ++i) {
+            placement.cells[i].logical_position = llama_pos(i/4);
+            placement.cells[i].ext_x = llama_pos(i%2);
+            placement.cells[i].ext_y = llama_pos((i/2)%2);
+        }
+        for (auto & controller : manifest.generation.controllers) {
+            for (auto & stream : controller.streams) {
+                stream.computation_frontier = manifest.identity.next_position;
+            }
+        }
     }
     vbr_capture_projection projection;
     if (!vbr_artifact_project_capture_union(
@@ -1917,10 +2025,14 @@ static bool publish_occupied_guard_package(
         manifest_id, assembly, topology));
     std::vector<vbr_projected_manifest_publish_result> results;
     if (!catalog.publish_projected_batch(
-            assembly, std::move(publications), budget, results) ||
+            assembly, std::move(publications), budget, results, nullptr, fault) ||
         results.size() != 1 ||
         results.front().status !=
             vbr_projected_manifest_publish_status::published) {
+        if (fault.fail_stage_at != UINT32_MAX || fault.fail_commit_at != UINT32_MAX ||
+            fault.fail_after_commit) {
+            return false;
+        }
         fprintf(stderr,
                 "occupied package publication failed: %" PRIu64
                 " size=%zu status=%u\n",
@@ -2352,6 +2464,76 @@ static void test_dependency_scoped_projected_catalog_publication() {
     budget.global_cap_state =
         llama_cache_budget_capacity_state::unbounded;
     std::vector<llama_vbr_projected_publication_claim> publication_claims;
+    {
+        const auto live_ops = ledger.snapshot().live_ops;
+        llama_cache_acct_artifact_id first_id, second_id, third_id, different_id;
+        vbr_artifact_package_view first, second, third, different;
+        CHECK(publish_occupied_guard_package(catalog, topology, budget,
+            701, 8, false, first_id, first, 991));
+        CHECK(publish_occupied_guard_package(catalog, topology, budget,
+            702, 12, false, second_id, second, 991));
+        CHECK(first.units().size() == 1 && second.units().size() == 1);
+        if (!first || !second) {
+            return;
+        }
+        const auto prefix_allocation = first.units()[0].payload_allocations[0].allocation;
+        CHECK(second.units()[0].payload_allocations.size() == 2);
+        CHECK(second.units()[0].payload_allocations[0].allocation == prefix_allocation);
+        CHECK(second.units()[0].payload_allocations.back().resident == 4);
+        CHECK(first.units()[0].unit_version_id != second.units()[0].unit_version_id);
+        first.reset();
+        CHECK(catalog.retire(first_id) == vbr_artifact_retire_status::retired);
+        CHECK(publish_occupied_guard_package(catalog, topology, budget,
+            703, 16, false, third_id, third, 991));
+        CHECK(third.units()[0].payload_allocations.size() == 3);
+        CHECK(third.units()[0].payload_allocations[0].allocation == prefix_allocation);
+        CHECK(third.units()[0].payload_allocations.back().resident == 4);
+        CHECK(read_chain(*third.units()[0].payload_shards[0]).size() == 16);
+        llama_cache_acct_artifact_id equal_id;
+        vbr_artifact_package_view equal;
+        // Different representation generations can have identical bytes. Only
+        // their immutable storage is shared; version identities stay distinct.
+        CHECK(publish_occupied_guard_package(catalog, topology, budget,
+            705, 16, false, equal_id, equal, 991 + 256));
+        CHECK(equal.units()[0].unit_version_id != third.units()[0].unit_version_id);
+        CHECK(equal.units()[0].payload_allocations.size() == third.units()[0].payload_allocations.size());
+        CHECK(equal.units()[0].payload_allocations[0].allocation == prefix_allocation);
+        for (int phase = 0; phase < 3; ++phase) {
+            const auto before_failure = ledger.snapshot().live_ops;
+            const auto references = catalog.snapshot().references;
+            llama_cache_transaction_fault fault;
+            if (phase == 0) { fault.fail_stage_at = 1; }
+            if (phase == 1) { fault.fail_commit_at = 1; }
+            if (phase == 2) { fault.fail_after_commit = true; }
+            llama_cache_acct_artifact_id failed_id;
+            vbr_artifact_package_view failed;
+            CHECK(!publish_occupied_guard_package(catalog, topology, budget,
+                710 + phase, 20, false, failed_id, failed, 991, 0, 1, 0,
+                GGML_TYPE_F16, false, fault));
+            CHECK(ledger.snapshot().live_ops == before_failure);
+            CHECK(catalog.snapshot().references == references);
+        }
+        CHECK(publish_occupied_guard_package(catalog, topology, budget,
+            704, 16, false, different_id, different, 991, 0, 1, 1));
+        CHECK(different.units()[0].payload_allocations.size() == 1);
+        CHECK(different.units()[0].payload_allocations[0].allocation != prefix_allocation);
+        second.reset();
+        CHECK(catalog.retire(second_id) == vbr_artifact_retire_status::retired);
+        // The latest snapshot still owns every shared prefix allocation after
+        // both ancestor manifests have been evicted.
+        vbr_artifact_package_view reread;
+        CHECK(catalog.resolve_reference(third_id, reread) == vbr_artifact_resolve_status::ok);
+        CHECK(read_chain(*reread.units()[0].payload_shards[0]) ==
+              read_chain(*third.units()[0].payload_shards[0]));
+        reread.reset();
+        third.reset();
+        different.reset();
+        equal.reset();
+        CHECK(catalog.retire(third_id) == vbr_artifact_retire_status::retired);
+        CHECK(catalog.retire(different_id) == vbr_artifact_retire_status::retired);
+        CHECK(catalog.retire(equal_id) == vbr_artifact_retire_status::retired);
+        CHECK(ledger.snapshot().live_ops == live_ops);
+    }
     for (size_t i = 0; i < assembly.manifests().size(); ++i) {
         if (assembly.manifests()[i].state !=
                 vbr_capture_manifest_state::ready) {
@@ -2417,6 +2599,37 @@ static void test_dependency_scoped_projected_catalog_publication() {
     // provisional source rows.  This model-free publication reaches the same
     // immutable catalog view used by production rather than constructing a
     // mutable package facade in the test.
+    // Qwen-style cells share temporal positions but retain distinct spatial
+    // coordinates. Both provisional placement and recycling use every row,
+    // and changing even one coordinate invalidates the recovery witness.
+    {
+        llama_cache_acct_artifact_id media_reference;
+        vbr_artifact_package_view media_view;
+        CHECK(publish_occupied_guard_package(catalog, topology, budget, 93, 8, false,
+            media_reference, media_view, 0, 0, 1, 0, GGML_TYPE_F16, true));
+        if (media_view) {
+            std::vector<uint64_t> rows;
+            CHECK(vbr_projected_packed_rows(media_view,
+                media_view.manifest().stream_placements.front(), rows));
+            CHECK((rows == std::vector<uint64_t> {0, 1, 2, 3, 4, 5, 6, 7}));
+            for (const uint32_t capacity : {8u, 16u}) {
+                occupied_guard_fixture media;
+                CHECK(make_occupied_guard_fixture(media_view, 93, capacity, media));
+                vbr_occupied_replacement_guard guard;
+                CHECK(vbr_prepare_occupied_replacement_guard(media.target, media_view,
+                    media_view, media.observation, guard) == vbr_occupied_replacement_guard_status::ready);
+                CHECK(guard.cell_mapping().size() == 8);
+                CHECK(guard.relocation_runs().size() == 1);
+                CHECK(vbr_recheck_occupied_replacement_guard(guard, media.target, media.observation) ==
+                    vbr_occupied_replacement_guard_status::ready);
+                media.cells[1].ext_x++;
+                CHECK(vbr_recheck_occupied_replacement_guard(guard, media.target, media.observation) !=
+                    vbr_occupied_replacement_guard_status::ready);
+            }
+        }
+        media_view.reset();
+        CHECK(catalog.retire(media_reference) == vbr_artifact_retire_status::retired);
+    }
     llama_cache_acct_artifact_id occupied_reference;
     vbr_artifact_package_view occupied_view;
     CHECK(publish_occupied_guard_package(
@@ -2456,6 +2669,44 @@ static void test_dependency_scoped_projected_catalog_publication() {
     CHECK(vbr_recheck_occupied_replacement_guard(
               occupied_guard, occupied.target, occupied.observation) ==
           vbr_occupied_replacement_guard_status::ready);
+
+    // Spare virtual cells can exceed the VBR backing budget. An authenticated
+    // destination quote may select the existing recycle strategy even though
+    // the ordinary unpriced guard would choose provisional placement.
+    vbr_import_schedule_quote budget_quote;
+    CHECK(vbr_quote_import_schedule(occupied.target, occupied_view, budget_quote));
+    vbr_import_destination_projection budget_destination;
+    budget_destination.status = vbr_import_destination_status::feasible_current;
+    budget_destination.recycle_incumbent = true;
+    for (const auto & child : occupied.target.children) {
+        std::vector<ggml_type> types;
+        for (const auto & unit : child.units) {
+            types.push_back(static_cast<ggml_type>(unit.current_type));
+        }
+        budget_destination.initial_types.push_back(types);
+        budget_destination.final_types.push_back(std::move(types));
+        budget_destination.initial_cursors.push_back(child.controller_policy.cursor);
+        budget_destination.final_cursors.push_back(child.controller_policy.cursor);
+        budget_destination.child_type_digests.push_back(child.controller_policy.current_type_vector_digest);
+    }
+    budget_destination.tree_digest = vbr_type_tree_digest(
+        budget_destination.child_type_digests, VBR_DOWNWARD_RECIPE_VERSION);
+    CHECK(vbr_rebind_import_schedule_quote(
+        occupied.target, occupied_view, budget_destination, budget_quote));
+    vbr_occupied_replacement_guard budget_guard;
+    CHECK(vbr_prepare_occupied_replacement_guard(
+        occupied.target, occupied_view, occupied_view, occupied.observation,
+        budget_guard, &budget_quote) == vbr_occupied_replacement_guard_status::ready);
+    CHECK(budget_guard.strategy() == vbr_occupied_replacement_strategy::recycle_incumbent_cells);
+    CHECK(budget_guard.recovery_runs().size() == 1);
+    CHECK(!budget_guard.cell_mapping().empty());
+    if (!budget_guard.cell_mapping().empty()) {
+        CHECK(budget_guard.cell_mapping().front().destination_physical_cell == 0);
+    }
+    CHECK(vbr_recheck_occupied_replacement_guard(
+        budget_guard, occupied.target, occupied.observation) ==
+        vbr_occupied_replacement_guard_status::ready);
+    budget_guard.reset();
 
     occupied_guard_fixture full_pool;
     CHECK(make_occupied_guard_fixture(
@@ -2536,6 +2787,70 @@ static void test_dependency_scoped_projected_catalog_publication() {
               shared_alias.observation, shared_alias_guard) ==
           vbr_occupied_replacement_guard_status::ownership_mismatch);
     shared_guard.reset();
+
+    // Absent insertion: the destination holds nothing, another sequence owns
+    // half the pool, and the incoming rows take the free half with the live
+    // controller as the only witness.
+    occupied_guard_fixture absent_pool = occupied;
+    absent_pool.target.destination_sequence_absent = true;
+    for (auto & cell : absent_pool.cells) {
+        cell.owner_sequence = 93;
+        cell.owns_destination = false;
+        cell.token = llama_token(2000+cell.physical_cell);
+    }
+    absent_pool.bind();
+    vbr_occupied_replacement_guard absent_guard;
+    CHECK(vbr_prepare_absent_insertion_guard(
+              absent_pool.target, occupied_view,
+              absent_pool.observation, absent_guard) ==
+          vbr_occupied_replacement_guard_status::ready);
+    CHECK(absent_guard.ready());
+    CHECK(absent_guard.absent_destination());
+    CHECK(absent_guard.strategy() ==
+          vbr_occupied_replacement_strategy::provisional_free_cells);
+    CHECK(absent_guard.recovery_runs().empty());
+    CHECK(absent_guard.cell_mapping().size() == 8);
+    CHECK(absent_guard.cell_mapping().front()
+              .destination_physical_cell == 8);
+    CHECK(absent_guard.preserved_cells().size() == 8);
+    CHECK(absent_guard.preserved_cells().front().owner_sequence == 93);
+    CHECK(absent_guard.preserved_cells().front().token == 2000);
+    CHECK(vbr_recheck_occupied_replacement_guard(
+              absent_guard, absent_pool.target, absent_pool.observation) ==
+          vbr_occupied_replacement_guard_status::ready);
+    auto absent_mutant = absent_pool;
+    ++absent_mutant.cells.back().token;
+    absent_mutant.bind();
+    CHECK(vbr_recheck_occupied_replacement_guard(
+              absent_guard, absent_mutant.target,
+              absent_mutant.observation) ==
+          vbr_occupied_replacement_guard_status::currency_changed);
+    CHECK(!absent_guard.ready());
+
+    auto absent_present = absent_pool;
+    absent_present.target.destination_sequence_absent = false;
+    absent_present.bind();
+    CHECK(vbr_prepare_absent_insertion_guard(
+              absent_present.target, occupied_view,
+              absent_present.observation, absent_guard) ==
+          vbr_occupied_replacement_guard_status::destination_present);
+    absent_present = absent_pool;
+    absent_present.cells.front().owner_sequence = 92;
+    absent_present.cells.front().owns_destination = true;
+    absent_present.bind();
+    CHECK(vbr_prepare_absent_insertion_guard(
+              absent_present.target, occupied_view,
+              absent_present.observation, absent_guard) ==
+          vbr_occupied_replacement_guard_status::destination_present);
+    // The other sequences sit at a later degrade cursor than the file.
+    auto absent_tiered = absent_pool;
+    absent_tiered.target.children.front().controller_policy.cursor++;
+    absent_tiered.bind();
+    CHECK(vbr_prepare_absent_insertion_guard(
+              absent_tiered.target, occupied_view,
+              absent_tiered.observation, absent_guard) ==
+          vbr_occupied_replacement_guard_status::tier_mismatch);
+    CHECK(!absent_guard.ready());
     auto full_pool_mutant = full_pool;
     full_pool_mutant.cells.back().physical_cell = 6;
     full_pool_mutant.bind();
@@ -2919,7 +3234,8 @@ static void test_dependency_scoped_projected_catalog_publication() {
 
     const auto validate_recycle_fanout = [&](uint32_t proof_count,
                                              uint64_t manifest_base,
-                                             bool accepted) {
+                                             bool accepted,
+                                             bool fragmented_source = false) {
         llama_cache_acct_artifact_id recovery_reference;
         llama_cache_acct_artifact_id incoming_reference;
         vbr_artifact_package_view recovery_view;
@@ -2929,7 +3245,8 @@ static void test_dependency_scoped_projected_catalog_publication() {
             recovery_reference, recovery_view, 900, 8, proof_count));
         CHECK(publish_occupied_guard_package(
             catalog, topology, budget, manifest_base + 1, 8, false,
-            incoming_reference, incoming_view, 900, 8, proof_count, 1));
+            incoming_reference, incoming_view, 900, 8, proof_count, 1,
+            GGML_TYPE_F16, false, {}, fragmented_source));
         CHECK(recovery_reference.v != 0 && incoming_reference.v != 0);
         CHECK(recovery_reference != incoming_reference);
 
@@ -2951,7 +3268,7 @@ static void test_dependency_scoped_projected_catalog_publication() {
               vbr_occupied_replacement_guard_status::ready);
         CHECK(guard.strategy() ==
               vbr_occupied_replacement_strategy::recycle_incumbent_cells);
-        CHECK(guard.relocation_runs().size() == 1);
+        CHECK(guard.relocation_runs().size() == (fragmented_source ? 8u : 1u));
         CHECK(guard.recovery_runs().size() == 1);
 
         prefix_validator_serials serials;
@@ -2995,6 +3312,32 @@ static void test_dependency_scoped_projected_catalog_publication() {
             : vbr_manifest_validation_status::geometry_mismatch));
         CHECK(bool(validated.proof) == accepted);
         CHECK(accepted ? !guard.ready() : guard.ready());
+        if (fragmented_source && validated.proof) {
+            vbr_adopt_stage_policy stage_policy;
+            stage_policy.ledger = &ledger;
+            stage_policy.budget = &budget;
+            stage_policy.pinned_domain = pinned;
+            stage_policy.pinned_ring_bytes = 8192;
+            stage_policy.chunk_bytes = 4096;
+            stage_policy.lanes.push_back({ device, nullptr, nullptr, false });
+            auto staged = vbr_stage_validated_manifest(std::move(validated.proof), stage_policy);
+            CHECK(staged.status == vbr_adopt_stage_status::staged);
+            CHECK(staged.staged);
+            if (staged.staged) {
+                CHECK(staged.staged->reads().size() == 2*proof_count);
+                for (const auto & read : staged.staged->reads()) {
+                    CHECK(read.destination_offset == 0);
+                    CHECK(read.size == 8);
+                    if (read.kind == vbr_staged_read_kind::unit_payload) {
+                        CHECK(read.projection_ranges.size() == 8);
+                        for (size_t i = 0; i < read.projection_ranges.size(); ++i) {
+                            CHECK(read.projection_ranges[i].source_offset == 7-i);
+                            CHECK(read.projection_ranges[i].size == 1);
+                        }
+                    }
+                }
+            }
+        }
         validated.proof.reset();
         guard.reset();
         incoming_view.reset();
@@ -3008,6 +3351,10 @@ static void test_dependency_scoped_projected_catalog_publication() {
     // exact validator limit; one additional shard fails before staging.
     validate_recycle_fanout(2048, 300, true);
     validate_recycle_fanout(2049, 400, false);
+    // Fragmented source rows still make one contiguous write per shard.
+    // The raw run product (512 * 9) exceeds the descriptor limit, but the
+    // packed incoming and exact recovery writes need only 512 * 2 reads.
+    validate_recycle_fanout(512, 500, true, true);
 
     llama_cache_acct_artifact_id run_reference;
     vbr_artifact_package_view run_view;
@@ -3345,6 +3692,19 @@ static void test_dependency_scoped_projected_catalog_publication() {
     CHECK(catalog.resolve_reference(prefix_reference, prefix_parent) ==
           vbr_artifact_resolve_status::ok);
     CHECK(prefix_parent.validate() == vbr_artifact_status::ok);
+    // the read-only answer agrees with project_attention_prefix and borrows nothing
+    CHECK(catalog.projection_parent_status(prefix_parent) ==
+          vbr_artifact_prefix_projection_status::projected);
+    auto parent_cap = vbr_artifact_prefix_projection_limits {};
+    parent_cap.max_proofs = 1;
+    CHECK(catalog.projection_parent_status(prefix_parent, parent_cap) ==
+          vbr_artifact_prefix_projection_status::limit_exceeded);
+    parent_cap = {};
+    parent_cap.max_units = 0;
+    CHECK(catalog.projection_parent_status(prefix_parent, parent_cap) ==
+          vbr_artifact_prefix_projection_status::invalid_argument);
+    CHECK(catalog.projection_parent_status(vbr_artifact_package_view {}) ==
+          vbr_artifact_prefix_projection_status::invalid_argument);
 
     const llama_token divergent[] { 1, 2, 99, 100 };
     vbr_artifact_attention_prefix_request prefix_request;
@@ -3882,6 +4242,28 @@ static void test_dependency_scoped_projected_catalog_publication() {
     CHECK(refused_validation.status ==
           vbr_manifest_validation_status::topology_mismatch);
     CHECK(!refused_validation.proof);
+
+    // A prefix owns only part of the captured image, so it cannot vouch for
+    // co-resident rows.
+    vbr_artifact_attention_prefix_projection co_resident_projection;
+    CHECK(catalog.project_attention_prefix(
+              prefix_parent, prefix_request, {}, co_resident_projection) ==
+          vbr_artifact_prefix_projection_status::projected);
+    vbr_import_co_resident prefix_co_resident;
+    prefix_co_resident.destination = 13;
+    prefix_co_resident.placements.push_back({ 0, 0, 13, 1, { { 2, 0, 0, 0 } } });
+    const std::vector<vbr_import_co_resident> prefix_co_residents {
+        prefix_co_resident,
+    };
+    auto co_resident_policy = validation_policy;
+    co_resident_policy.co_residents = &prefix_co_residents;
+    auto co_resident_validation = vbr_validate_attention_prefix_projection(
+        validation_target, std::move(co_resident_projection),
+        co_resident_policy);
+    CHECK(co_resident_validation.status ==
+          vbr_manifest_validation_status::ownership_mismatch);
+    CHECK(co_resident_validation.decision == vbr_import_decision::reject);
+    CHECK(!co_resident_validation.proof);
 
     // Dropping the caller's package lease cannot retire storage while either
     // independently borrowed projection remains alive.
@@ -4693,7 +5075,8 @@ static void test_ring_accounting_once() {
 
 static bool sample_unbounded_host_budget(
         void *,
-        llama_cache_budget_config & output) noexcept {
+        llama_cache_budget_config & output,
+        uint64_t) noexcept {
     output = {};
     output.host.pageable_state =
         llama_cache_budget_capacity_state::unbounded;
@@ -4722,7 +5105,8 @@ struct projected_store_budget_context {
 
 static bool sample_projected_store_budget(
         void * opaque,
-        llama_cache_budget_config & output) noexcept {
+        llama_cache_budget_config & output,
+        uint64_t) noexcept {
     const auto * context =
         static_cast<const projected_store_budget_context *>(opaque);
     if (!context || !context->available) {
@@ -4905,7 +5289,7 @@ static void test_projected_host_batch_store_adapter() {
     };
     llama_cache_budget_config staging_budget;
     CHECK(sample_projected_store_budget(
-        &budget_context, staging_budget));
+        &budget_context, staging_budget, 0));
     staging_budget.devices.front().configured_cache_cap = 32;
     staging_budget.devices.front().cache_cap_state =
         llama_cache_budget_capacity_state::known;
@@ -5141,6 +5525,8 @@ static void test_projected_host_batch_store_adapter() {
         CHECK(results[0].payload->accounted_by(&ledger));
         CHECK(results[0].payload->reference_artifact().v != 0);
     }
+    // no payload, no projection parent
+    CHECK(!store->host_prefix_projection_ready(nullptr));
     CHECK(results[1].manifest_id == 2);
     CHECK(results[1].status ==
           vbr_projected_manifest_publish_status::dependency_unavailable);
@@ -5294,7 +5680,7 @@ static void test_projected_host_batch_store_adapter() {
         { topology }, foreign_bindings));
     llama_cache_budget_config foreign_budget;
     CHECK(sample_projected_store_budget(
-        &budget_context, foreign_budget));
+        &budget_context, foreign_budget, 0));
     std::vector<vbr_projected_manifest_publish_result> foreign_results;
     CHECK(foreign_catalog.publish_projected_batch(
         ready_assembly, make_publications(ready_assembly), foreign_budget,
@@ -5470,7 +5856,7 @@ static void test_server_store_construction_and_lifetime() {
     config.sample_budget = sample_unbounded_host_budget;
 
     const auto baseline = ledger.snapshot();
-    CHECK(sample_unbounded_host_budget(nullptr, budget));
+    CHECK(sample_unbounded_host_budget(nullptr, budget, 0));
     {
         llama_cache_budget_coordinator coordinator;
         const auto snapshot = ledger.snapshot();
@@ -5684,6 +6070,28 @@ static void test_server_import_route_classification() {
           status::validation_failed);
 
     server_vbr_artifact_import_output fallback;
+    CHECK(!server_vbr_artifact_import_capacity_refused(fallback));
+    fallback.status = status::unavailable;
+    CHECK(!server_vbr_artifact_import_capacity_refused(fallback));
+    fallback.destination_status = vbr_import_destination_status::exhausted;
+    CHECK(server_vbr_artifact_import_capacity_refused(fallback));
+    const auto capacity_refusal = fallback;
+    const auto refuses_capacity_fallback = [&](auto mutate) {
+        auto output = capacity_refusal;
+        mutate(output);
+        CHECK(!server_vbr_artifact_import_capacity_refused(output));
+    };
+    refuses_capacity_fallback([](auto & output) { output.adopt_attempted = true; });
+    refuses_capacity_fallback([](auto & output) { output.h2d_bytes = 1; });
+    refuses_capacity_fallback([](auto & output) { output.h2d_chunks = 1; });
+    refuses_capacity_fallback([](auto & output) {
+        output.recovery = vbr_adopt_recovery_outcome::quarantined;
+    });
+    refuses_capacity_fallback([](auto & output) { output.status = status::adopt_failed; });
+    refuses_capacity_fallback([](auto & output) { output.status = status::ok; });
+    fallback.destination_status = vbr_import_destination_status::invalid;
+    fallback.occupied_guard_status = vbr_occupied_replacement_guard_status::capacity_unavailable;
+    CHECK(server_vbr_artifact_import_capacity_refused(fallback));
     for (const auto retryable : {
             status::validation_failed,
             status::report_only,

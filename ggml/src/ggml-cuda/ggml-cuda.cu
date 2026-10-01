@@ -20,6 +20,7 @@
 #include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-transpose.cuh"
+#include "ggml-cuda/conv3d.cuh"
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
@@ -340,13 +341,9 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
 
-#ifndef GGML_USE_MUSA
         int supports_coop_launch = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&supports_coop_launch, cudaDevAttrCooperativeLaunch, physical_id));
         info.devices[id].supports_cooperative_launch = !!supports_coop_launch;
-#else
-        info.devices[id].supports_cooperative_launch = false;
-#endif // !(GGML_USE_MUSA)
 
 #if defined(GGML_USE_HIP)
         info.devices[id].smpbo = prop.sharedMemPerBlock;
@@ -367,8 +364,6 @@ static ggml_cuda_device_info ggml_cuda_init() {
                       device_vmm ? "yes" : "no", prop.warpSize,
                       device_vram_mib);
 #elif defined(GGML_USE_MUSA)
-        // FIXME: Ensure compatibility with varying warp sizes across different MUSA archs.
-        info.devices[id].warp_size = 32;
         info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
         info.devices[id].cc = GGML_CUDA_CC_OFFSET_MTHREADS + prop.major * 0x100;
         info.devices[id].cc += prop.minor * 0x10;
@@ -3101,8 +3096,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    const bool force_mmq = hint == GGML_HINT_FORCE_MMQ &&
-            GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE;
+    const bool wide_q5_mmq = ggml_cuda_use_wide_q5_mmq(cc, src0, dst);
+    const bool force_mmq = wide_q5_mmq || (hint == GGML_HINT_FORCE_MMQ &&
+            GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE);
     if (!force_mmq && ggml_cuda_f8_mmvq_layout_supported(src0) &&
             ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
@@ -3671,6 +3667,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_CONV_2D:
             ggml_cuda_op_conv2d(ctx, dst);
+            break;
+        case GGML_OP_CONV_3D:
+            ggml_cuda_op_conv3d(ctx, dst);
             break;
         case GGML_OP_CONV_2D_DW:
             ggml_cuda_op_conv2d_dw(ctx, dst);
@@ -5448,6 +5447,23 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_SCALE) {
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * scale    = cgraph->nodes[node_idx+1];
+
+        if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous_rows(rms_norm->src[0]) || !ggml_is_contiguous(scale)) {
+            return false;
+        }
+
+        float bias;
+        memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+
+        const int output = node_idx + 1;
+        return bias == 0.0f && scale->type == GGML_TYPE_F32 &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, 2, &output, 1);
+    }
+
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
@@ -6572,6 +6588,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
         std::vector<ggml_op>    ops;
+        ops.reserve(13);  // max ops; avoids gcc -Wstringop-overflow false positive
 
         if (can_fuse) {
             const ggml_tensor * logits  = node->src[0];
@@ -7820,6 +7837,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+        ggml_cuda_op_rms_norm_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -8252,6 +8274,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    // Retain the pre-sync allocation policy. Extending top-k input lifetimes to
+    // force extra fusions showed no throughput gain in Flash-Next MoE-cache
+    // qualification and changed routing tie/rounding behavior. Existing top-k
+    // fusions remain eligible in graph_compute without these extra dependencies.
     if (!disable_fusion) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL) {
@@ -8571,10 +8597,57 @@ static int ggml_cuda_physical_device_share_count(int device) {
     return info.devices[device].physical_share_count;
 }
 
-void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total) {
+static cudaError_t ggml_cuda_device_memory_info(int device, size_t * free, size_t * total) {
     ggml_cuda_set_device(device);
+    const cudaError_t err = cudaMemGetInfo(free, total);
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    // ROCm 7.2 can charge each small VMM mapping as 2 MiB in hipMemGetInfo:
+    // 2 GiB in 256 KiB chunks reports zero free on a 16 GiB Radeon. Use the
+    // kernel's physical VRAM accounting, which includes other processes and the
+    // desktop. Do not substitute a whole-device total for an APU or partition.
+    if (err == cudaSuccess && !ggml_cuda_info().devices[device].integrated) {
+        char bus_id[32] = {};
+        const int physical = ggml_cuda_info().devices[device].physical_device;
+        if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), physical) == cudaSuccess) {
+            unsigned domain, bus, slot, function;
+            if (sscanf(bus_id, "%x:%x:%x.%x", &domain, &bus, &slot, &function) == 4) {
+                char path[128];
+                const auto read_counter = [&](const char * name, uint64_t & value) {
+                    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%04x:%02x:%02x.%x/%s",
+                            domain, bus, slot, function, name);
+                    FILE * file = fopen(path, "r");
+                    if (!file) {
+                        return false;
+                    }
+                    const bool ok = fscanf(file, "%" SCNu64, &value) == 1;
+                    fclose(file);
+                    return ok;
+                };
+                uint64_t physical_total, used;
+                if (read_counter("mem_info_vram_total", physical_total) &&
+                    read_counter("mem_info_vram_used", used) &&
+                    physical_total == *total && used <= physical_total) {
+                    size_t available = physical_total - used;
+                    // Preserve HIP's optional caller-requested reserve (MiB).
+                    if (const char * env = getenv("HIP_HIDDEN_FREE_MEM")) {
+                        uint64_t mib = 0;
+                        const auto parsed = std::from_chars(env, env + strlen(env), mib);
+                        if (parsed.ec == std::errc() && *parsed.ptr == '\0') {
+                            available = mib > available / (1024 * 1024)
+                                    ? 0 : available - size_t(mib) * 1024 * 1024;
+                        }
+                    }
+                    *free = available;
+                }
+            }
+        }
+    }
+#endif
+    return err;
+}
 
-    CUDA_CHECK(cudaMemGetInfo(free, total));
+void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total) {
+    CUDA_CHECK(ggml_cuda_device_memory_info(device, free, total));
 
     // virtual devices sharing one physical GPU share its memory pool; split it between them
     const int share_count = ggml_cuda_physical_device_share_count(device);
@@ -8626,6 +8699,8 @@ struct ggml_backend_cuda_device_context {
     std::string description;
     std::string pci_bus_id;
     int op_offload_min_batch_size;
+    // cudaDeviceProp.integrated; cudaGetDeviceProperties is too slow to call per query (~1 ms)
+    bool integrated;
 };
 
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
@@ -8721,7 +8796,7 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
     // context floor (~300-500 MiB), cudaMemGetInfo returns OOM for a NEW process before
     // it has allocated a single byte — report 0 free so the caller's normal failure path
     // produces an honest error instead of an abort (co-tenancy race loser)
-    const cudaError_t err = cudaMemGetInfo(free, total);
+    const cudaError_t err = ggml_cuda_device_memory_info(ctx->device, free, total);
     if (err != cudaSuccess) {
         GGML_LOG_WARN("%s: cudaMemGetInfo failed on device %d (%s) — reporting 0 free\n",
                 __func__, ctx->device, cudaGetErrorString(err));
@@ -8734,12 +8809,9 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
 // ref: https://github.com/ggml-org/llama.cpp/pull/17368
 #if defined(__linux__) && !defined(GGML_USE_HIP)
     // Check if this is a UMA (Unified Memory Architecture) system
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
-
     // Check if UMA is explicitly enabled via environment variable
     bool uma_env = getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr;
-    bool is_uma = prop.integrated > 0 || uma_env;
+    bool is_uma = ctx->integrated || uma_env;
 
     if (is_uma) {
         // For UMA systems (like DGX Spark), use system memory info
@@ -8763,10 +8835,7 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
 static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
 
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
-
-    return prop.integrated
+    return ctx->integrated
         ? GGML_BACKEND_DEVICE_TYPE_IGPU
         : GGML_BACKEND_DEVICE_TYPE_GPU;
 }
@@ -8876,6 +8945,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
+                    return false;
+                }
                 if (ggml_cuda_is_exl3(a->type)) {
 #if defined(GGML_USE_HIP)
                     // The shared EXL3 executor uses 32-lane transforms. Wave64
@@ -9233,10 +9305,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return false;
             } break;
         case GGML_OP_DUP:
-            {
-                ggml_type src0_type = op->src[0]->type;
-                return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
-            } break;
+                return true;
         case GGML_OP_ARGMAX:
         case GGML_OP_COUNT_EQUAL:
             {
@@ -9343,8 +9412,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 
             if (op->src[3]->ne[0] == 1) {
                 // Mamba2
-                // (kernel only supports (d_state == 128 || d_state == 256) && d_head % 16 == 0)
-                return (op->src[0]->ne[0] == 128 || op->src[0]->ne[0] == 256) && op->src[0]->ne[1] % 16 == 0;
+                // (kernel only supports (d_state == 96 || d_state == 128 || d_state == 256) && d_head % 16 == 0)
+                const int64_t d_state = op->src[0]->ne[0];
+                return (d_state == 96 || d_state == 128 || d_state == 256) && op->src[0]->ne[1] % 16 == 0;
             } else {
                 if (K > 1) {
                     return false;
@@ -9386,8 +9456,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_IM2COL_3D:
         case GGML_OP_CONV_2D:
             return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
+        case GGML_OP_CONV_3D:
+            return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
         case GGML_OP_CONV_2D_DW:
-            return op->src[0]->type == GGML_TYPE_F32;
+            return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                   (ggml_is_contiguous(op->src[1]) || ggml_is_contiguous_channels(op->src[1]));
         case GGML_OP_CONV_TRANSPOSE_2D:
         case GGML_OP_POOL_1D:
         case GGML_OP_POOL_2D:
@@ -9411,7 +9488,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
 #endif
         case GGML_OP_SUM_ROWS:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_MEAN:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_GROUP_NORM:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_PAD:
@@ -9446,7 +9525,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_POST:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
         case GGML_OP_DFLASH2_CONV:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
@@ -9892,6 +9971,10 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                     c = std::tolower(c);
                 }
                 dev_ctx->op_offload_min_batch_size = min_batch_size;
+
+                cudaDeviceProp prop;
+                CUDA_CHECK(cudaGetDeviceProperties(&prop, physical_id));
+                dev_ctx->integrated = prop.integrated > 0;
 
                 ggml_backend_dev_t dev = new ggml_backend_device {
                     /* .iface   = */ ggml_backend_cuda_device_interface,

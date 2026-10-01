@@ -6,12 +6,17 @@
 #include <stdint.h>
 #include <limits.h>
 
-// EXL3's CPU trellis decode is costlier than the ordinary vector-dot types.
-// Keep its admission floor consistent in fit, context setup, and the provider.
+// Keep format-aware admission consistent in fit, context setup, and the provider.
 static inline size_t ggml_moe_cache_effective_min_expert_bytes(
         int wtype, int explicit_minimum, size_t default_minimum) {
-    return !explicit_minimum && ggml_type_is_exl3((enum ggml_type)wtype)
-        ? 128u << 10 : default_minimum;
+    if (explicit_minimum) return default_minimum;
+    // EXL3's CPU trellis decode is costlier than ordinary vector dots.
+    if (ggml_type_is_exl3((enum ggml_type)wtype)) return 128u << 10;
+    // Q2_0 stores twice as many weights per byte as Q4_0. A 450 KiB
+    // Q2_0 expert should not miss the ordinary 512 KiB floor merely because
+    // its codes are more compact; retain the same minimum weight count.
+    if (wtype == GGML_TYPE_Q2_0) return default_minimum / 2;
+    return default_minimum;
 }
 
 // Slot IDs remain int32. Ordinary kernels also index quant blocks with int32;
@@ -106,6 +111,12 @@ struct ggml_moe_cache_api {
     void   (*session_enter)(void * session);
     void   (*session_leave)(void * session);
 
+    // Copy selected host experts to their ordinary device layout, reusing cached
+    // bytes where available. selected is an expert-indexed 32-bit bitset.
+    // Returns 0 without writing/submitting work when the normal copy is needed.
+    int (*prefill_copy)(void * session, void * backend, const struct ggml_tensor * source,
+            struct ggml_tensor * destination, const uint32_t * selected, size_t n_words);
+
     // Begin one CPU MUL_MAT_ID node. Returns an opaque plan, or NULL when the stock CPU path should handle the complete node.
     void * (*begin)(const char * tensor_name, const void * host_base, size_t expert_size,
                     int64_t n_in, int64_t n_out, int wtype, int64_t n_expert,
@@ -128,14 +139,18 @@ struct ggml_moe_cache_api {
     // Releases slot pins and all per-node ownership. Must be called exactly once for every non-NULL begin result, on every success or failure path.
     void (*end)(void * node);
 
-    // Dispatch one fused up * GLU(gate) operation over experts resident for both tensors. When down is non-NULL, continue through the down projection for rows resident in all three tensors. This is used only after the CPU backend proves that the corresponding nodes form an elidable subgraph. ids and act_rows contain n_rows flattened token-major routed rows. Returns a regular node accepted by collect/end and marks the skipped logical rows in hit_mask.
-    void * (*fused_begin)(const struct ggml_moe_cache_tensor_desc * up,
-                          const struct ggml_moe_cache_tensor_desc * gate,
-                          const struct ggml_moe_cache_tensor_desc * down,
-                          int glu_op, float up_min, float up_max,
-                          float gate_min, float gate_max,
-                          const int32_t * ids, int n_rows, int64_t n_tokens,
-                          const float * const * act_rows, uint64_t * hit_mask);
+    // Plan one fused up * GLU(gate) operation over experts resident for both tensors. When down is non-NULL, continue through the down projection for rows resident in all three tensors. This is used only after the CPU backend proves that the corresponding nodes form an elidable subgraph. ids and act_rows contain n_rows flattened token-major routed rows. Returns a regular node accepted by collect/end and marks the skipped logical rows in hit_mask.
+    // Planning launches no GPU work, so CPU workers can start on the misses while one thread calls fused_dispatch.
+    void * (*fused_plan)(const struct ggml_moe_cache_tensor_desc * up,
+                         const struct ggml_moe_cache_tensor_desc * gate,
+                         const struct ggml_moe_cache_tensor_desc * down,
+                         int glu_op, float up_min, float up_max,
+                         float gate_min, float gate_max,
+                         const int32_t * ids, int n_rows, int64_t n_tokens,
+                         const float * const * act_rows, uint64_t * hit_mask);
+    // Launches a fused_plan node once; repeated calls before collect return the launch result. On 0, the caller must recompute
+    // the hit rows on the CPU. end is required either way.
+    int    (*fused_dispatch)(void * node);
 
     // Host buffer mutation or teardown notification. Sessions cancel or finish any fill that still reads the supplied range before this call returns.
     void (*invalidate)(const void * base, size_t size);

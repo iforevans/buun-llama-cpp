@@ -1,4 +1,5 @@
 #include "fit.h"
+#include "fit-internal.h"
 #include "../ggml/src/ggml-backend-moe-cache.h"
 
 #include <cstdint>
@@ -27,6 +28,56 @@ static common_moe_cache_fit_shape_input shape(
 
 int main() {
     constexpr size_t MiB = 1024*1024;
+
+    {
+        expect(common_fit_physical_memory({}).total() == 0,
+                "ordinary devices must not gain a second physical charge");
+        const auto symmetric = common_fit_physical_memory({{1, 2, 3, 1, 1}, {1, 2, 3, 1, 1}});
+        expect(symmetric.model == 2 && symmetric.context == 4 && symmetric.compute == 6 &&
+                symmetric.context_fixed == 2 && symmetric.context_vbr_managed == 2 && symmetric.total() == 12,
+                "physical buffers must count once per child; context subsets are not extra allocations");
+        const auto skewed = common_fit_physical_memory({{1, 8, 2, 3, 5}, {2, 4, 7, 1, 3}});
+        expect(skewed.model == 4 && skewed.context == 16 && skewed.compute == 14 &&
+                skewed.context_fixed == 6 && skewed.context_vbr_managed == 10,
+                "a less loaded peer must not hide the peak child allocation");
+
+        ggml_backend_load_all();
+        const auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        expect(cpu != nullptr, "CPU backend is needed for Meta identity test");
+        if (cpu) {
+            const auto mirrored = [](const ggml_tensor *, void *) -> ggml_backend_meta_split_state {
+                return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1 };
+            };
+            int model_a = 0, model_b = 0;
+            ggml_backend_dev_t children[] = {cpu, cpu};
+            const auto a = ggml_backend_meta_device(children, 2, mirrored, &model_a);
+            const auto b = ggml_backend_meta_device(children, 2, mirrored, &model_b);
+            expect(a != b && common_fit_same_devices({a}, {b}),
+                    "distinct dry-model Meta handles must match the same ordered inventory");
+            expect(common_fit_extra_device_scale(a, b) == 1,
+                    "a separately loaded tensor draft must retain its balanced-equivalent charge");
+            expect(common_fit_extra_device_scale(a, cpu) == 2,
+                    "a pinned child draft must charge its full footprint on every target shard");
+            expect(common_fit_extra_device_scale(cpu, cpu) == 1 &&
+                    common_fit_extra_device_scale(cpu, a) == 0,
+                    "ordinary device accounting is unchanged and cannot absorb an extra Meta device");
+            expect(!common_fit_same_devices({a}, {cpu}) && !common_fit_same_devices({a}, {a, b}),
+                    "different device topology must not match");
+            const auto gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            if (gpu) {
+                ggml_backend_dev_t forward[] = {cpu, gpu}, reverse[] = {gpu, cpu};
+                const auto f = ggml_backend_meta_device(forward, 2, mirrored, &model_a);
+                const auto r = ggml_backend_meta_device(reverse, 2, mirrored, &model_b);
+                expect(!common_fit_same_devices({f}, {r}), "child order is part of fit device identity");
+                expect(common_fit_extra_device_scale(f, gpu) == 2 &&
+                        common_fit_extra_device_scale(r, gpu) == 2,
+                        "a draft pinned to either child must be counted without averaging");
+                expect(common_fit_extra_device_scale(a, gpu) == 0 &&
+                        common_fit_extra_device_scale(cpu, gpu) == 0,
+                        "non-member GPUs must remain outside the target fit authority");
+            }
+        }
+    }
 
     expect(common_fit_extra_context_size(8192, 2, true, 0) == 8192,
             "implicit MTP fit must cover all target streams");

@@ -195,6 +195,13 @@ static void test_exposure_gate() {
         "/tmp/llama.sock", 1));
     CHECK(!server_cache_plan_preflight_exposure_allowed("0.0.0.0", 0));
     CHECK(!server_cache_plan_preflight_exposure_allowed("127.0.0.1", 2));
+    CHECK(server_cache_plan_preflight_exposure_allowed(
+        std::vector<std::string>{"127.0.0.1", "::1", "/tmp/llama.sock"}, 1));
+    CHECK(!server_cache_plan_preflight_exposure_allowed(
+        std::vector<std::string>{"127.0.0.1", "0.0.0.0"}, 1));
+    CHECK(!server_cache_plan_preflight_exposure_allowed(
+        std::vector<std::string>{"0.0.0.0", "127.0.0.1"}, 0));
+    CHECK(!server_cache_plan_preflight_exposure_allowed(std::vector<std::string>{}, 0));
 
     CHECK(server_cache_plan_preflight_request_field_allowed("prompt"));
     CHECK(server_cache_plan_preflight_request_field_allowed("id_slot"));

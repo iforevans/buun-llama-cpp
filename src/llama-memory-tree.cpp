@@ -16,7 +16,7 @@ bool collect_impl(
         output.push_back({ uint32_t(output.size()), iswa->get_base(), nullptr,
             checkpoint_child_dependency_mode::live_guarded, nullptr });
         output.push_back({ uint32_t(output.size()), iswa->get_swa(), nullptr,
-            checkpoint_child_dependency_mode::payload_complete, nullptr });
+            checkpoint_child_dependency_mode::live_guarded, nullptr, true });
         return true;
     }
     if (auto * hybrid_iswa =

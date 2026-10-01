@@ -905,9 +905,10 @@ bool vbr_generation_tracker::prepare_import_image(
         const vbr_checkpoint_generation_controller & source,
         llama_seq_id destination,
         const std::vector<vbr_artifact_stream_placement> & placements,
-        vbr_tracker_import_image & output) noexcept {
+        vbr_tracker_import_image & output,
+        const std::vector<vbr_import_co_resident> * co_residents) noexcept {
     return prepare_import_image_impl(
-        plan, source, destination, &placements, nullptr, output);
+        plan, source, destination, &placements, nullptr, co_residents, output);
 }
 
 bool vbr_generation_tracker::prepare_relocated_import_image(
@@ -917,7 +918,7 @@ bool vbr_generation_tracker::prepare_relocated_import_image(
         const vbr_occupied_replacement_guard & replacement,
         vbr_tracker_import_image & output) noexcept {
     return prepare_import_image_impl(
-        plan, source, destination, nullptr, &replacement, output);
+        plan, source, destination, nullptr, &replacement, nullptr, output);
 }
 
 bool vbr_generation_tracker::prepare_import_image_impl(
@@ -926,10 +927,14 @@ bool vbr_generation_tracker::prepare_import_image_impl(
         llama_seq_id destination,
         const std::vector<vbr_artifact_stream_placement> * placements,
         const vbr_occupied_replacement_guard * replacement,
+        const std::vector<vbr_import_co_resident> * co_residents,
         vbr_tracker_import_image & output) noexcept {
     try {
         if (!active() || !stable() || !output.impl_ ||
             ((placements == nullptr) == (replacement == nullptr)) ||
+            (co_residents != nullptr && !co_residents->empty() &&
+             (replacement != nullptr ||
+              plan.transition != vbr_tracker_install_transition::whole_import)) ||
             plan.child_id != source.child_id ||
             plan.target_instance != instance_id_ ||
             destination < 0 || destination >= LLAMA_MAX_SEQ ||
@@ -1016,12 +1021,77 @@ bool vbr_generation_tracker::prepare_import_image_impl(
             next->extent_handles.push_back(handle);
         }
 
+        // A committed import extent for a sequence other than the destination
+        // that keeps rows in the published stream.
+        const auto reserve_owner_extent = [&](uint16_t stream_index,
+                                              llama_seq_id owner,
+                                              llama_pos first, llama_pos last) {
+            if (last == std::numeric_limits<llama_pos>::max()) {
+                return vbr_extent_handle{};
+            }
+            const auto handle = extents_.reserve(
+                vbr_mutation_family::import,
+                vbr_operation_class::state_api,
+                stream_index, owner, first, last + 1);
+            if (!handle) {
+                return vbr_extent_handle{};
+            }
+            const auto guard = extents_.add_ref(handle);
+            if (!guard) {
+                extents_.fail(handle);
+                return vbr_extent_handle{};
+            }
+            next->extent_guard_refs.push_back(guard);
+            if (!extents_.commit(handle)) {
+                return vbr_extent_handle{};
+            }
+            next->extent_handles.push_back(handle);
+            return handle;
+        };
+        // Generation-1 import stamp for one not yet stamped cell.
+        const auto stamp = [&](vbr_generation_stream_state & stream,
+                               uint32_t physical, llama_seq_id seq,
+                               vbr_extent_handle handle) {
+            if (physical >= n_cells_ || seq < 0 || !handle ||
+                stream.cell_last_dependency_gen[physical] != 0 ||
+                stream.cell_last_membership_gen[physical] != 0) {
+                return false;
+            }
+            const uint32_t page =
+                physical / VBR_GENERATION_PAGE_CELLS;
+            constexpr uint32_t generation = 1;
+            stream.page_event_gen[page] = std::max(
+                stream.page_event_gen[page], generation);
+            stream.page_last_import_gen[page] = std::max(
+                stream.page_last_import_gen[page], generation);
+            stream.cell_last_dependency_gen[physical] = generation;
+            stream.cell_last_membership_gen[physical] = generation;
+            const uint16_t provenance = pack_provenance(
+                vbr_mutation_family::import,
+                vbr_operation_class::state_api);
+            stream.cell_dependency_provenance[physical] = provenance;
+            stream.cell_membership_provenance[physical] = provenance;
+            stream.cell_last_membership_seq[physical] =
+                static_cast<int16_t>(seq);
+            stream.cell_dependency_extent[physical] =
+                extents_.add_ref(handle);
+            stream.cell_membership_extent[physical] =
+                extents_.add_ref(handle);
+            if (!stream.cell_dependency_extent[physical] ||
+                !stream.cell_membership_extent[physical]) {
+                return false;
+            }
+            set_range_bit(
+                stream.cell_dependency_in_range, physical, true);
+            set_range_bit(
+                stream.cell_membership_in_range, physical, true);
+            return true;
+        };
+
         if (replacement) {
             // Rebuild one coherent tracker image for the shared physical
             // stream. The guard authenticates the destination mapping and all
             // single-owner cells retained for the other logical sequences.
-            uint32_t previous_physical = 0;
-            bool first = true;
             auto & stream = next->streams.front();
             std::map<llama_seq_id, std::pair<llama_pos, llama_pos>> ranges;
             for (const auto & cell : replacement->preserved_cells()) {
@@ -1045,88 +1115,34 @@ bool vbr_generation_tracker::prepare_import_image_impl(
             }
             std::map<llama_seq_id, vbr_extent_handle> retained_extents;
             for (const auto & entry : ranges) {
-                if (entry.second.second ==
-                        std::numeric_limits<llama_pos>::max()) {
-                    return false;
-                }
-                const auto handle = extents_.reserve(
-                    vbr_mutation_family::import,
-                    vbr_operation_class::state_api,
-                    0, entry.first, entry.second.first,
-                    entry.second.second + 1);
+                const auto handle = reserve_owner_extent(
+                    0, entry.first, entry.second.first, entry.second.second);
                 if (!handle) {
                     return false;
                 }
-                const auto guard = extents_.add_ref(handle);
-                if (!guard) {
-                    extents_.fail(handle);
-                    return false;
-                }
-                next->extent_guard_refs.push_back(guard);
-                if (!extents_.commit(handle)) {
-                    return false;
-                }
-                next->extent_handles.push_back(handle);
                 retained_extents.emplace(entry.first, handle);
             }
-            const auto stamp = [&](uint32_t physical, llama_seq_id seq,
-                                   vbr_extent_handle handle) {
-                if (physical >= n_cells_ || seq < 0 || !handle ||
-                    stream.cell_last_dependency_gen[physical] != 0 ||
-                    stream.cell_last_membership_gen[physical] != 0) {
-                    return false;
-                }
-                const uint32_t page =
-                    physical / VBR_GENERATION_PAGE_CELLS;
-                constexpr uint32_t generation = 1;
-                stream.page_event_gen[page] = std::max(
-                    stream.page_event_gen[page], generation);
-                stream.page_last_import_gen[page] = std::max(
-                    stream.page_last_import_gen[page], generation);
-                stream.cell_last_dependency_gen[physical] = generation;
-                stream.cell_last_membership_gen[physical] = generation;
-                const uint16_t provenance = pack_provenance(
-                    vbr_mutation_family::import,
-                    vbr_operation_class::state_api);
-                stream.cell_dependency_provenance[physical] = provenance;
-                stream.cell_membership_provenance[physical] = provenance;
-                stream.cell_last_membership_seq[physical] =
-                    static_cast<int16_t>(seq);
-                stream.cell_dependency_extent[physical] =
-                    extents_.add_ref(handle);
-                stream.cell_membership_extent[physical] =
-                    extents_.add_ref(handle);
-                if (!stream.cell_dependency_extent[physical] ||
-                    !stream.cell_membership_extent[physical]) {
-                    return false;
-                }
-                set_range_bit(
-                    stream.cell_dependency_in_range, physical, true);
-                set_range_bit(
-                    stream.cell_membership_in_range, physical, true);
-                return true;
-            };
             for (const auto & cell : replacement->preserved_cells()) {
                 const auto handle = retained_extents.find(
                     cell.owner_sequence);
                 if (handle == retained_extents.end() ||
-                    !stamp(cell.physical_cell, cell.owner_sequence,
+                    !stamp(stream, cell.physical_cell, cell.owner_sequence,
                            handle->second)) {
                     return false;
                 }
             }
             const auto destination_handle = import_extents.front();
+            // Recycled incumbent rows are mapped in logical-token order,
+            // not necessarily physical order. stamp() still rejects duplicate
+            // destinations and collisions with the preserved foreign rows.
             for (const auto & cell : replacement->cell_mapping()) {
                 if (cell.source_stream != 0 ||
                     cell.destination_physical_cell >= n_cells_ ||
-                    cell.logical_position < 0 ||
-                    (!first && cell.destination_physical_cell <= previous_physical)) {
+                    cell.logical_position < 0) {
                     return false;
                 }
-                first = false;
-                previous_physical = cell.destination_physical_cell;
                 const uint32_t physical = cell.destination_physical_cell;
-                if (!stamp(physical, destination, destination_handle)) {
+                if (!stamp(stream, physical, destination, destination_handle)) {
                     return false;
                 }
             }
@@ -1207,6 +1223,43 @@ bool vbr_generation_tracker::prepare_import_image_impl(
                                   cell.physical_cell, true);
                     set_range_bit(stream.cell_membership_in_range,
                                   cell.physical_cell, true);
+                }
+            }
+            if (co_residents != nullptr) {
+                for (const auto & co : *co_residents) {
+                    if (co.destination == destination) {
+                        return false;
+                    }
+                    for (const auto & placement : co.placements) {
+                        if (placement.child_id != plan.child_id) {
+                            continue;
+                        }
+                        if (placement.stream_index >= next->streams.size() ||
+                            placement.cells.empty()) {
+                            return false;
+                        }
+                        const auto range = std::minmax_element(
+                            placement.cells.begin(), placement.cells.end(),
+                            [](const auto & a, const auto & b) {
+                                return a.logical_position < b.logical_position;
+                            });
+                        if (range.first->logical_position < 0) {
+                            return false;
+                        }
+                        const auto handle = reserve_owner_extent(
+                            uint16_t(placement.stream_index), co.destination,
+                            range.first->logical_position,
+                            range.second->logical_position);
+                        // stamp() refuses a row the destination or another
+                        // co-resident already holds.
+                        for (const auto & cell : placement.cells) {
+                            if (!stamp(next->streams[placement.stream_index],
+                                       cell.physical_cell, co.destination,
+                                       handle)) {
+                                return false;
+                            }
+                        }
+                    }
                 }
             }
         }

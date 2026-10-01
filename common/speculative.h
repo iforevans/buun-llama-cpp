@@ -141,6 +141,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 //      (classic lockstep drafter decodes) — their state is managed entirely via
 //      begin()/process()/draft().
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
 // Whether any configured implementation requires target embeddings.
 bool common_speculative_need_embd(common_speculative * spec);

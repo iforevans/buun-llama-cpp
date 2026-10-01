@@ -150,6 +150,8 @@ std::string lora_config_identity(const std::vector<common_adapter_lora_info> & l
 //                             batch before any logical payload mutation
 //   frontier_disagree_after_flip - make the frontier selector disagree only after
 //                                  it owns reads (exercises fail-closed legacy fallback)
+//   idle_capture_slow - hold a background exact capture 3 s after its transfer, before it
+//                       completes (a shutdown can land inside it)
 bool server_fault(const char * tag);
 
 //
@@ -180,9 +182,12 @@ private: // disallow accessing these members directly, risking out-of-sync
     // first read after a token edit is linear; unchanged reads are O(1).
     mutable std::array<uint8_t, 32> retention_token_digest_cache = {};
     mutable bool retention_token_digest_valid = false;
+    mutable std::array<uint8_t, 32> retention_content_digest_cache = {};
+    mutable bool retention_content_digest_valid = false;
 
     void invalidate_retention_token_digest() noexcept {
         retention_token_digest_valid = false;
+        retention_content_digest_valid = false;
     }
 
     // for ex. with input of 5 text tokens and 2 images (each image occupies 3 tokens and 2 pos):
@@ -216,6 +221,8 @@ public:
         tokens.swap(other.tokens);
         retention_token_digest_cache.swap(other.retention_token_digest_cache);
         swap(retention_token_digest_valid, other.retention_token_digest_valid);
+        retention_content_digest_cache.swap(other.retention_content_digest_cache);
+        swap(retention_content_digest_valid, other.retention_content_digest_valid);
     }
 
     friend void swap(server_tokens & lhs, server_tokens & rhs) noexcept {
@@ -243,6 +250,10 @@ public:
     // a media chunk or a chunk has no content identity; callers must then fail
     // closed rather than publish a reusable frontier.
     bool media_content_identity(int64_t n_tokens, std::string & out) const;
+
+    // One frontier per media-identity scope: before each chunk, then the end.
+    // Used to find a saved prefix even when the request appends new media.
+    std::vector<size_t> media_prefix_boundaries() const;
 
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
@@ -274,12 +285,17 @@ public:
     // distinct media can never compare as reusable content.
     const llama_tokens & retention_token_ids() const;
 
+    // Stable token-only digest, also used by persisted slot/resume envelopes.
     bool retention_token_digest(
         std::array<uint8_t, 32> & out) const noexcept;
 
-    // Stable identity for one exact logical prefix. Unlike the whole-token
-    // cache above, this deliberately includes the media-prefix identity and
-    // refuses a boundary that cuts through a media chunk. Stem publication
+    // Cached process-local recovery identity including media IDs/geometry.
+    // Prepare before no-fail publication; repeated reads do not allocate.
+    bool retention_content_digest(
+        std::array<uint8_t, 32> & out) const noexcept;
+
+    // Stable identity for one exact logical prefix, including media identity.
+    // Refuses a boundary that cuts through a media chunk. Stem publication
     // uses it as a bounded source witness while the live suffix may continue
     // to change independently.
     bool retention_token_prefix_digest(
@@ -331,7 +347,7 @@ public:
     // payloads with placeholders. Refuse partial/unidentified media chunks.
     server_tokens clone_cached_prefix(size_t n) const;
     // Primary KV positions, including M-RoPE image multiplicities and gaps.
-    std::vector<llama_pos> prefix_row_positions(size_t n) const;
+    std::vector<llama_pos> prefix_row_positions(size_t n, std::vector<mtmd_decoder_pos> * coordinates = nullptr) const;
 };
 
 
@@ -392,6 +408,15 @@ std::vector<server_tokens> tokenize_input_prompts(
                                         bool parse_special,
                                         const mtmd_helper_init_opt & init_opt);
 
+// tokenize a single prompt, see tokenize_input_prompts() for the supported shapes
+server_tokens tokenize_input_subprompt(
+                                        const llama_vocab * vocab,
+                                        mtmd_context * mctx,
+                                        const json & json_prompt,
+                                        bool add_special,
+                                        bool parse_special,
+                                        const mtmd_helper_init_opt & init_opt);
+
 //
 // OAI utils
 //
@@ -421,6 +446,16 @@ json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
     std::vector<raw_buffer> & out_files);
+
+// used by /embeddings endpoint, content has the same format as a chat message content array
+server_tokens tokenize_oai_content_array(
+    const llama_vocab * vocab,
+    mtmd_context * mctx,
+    const server_chat_params & opt,
+    json content,
+    bool add_special,
+    bool parse_special,
+    const mtmd_helper_init_opt & init_opt);
 
 // TODO: move it to server-task.cpp
 json format_embeddings_response_oaicompat(
@@ -758,7 +793,9 @@ struct server_subproc {
         void wait(const std::vector<server_subproc *> & procs, std::vector<bool> & ready, int64_t timeout_ms);
 
     private:
+#ifndef _WIN32
         intptr_t wake_fd[2] = { -1, -1 }; // POSIX self-pipe
+#endif
     };
 
 private:

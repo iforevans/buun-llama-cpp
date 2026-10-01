@@ -72,7 +72,7 @@ static __global__ void mul_mat_f(
     typedef tile< 8, 4, T,     DATA_LAYOUT_I_MAJOR_MIRRORED> tile_B;
     typedef tile<32, 8, float, DATA_LAYOUT_I_MAJOR>          tile_C;
 #else
-    if constexpr (rows_per_block != MMF_ROWS_PER_BLOCK) {NO_DEVICE_CODE;} else {
+    if constexpr (rows_per_block != MMF_ROWS_PER_BLOCK && rows_per_block != 16) {NO_DEVICE_CODE;} else {
     typedef tile<16, 8, T>     tile_A;
     typedef tile<8,  8, T>     tile_B;
     typedef tile<16, 8, float> tile_C;
@@ -264,8 +264,13 @@ static __global__ void mul_mat_f(
             return;
         }
 
-        float sum[rows_per_block/warp_size] = {0.0f};
-        static_assert((rows_per_block % warp_size) == 0, "rows_per_block must be a multiple of warp_size.");
+        if constexpr (rows_per_block < warp_size) {
+            if (threadIdx.x >= rows_per_block) {
+                return;
+            }
+        }
+        float sum[(rows_per_block + warp_size - 1)/warp_size] = {0.0f};
+        static_assert((rows_per_block % warp_size) == 0 || rows_per_block == 16);
 #pragma unroll
         for (int i0 = 0; i0 < nwarps*rows_per_block; i0 += rows_per_block) {
 #pragma unroll

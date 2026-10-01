@@ -154,6 +154,14 @@ struct vbr_companion_adoption_provider {
         llama_seq_id destination,
         const vbr_companion_attention_layout & layout,
         std::unique_ptr<vbr_prepared_companion_image> & output) noexcept = nullptr;
+    // Absent-destination insertion into a target that holds other sequences.
+    // Used instead of `prepare` when the guard is absent_destination(); the
+    // destination must hold no state and other sequences are left untouched.
+    bool (*prepare_insertion)(
+        const void * context,
+        std::unique_ptr<vbr_parsed_companion_image> parsed,
+        llama_seq_id destination,
+        std::unique_ptr<vbr_prepared_companion_image> & output) noexcept = nullptr;
     uint32_t attention_child_id = UINT32_MAX;
     // Late complete-tree drift gate. It must be allocation-free and describe the
     // same target object as target_cookie/prepare/publish_swap.
@@ -349,7 +357,8 @@ vbr_adopt_status vbr_adopt_check_complete_tree(
         const std::vector<vbr_adopt_expected_attention> & expected,
         const std::vector<llama_memory_tree_child> & live,
         const std::vector<vbr_companion_adoption_provider> & companions,
-        bool occupied_replacement = false) noexcept;
+        bool occupied_replacement = false,
+        bool absent_insertion = false) noexcept;
 
 // Rollback quarantine is meaningful for VMM backends whose unmap door can
 // return false. CUDA's current unmap door is fail-stop (CU_CHECK aborts on a

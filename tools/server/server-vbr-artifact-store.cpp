@@ -13,8 +13,10 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <map>
 #include <random>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 bool server_vbr_companion_codec_for(
@@ -72,6 +74,27 @@ vbr_precision_admission import_precision(
     return result;
 }
 
+// Destination pricing counts co-resident rows as occupancy. Children are priced
+// alike, so the fullest child bounds them all.
+uint64_t co_resident_cells(const server_vbr_artifact_import_target & request) noexcept {
+    const auto child_cells = [&](uint32_t child_id) {
+        uint64_t cells = 0;
+        for (const auto & co : request.co_residents) {
+            for (const auto & placement : co.placements) {
+                cells += placement.child_id == child_id ? placement.cells.size() : 0;
+            }
+        }
+        return cells;
+    };
+    uint64_t result = 0;
+    for (const auto & co : request.co_residents) {
+        for (const auto & placement : co.placements) {
+            result = std::max(result, child_cells(placement.child_id));
+        }
+    }
+    return result + request.unowned_cells;
+}
+
 // A refusal needs no payload authentication. A pass grants no authority: the
 // existing quote/validation path below repeats both projection and admission.
 bool import_preflight(
@@ -82,7 +105,7 @@ bool import_preflight(
     vbr_import_destination_projection destination;
     if (!vbr_explicit_import_destination_preflight(
             *request.memory, request.destination, package, frontier,
-            request.incoming_cells, destination)) {
+            request.incoming_cells, destination, co_resident_cells(request))) {
         return false;
     }
     output.destination_status = destination.status;
@@ -265,6 +288,15 @@ public:
             llama_memory_seq_pos_min(memory, target->destination) < 0 &&
             llama_memory_seq_pos_max(memory, target->destination) < 0;
     }
+    // A target-only restore empties the draft sequence until the drafter
+    // rebuilds it, so a captured draft image may hold no cells at all.
+    static bool at_terminal(
+            const server_vbr_draft_target & target, llama_pos terminal) {
+        auto * memory = llama_get_memory(target.ctx);
+        const llama_pos live = llama_memory_seq_pos_max(memory, target.destination);
+        return live == terminal ||
+            (live < 0 && llama_memory_seq_pos_min(memory, target.destination) < 0);
+    }
     static bool prepare(
             const void * opaque,
             std::unique_ptr<vbr_parsed_companion_image> parsed_base,
@@ -294,8 +326,7 @@ public:
             }
             auto * memory = llama_get_memory(target->ctx);
             if (!memory || target->expected_terminal < 0 ||
-                llama_memory_seq_pos_max(memory, destination) !=
-                    target->expected_terminal) {
+                !at_terminal(*target, target->expected_terminal)) {
                 if (memory) {
                     llama_memory_seq_rm(memory, destination, -1, -1);
                 }
@@ -318,7 +349,7 @@ public:
             reader, target.destination, LLAMA_STATE_SEQ_FLAGS_NONE);
         auto * memory = llama_get_memory(target.ctx);
         return written == bytes && reader.n_bytes() == bytes && memory &&
-            llama_memory_seq_pos_max(memory, target.destination) == terminal;
+            at_terminal(target, terminal);
     }
     static bool prepare_replacement(
             const void * opaque,
@@ -354,9 +385,11 @@ public:
                 llama_memory_seq_pos_min(memory, destination);
             const size_t live_bytes = llama_state_seq_get_size_ext(
                 target->ctx, destination, LLAMA_STATE_SEQ_FLAGS_NONE);
-            if (image->recovery_live_terminal != target->recovery_terminal ||
-                recovery_live_min < 0 ||
-                recovery_live_min > target->recovery_terminal ||
+            // an empty draft sequence is its own recovery: nothing to restore
+            if (((recovery_live_min >= 0 || image->recovery_live_terminal >= 0) &&
+                 (image->recovery_live_terminal != target->recovery_terminal ||
+                  recovery_live_min < 0 ||
+                  recovery_live_min > target->recovery_terminal)) ||
                 live_bytes == 0 ||
                 live_bytes != recovery->bytes ||
                 recovery->source->size() != recovery->bytes) {
@@ -396,9 +429,7 @@ public:
             target->destination == image.target.destination &&
             target->expected_terminal == image.target.expected_terminal &&
             target->recovery_terminal == image.target.recovery_terminal &&
-            llama_memory_seq_pos_max(
-                llama_get_memory(target->ctx), target->destination) ==
-                    target->expected_terminal &&
+            at_terminal(*target, target->expected_terminal) &&
             llama_state_seq_get_size_ext(
                 target->ctx, target->destination,
                 LLAMA_STATE_SEQ_FLAGS_NONE) == image.expected_bytes;
@@ -752,6 +783,7 @@ server_vbr_artifact_capture_status map_status(
             return server_vbr_artifact_capture_status::ok;
         case vbr_explicit_capture_status::not_armed:
         case vbr_explicit_capture_status::unsupported_layout:
+        case vbr_explicit_capture_status::projected_stash_requires_exact:
             return server_vbr_artifact_capture_status::unsupported;
         case vbr_explicit_capture_status::slot_not_idle:
             return server_vbr_artifact_capture_status::slot_processing;
@@ -808,6 +840,7 @@ void copy_capture_result(
     output.stash_bytes = result.stash_bytes;
     output.companion_bytes = result.companion_bytes;
     output.chunks = result.chunks;
+    output.reused_attention_bytes = result.reused_attention_bytes;
     output.backpressure_waits = result.backpressure_waits;
     output.event_completions = result.event_completions;
     output.synchronous_fallbacks = result.synchronous_fallbacks;
@@ -1066,6 +1099,15 @@ bool server_vbr_artifact_import_variant_fallback_safe(
             return false;
     }
     return false;
+}
+
+bool server_vbr_artifact_import_capacity_refused(
+        const server_vbr_artifact_import_output & output) noexcept {
+    return output.status == server_vbr_artifact_import_status::unavailable &&
+        !output.adopt_attempted && output.h2d_bytes == 0 && output.h2d_chunks == 0 &&
+        output.recovery == vbr_adopt_recovery_outcome::not_needed &&
+        (output.destination_status == vbr_import_destination_status::exhausted ||
+         output.occupied_guard_status == vbr_occupied_replacement_guard_status::capacity_unavailable);
 }
 
 bool server_vbr_artifact_reference_index::publish(
@@ -1405,7 +1447,7 @@ public:
             scheduler_checked_ = true;
             try {
                 llama_cache_budget_config budget;
-                if (!sample_budget_(budget_context_, budget)) {
+                if (!sample_budget_(budget_context_, budget, 0)) {
                     status_ = status::budget_failed;
                     return false;
                 }
@@ -1612,6 +1654,20 @@ private:
     status status_ = status::not_called;
 };
 
+// A freshly published reference becomes a cache-owned payload, or is discarded.
+std::shared_ptr<const server_prompt_cache_vbr_payload> adopt_fresh_reference(
+        llama_vbr_artifact_catalog & catalog,
+        llama_cache_acct_artifact_id reference) {
+    std::vector<llama_cache_acct_artifact_id> references { reference };
+    std::vector<vbr_artifact_package_view> packages;
+    if (!catalog.claim_fresh_host_batch(references, packages) ||
+        packages.size() != 1) {
+        (void) catalog.discard_unowned_reference(reference);
+        return nullptr;
+    }
+    return server_prompt_cache_vbr_payload::adopt(std::move(packages.front()));
+}
+
 } // namespace
 
 bool server_vbr_artifact_store_test_door::import_transport_policy(
@@ -1669,7 +1725,7 @@ bool server_vbr_artifact_store_test_door::projected_staging_lifecycle(
             projected_capture_resource_admission admission(
                 ledger, &budget_context,
                 +[](void * opaque,
-                    llama_cache_budget_config & output) noexcept {
+                    llama_cache_budget_config & output, uint64_t) noexcept {
                     const auto * state =
                         static_cast<const fixed_budget_context *>(opaque);
                     if (!state || !state->budget) {
@@ -1753,7 +1809,7 @@ bool server_vbr_artifact_store_test_door::projected_staging_initial(
             projected_capture_resource_admission admission(
                 ledger, &budget_context,
                 +[](void * opaque,
-                    llama_cache_budget_config & output) noexcept {
+                    llama_cache_budget_config & output, uint64_t) noexcept {
                     auto * state =
                         static_cast<fixed_budget_context *>(opaque);
                     if (!state || !state->budget || !state->samples) {
@@ -1823,14 +1879,16 @@ bool server_vbr_artifact_store_test_door::projected_resource_initial(
             projected_capture_resource_admission admission(
                 *state.ledger, &budget_state,
                 +[](void * opaque,
-                    llama_cache_budget_config & output) noexcept {
+                    llama_cache_budget_config & output,
+                    uint64_t pending_host_bytes) noexcept {
                     auto * current = static_cast<budget_context *>(opaque);
                     if (!current || !current->store || !current->samples) {
                         return false;
                     }
                     ++*current->samples;
                     return current->store->sample_budget(
-                        current->store->budget_context, output);
+                        current->store->budget_context, output,
+                        pending_host_bytes);
                 },
                 state.domain_bindings, &scheduler, &state.catalog);
             accepted = admission.admit(quote);
@@ -2210,7 +2268,7 @@ server_vbr_artifact_store::create(
         }
 
         llama_cache_budget_config budget;
-        if (!state->sample_budget(state->budget_context, budget)) {
+        if (!state->sample_budget(state->budget_context, budget, 0)) {
             fail(server_vbr_artifact_store_create_failure::
                 budget_sample_failed);
             return nullptr;
@@ -2315,7 +2373,7 @@ server_vbr_artifact_store::prepare_host_payload(
     impl_->counters.requested++;
     try {
         llama_cache_budget_config budget;
-        if (!impl_->sample_budget(impl_->budget_context, budget)) {
+        if (!impl_->sample_budget(impl_->budget_context, budget, 0)) {
             output.status = server_vbr_artifact_capture_status::unavailable;
             impl_->counters.unavailable++;
             return output;
@@ -2389,9 +2447,13 @@ server_vbr_artifact_store::transfer_host_payload(
 server_vbr_artifact_capture_output
 server_vbr_artifact_store::publish_host_payload(
         server_vbr_explicit_host_capture & operation,
-        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload,
+        vbr_explicit_attention_reuse * attention_reuse)
         noexcept {
     payload.reset();
+    if (attention_reuse) {
+        attention_reuse->reset();
+    }
     server_vbr_artifact_capture_output output;
     if (!operation.ready_for_publication()) {
         if (!operation.impl_) {
@@ -2436,21 +2498,8 @@ server_vbr_artifact_store::publish_host_payload(
             operation.reset();
             return output;
         }
-        std::vector<llama_cache_acct_artifact_id> references {
-            result.sink.reference_artifact,
-        };
-        std::vector<vbr_artifact_package_view> packages;
-        if (!impl_->catalog.claim_fresh_host_batch(
-                references, packages) || packages.size() != 1) {
-            (void) impl_->catalog.discard_unowned_reference(
-                result.sink.reference_artifact);
-            output.status = server_vbr_artifact_capture_status::internal_error;
-            impl_->counters.internal_error++;
-            operation.reset();
-            return output;
-        }
-        payload = server_prompt_cache_vbr_payload::adopt(
-            std::move(packages.front()));
+        payload = adopt_fresh_reference(
+            impl_->catalog, result.sink.reference_artifact);
         if (!payload) {
             output.status = server_vbr_artifact_capture_status::internal_error;
             impl_->counters.internal_error++;
@@ -2474,6 +2523,12 @@ server_vbr_artifact_store::publish_host_payload(
         }
         impl_->counters.staging_overlap_refusals =
             impl_->catalog.snapshot().staging_overlap_refusals;
+        if (attention_reuse) {
+            // Optional optimization: refusal leaves the next capture on its
+            // normal transfer path, without invalidating this publication.
+            (void) operation.impl_->capture.retain_attention(
+                payload->package(), *attention_reuse);
+        }
         operation.reset();
         return output;
     } catch (...) {
@@ -2498,7 +2553,7 @@ server_vbr_artifact_capture_output server_vbr_artifact_store::capture_impl(
             return output;
         }
         llama_cache_budget_config budget;
-        if (!impl_->sample_budget(impl_->budget_context, budget)) {
+        if (!impl_->sample_budget(impl_->budget_context, budget, 0)) {
             output.status =
                 server_vbr_artifact_capture_status::unavailable;
             impl_->counters.unavailable++;
@@ -2641,7 +2696,7 @@ bool server_vbr_artifact_store::publish_projected_host_batch_impl(
 
     llama_cache_budget_config budget;
     if (!capacity_admitted &&
-        !impl_->sample_budget(impl_->budget_context, budget)) {
+        !impl_->sample_budget(impl_->budget_context, budget, 0)) {
         return false;
     }
 
@@ -3233,9 +3288,7 @@ server_vbr_artifact_store::prepare_host_prefix_projection(
         uint64_t lcp_tokens,
         vbr_artifact_attention_prefix_projection & output) noexcept {
     output.reset();
-    if (!payload || !payload->retirement_owned() ||
-        !payload->accounted_by(impl_->ledger) || !payload->package() ||
-        !impl_->catalog.owns_host_package(payload->package())) {
+    if (!host_prefix_projection_parent(payload)) {
         return vbr_artifact_prefix_projection_status::parent_stale;
     }
     vbr_artifact_attention_prefix_request request;
@@ -3245,6 +3298,22 @@ server_vbr_artifact_store::prepare_host_prefix_projection(
     request.text_only = true;
     return impl_->catalog.project_attention_prefix(
         payload->package(), request, {}, output);
+}
+
+bool server_vbr_artifact_store::host_prefix_projection_ready(
+        const std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        const noexcept {
+    return host_prefix_projection_parent(payload) &&
+        impl_->catalog.projection_parent_status(payload->package()) ==
+            vbr_artifact_prefix_projection_status::projected;
+}
+
+bool server_vbr_artifact_store::host_prefix_projection_parent(
+        const std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        const noexcept {
+    return payload && payload->retirement_owned() &&
+        payload->accounted_by(impl_->ledger) && payload->package() &&
+        impl_->catalog.owns_host_package(payload->package());
 }
 
 server_vbr_artifact_import_output
@@ -3313,7 +3382,7 @@ server_vbr_artifact_store::import_host_prefix_payload_impl(
         }
 
         llama_cache_budget_config budget;
-        if (!impl_->sample_budget(impl_->budget_context, budget)) {
+        if (!impl_->sample_budget(impl_->budget_context, budget, 0)) {
             return fail(server_vbr_artifact_import_status::unavailable,
                         impl_->counters.imports_unavailable);
         }
@@ -3494,7 +3563,7 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
         }
 
         llama_cache_budget_config budget;
-        if (!impl_->sample_budget(impl_->budget_context, budget)) {
+        if (!impl_->sample_budget(impl_->budget_context, budget, 0)) {
             return fail(server_vbr_artifact_import_status::unavailable,
                         impl_->counters.imports_unavailable);
         }
@@ -3523,7 +3592,8 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
                 accounting_snapshot.serial, &representation_policy,
                 vbr_explicit_capture_representation_identity,
                 context.snapshot,
-                downward_projection, downward, schedule_quote, 0, request.incoming_cells);
+                downward_projection, downward, schedule_quote, 0, request.incoming_cells,
+                co_resident_cells(request));
         const auto incoming_has_companion = [&](
                 vbr_artifact_companion_kind kind) {
             return std::any_of(
@@ -3644,15 +3714,22 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
             return fail(server_vbr_artifact_import_status::unavailable,
                         impl_->counters.imports_unavailable);
         }
-        if (recovery) {
-            const auto guard_status =
-                vbr_explicit_prepare_occupied_replacement_guard(
+        const bool guarded = recovery || request.absent_insertion;
+        if (guarded) {
+            const auto guard_status = recovery
+                ? vbr_explicit_prepare_occupied_replacement_guard(
                     *request.memory, request.destination, package, *recovery,
                     impl_->domain_bindings, accounting_snapshot.serial,
                     &representation_policy,
                     vbr_explicit_capture_representation_identity,
                     occupied_guard, &schedule_quote,
-                    &context.snapshot.companions);
+                    &context.snapshot.companions)
+                : vbr_explicit_prepare_absent_insertion_guard(
+                    *request.memory, request.destination, package,
+                    impl_->domain_bindings, accounting_snapshot.serial,
+                    &representation_policy,
+                    vbr_explicit_capture_representation_identity,
+                    occupied_guard, &context.snapshot.companions);
             output.occupied_guard_status = guard_status;
             if (guard_status !=
                     vbr_occupied_replacement_guard_status::ready) {
@@ -3680,6 +3757,8 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
             &package.manifest().token_block.tokens,
         };
         policy.destination_sequence = request.destination;
+        policy.co_residents = &request.co_residents;
+        policy.pack_rows = request.pack_rows;
         policy.adoption_nonce = impl_->next_reference++;
         if (policy.adoption_nonce == 0) {
             policy.adoption_nonce = impl_->next_reference++;
@@ -3690,7 +3769,7 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
         policy.transform_budget_plan = &transform_budget;
         policy.allow_upward = true;
         policy.schedule_quote = &schedule_quote;
-        if (recovery) {
+        if (guarded) {
             policy.occupied_replacement = &occupied_guard;
             policy.occupied_representation_context = &representation_policy;
             policy.occupied_representation_identity =
@@ -3763,6 +3842,226 @@ bool server_vbr_artifact_store::retain_host_payload(
     payload = server_prompt_cache_vbr_payload::adopt_owned(
         std::move(package));
     return bool(payload);
+}
+
+vbr_artifact_status server_vbr_artifact_store::export_host_payload(
+        const server_prompt_cache_vbr_payload & payload,
+        const vbr_artifact_stream_writer & writer,
+        uint64_t max_encoded_bytes) noexcept {
+    if (!payload.accounted_by(impl_->ledger) ||
+        !impl_->catalog.owns_host_package(payload.package())) {
+        return vbr_artifact_status::invalid_argument;
+    }
+    return payload.package().encode_exact(writer, max_encoded_bytes);
+}
+
+namespace {
+
+// Decode hands payload bytes over before the package is known to be valid, so
+// every stream is held privately until the decoder reports the whole envelope
+// verified.
+struct ingest_staging {
+    using key = std::tuple<bool, uint32_t, uint32_t, bool>;
+    std::map<key, std::shared_ptr<artifact_segment_chain>> chains;
+    bool verified = false;
+
+    // host bytes held in the chains so far
+    uint64_t bytes() const {
+        uint64_t n = 0;
+        for (const auto & chain : chains) {
+            n += chain.second->size();
+        }
+        return n;
+    }
+
+    static bool consume(
+            void * context,
+            vbr_artifact_section_kind section,
+            uint32_t object_index,
+            uint32_t shard_index,
+            bool clean_stash,
+            uint64_t offset,
+            uint64_t total_size,
+            const uint8_t * data,
+            size_t size) noexcept {
+        try {
+            auto & self = *static_cast<ingest_staging *>(context);
+            const bool companion = section ==
+                vbr_artifact_section_kind::companion_payload;
+            if (!companion &&
+                section != vbr_artifact_section_kind::unit_blob) {
+                return false;
+            }
+            auto & chain = self.chains[
+                key { companion, object_index, shard_index, clean_stash }];
+            if (!chain) {
+                chain = std::make_shared<artifact_segment_chain>(total_size);
+            }
+            return chain->size() == offset && chain->append(data, size);
+        } catch (...) {
+            return false;
+        }
+    }
+
+    static void finish(void * context, bool verified) noexcept {
+        static_cast<ingest_staging *>(context)->verified = verified;
+    }
+
+    // Whether `bytes` more of pageable host memory fit the sampled budget. The
+    // object is staged in host memory whole before the catalog can price it,
+    // so the encoded size is priced first, as the catalog prices what it
+    // publishes, and nothing is allocated for an object the budget refuses.
+    static bool admitted(
+            llama_cache_acct_ledger & ledger,
+            const llama_cache_budget_config & budget,
+            uint64_t bytes) noexcept {
+        try {
+            auto snapshot = ledger.snapshot();
+            llama_cache_budget_plan plan;
+            plan.accounting_serial = snapshot.serial;
+            plan.entries.push_back({
+                llama_cache_acct_resource_domain::non_device(
+                    llama_cache_acct_residency::pageable_host),
+                bytes, 0});
+            llama_cache_budget_coordinator coordinator;
+            return coordinator.reset(std::move(snapshot), budget) &&
+                coordinator.fits(plan).state ==
+                    llama_cache_budget_fit_state::fits;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    std::shared_ptr<const artifact_segment_chain> take(
+            bool companion,
+            uint32_t object_index,
+            uint32_t shard_index,
+            bool clean_stash) {
+        const auto found = chains.find(
+            key { companion, object_index, shard_index, clean_stash });
+        return found == chains.end() ? nullptr : std::move(found->second);
+    }
+};
+
+} // namespace
+
+server_vbr_artifact_ingest_output
+server_vbr_artifact_store::ingest_host_payload(
+        const vbr_artifact_stream_reader & reader,
+        uint64_t encoded_bytes,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        noexcept {
+    payload.reset();
+    server_vbr_artifact_ingest_output output;
+    try {
+        llama_cache_budget_config budget;
+        if (!impl_->sample_budget(impl_->budget_context, budget, 0) ||
+            !ingest_staging::admitted(*impl_->ledger, budget, encoded_bytes)) {
+            output.stream_status =
+                vbr_capture_stream_status::accounting_refused;
+            return output;
+        }
+        ingest_staging staging;
+        const vbr_artifact_payload_consumer consumer {
+            &staging, ingest_staging::consume, ingest_staging::finish,
+        };
+        vbr_artifact_decode_limits limits;
+        limits.max_total_bytes = encoded_bytes;
+        vbr_artifact_package package;
+        output.decode_status = vbr_artifact_decode(
+            reader, encoded_bytes, limits, &consumer, package);
+        if (output.decode_status != vbr_artifact_status::ok ||
+            !staging.verified) {
+            return output;
+        }
+        // The catalog binds one topology set for its lifetime; an envelope
+        // written under another device layout is not re-homed here. The
+        // staged bytes are allocated already: they count back into the
+        // headroom the catalog prices the package against.
+        if (package.topologies != impl_->topologies ||
+            !impl_->sample_budget(impl_->budget_context, budget, staging.bytes()) ||
+            !impl_->catalog.prepare_capture_package(package)) {
+            return output;
+        }
+        auto build = impl_->catalog.begin_capture(
+            package, budget, {}, output.stream_status);
+        if (!build) {
+            return output;
+        }
+        const auto segment = [&](vbr_unit_build & unit, uint32_t unit_index,
+                                 uint32_t shard_index, bool clean_stash) {
+            vbr_verified_segment verified;
+            verified.unit_index = unit_index;
+            verified.shard_index = shard_index;
+            verified.clean_stash = clean_stash;
+            verified.bytes = staging.take(
+                false, unit_index, shard_index, clean_stash);
+            if (!verified.bytes) {
+                return vbr_capture_stream_status::missing_segment;
+            }
+            verified.streaming_digest =
+                vbr_capture_stream_digest(*verified.bytes);
+            return unit.accept_verified_segment(verified);
+        };
+        for (uint32_t i = 0; i < package.companions.size(); ++i) {
+            vbr_verified_companion verified;
+            verified.companion_index = i;
+            verified.bytes = staging.take(true, i, 0, false);
+            if (!verified.bytes) {
+                output.stream_status =
+                    vbr_capture_stream_status::missing_segment;
+                return output;
+            }
+            verified.streaming_digest =
+                vbr_capture_stream_digest(*verified.bytes);
+            output.stream_status = build->accept_verified_companion(verified);
+            if (output.stream_status != vbr_capture_stream_status::ok) {
+                return output;
+            }
+        }
+        for (uint32_t i = 0; i < package.unit_blobs.size(); ++i) {
+            auto unit = build->begin_unit(i, output.stream_status);
+            if (!unit) {
+                return output;
+            }
+            const auto & descriptor = package.unit_blobs[i].descriptor;
+            for (const auto & shard : descriptor.shards) {
+                output.stream_status =
+                    segment(*unit, i, shard.shard_index, false);
+                if (output.stream_status != vbr_capture_stream_status::ok) {
+                    return output;
+                }
+            }
+            if (descriptor.clean_stash_state ==
+                    vbr_artifact_clean_stash_state::present) {
+                for (const auto & shard : descriptor.clean_stash.shards) {
+                    output.stream_status =
+                        segment(*unit, i, shard.shard_index, true);
+                    if (output.stream_status !=
+                            vbr_capture_stream_status::ok) {
+                        return output;
+                    }
+                }
+            }
+            output.stream_status = unit->seal_unit();
+            if (output.stream_status != vbr_capture_stream_status::ok) {
+                return output;
+            }
+        }
+        const auto published = build->publish_reference();
+        output.stream_status = published.status;
+        build.reset();
+        if (published.status != vbr_capture_stream_status::ok ||
+            published.reference_artifact.v == 0) {
+            return output;
+        }
+        payload = adopt_fresh_reference(
+            impl_->catalog, published.reference_artifact);
+        return output;
+    } catch (...) {
+        payload.reset();
+        return output;
+    }
 }
 
 const server_vbr_artifact_store_counters &

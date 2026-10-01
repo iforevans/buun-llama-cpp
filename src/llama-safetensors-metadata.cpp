@@ -307,14 +307,72 @@ void llama_safetensors_emit_bpe_tokenizer(llama_safetensors_metadata_sink &    s
         }
     }
 
+    // Match SpecialVocab's precedence: post-processors override model/config
+    // defaults; ByteLevel only supplies defaults for processors not seen yet.
+    std::optional<bool> add_bos, add_eos;
+    uint32_t bos_id = policy.bos_token_id;
+    uint32_t eos_id = policy.eos_token_id;
+    const auto token_id = [&](const std::string & token) -> uint32_t {
+        const auto it = std::find(tokens.begin(), tokens.end(), token);
+        if (it == tokens.end()) {
+            throw std::runtime_error("post-processor token not found: '" + token + "'");
+        }
+        return static_cast<uint32_t>(it - tokens.begin());
+    };
+    const auto process = [&](const llama_safetensors_tokenizer_json & processor) {
+        const std::string type = processor.value("type", "");
+        if (type == "ByteLevel") {
+            if (!add_bos) { add_bos = false; }
+            if (!add_eos) { add_eos = false; }
+        } else if (type == "RobertaProcessing") {
+            bos_id = token_id(processor.at("cls").at(0).get<std::string>());
+            eos_id = token_id(processor.at("sep").at(0).get<std::string>());
+            add_bos = add_eos = true;
+            sink.set_u32("tokenizer.ggml.separator_token_id", eos_id);
+            sink.set_bool("tokenizer.ggml.add_sep_token", true);
+        } else if (type == "TemplateProcessing") {
+            const auto it = processor.find("single");
+            if (it == processor.end() || !it->is_array() || it->size() <= 1) {
+                return;
+            }
+            const auto first = it->front().find("SpecialToken");
+            if (first != it->front().end()) {
+                // Configured BOS remains authoritative as an identity; the
+                // template decides whether to insert it (as in SpecialVocab).
+                add_bos = token_id(first->at("id").get<std::string>()) == bos_id;
+            }
+            const auto last = it->back().find("SpecialToken");
+            if (last != it->back().end()) {
+                const uint32_t template_eos = token_id(last->at("id").get<std::string>());
+                if (template_eos != eos_id) {
+                    sink.set_u32("tokenizer.ggml.eot_token_id", eos_id);
+                    eos_id = template_eos;
+                }
+                add_eos = true;
+            }
+        }
+    };
+    const auto post = tokenizer.find("post_processor");
+    if (post != tokenizer.end() && post->is_object()) {
+        const auto processors = post->find("processors");
+        if (processors != post->end() && processors->is_array()) {
+            for (const auto & processor : *processors) { process(processor); }
+        } else {
+            process(*post);
+        }
+    }
+
     sink.set_string("tokenizer.ggml.model", "gpt2");
     sink.set_string("tokenizer.ggml.pre", policy.pre_tokenizer);
     sink.set_string_array("tokenizer.ggml.tokens", tokens);
     sink.set_i32_array("tokenizer.ggml.token_type", token_types.data(), token_types.size());
     sink.set_string_array("tokenizer.ggml.merges", merges);
-    sink.set_u32("tokenizer.ggml.bos_token_id", policy.bos_token_id);
-    sink.set_u32("tokenizer.ggml.eos_token_id", policy.eos_token_id);
-    sink.set_bool("tokenizer.ggml.add_bos_token", policy.add_bos_token);
+    sink.set_u32("tokenizer.ggml.bos_token_id", bos_id);
+    sink.set_u32("tokenizer.ggml.eos_token_id", eos_id);
+    sink.set_bool("tokenizer.ggml.add_bos_token", add_bos.value_or(policy.add_bos_token));
+    if (add_eos) {
+        sink.set_bool("tokenizer.ggml.add_eos_token", *add_eos);
+    }
 
     if (policy.padding_token) {
         const auto it = std::find(tokens.begin(), tokens.end(), *policy.padding_token);

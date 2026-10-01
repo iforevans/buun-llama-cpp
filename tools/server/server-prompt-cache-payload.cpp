@@ -419,6 +419,11 @@ server_prompt_cache_vbr_variant_set::quality_anchor() const noexcept {
     return impl_ ? impl_->anchor : empty;
 }
 
+const server_prompt_cache_vbr_owner &
+server_prompt_cache_vbr_variant_set::preferred() const noexcept {
+    return quality_anchor() ? quality_anchor() : compact_current();
+}
+
 uint64_t server_prompt_cache_vbr_variant_set::logical_bytes() const noexcept {
     return impl_ ? impl_->logical : 0;
 }
@@ -795,8 +800,7 @@ bool server_prompt_cache_payload::prepare_vbr_refresh(
     if (!incoming || !variants || !variants->compact_current()) {
         return false;
     }
-    const auto best = variants->quality_anchor()
-        ? variants->quality_anchor() : variants->compact_current();
+    const auto & best = variants->preferred();
     try {
         if (!same_frontier(
                 incoming->package().manifest(),

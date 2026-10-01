@@ -287,7 +287,7 @@ static int common_download_file_single_online(const std::string & url,
     static const int max_attempts        = 3;
     static const int retry_delay_seconds = 2;
 
-    const bool file_exists = std::filesystem::exists(path);
+    const bool file_exists = std::filesystem::exists(std::filesystem::u8path(path));
 
     if (file_exists && skip_etag) {
         LOG_DBG("%s: using cached file: %s\n", __func__, path.c_str());
@@ -363,7 +363,7 @@ static int common_download_file_single_online(const std::string & url,
 
     { // silent
         std::error_code ec;
-        std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+        std::filesystem::create_directories(std::filesystem::u8path(path).parent_path(), ec);
     }
 
     bool success = false;
@@ -478,7 +478,7 @@ int common_download_file_single(const std::string & url,
         return common_download_file_single_online(url, path, online_opts, skip_etag);
     }
 
-    if (!std::filesystem::exists(path)) {
+    if (!std::filesystem::exists(std::filesystem::u8path(path))) {
         LOG_ERR("%s: required file is not available in cache (offline mode): %s\n", __func__, path.c_str());
         return -1;
     }
@@ -770,7 +770,7 @@ static common_download_hf_plan safetensors_plan(
         throw std::runtime_error("safetensors directory is missing " + configs.front());
     }
     plan.primary = config->second;
-    plan.model_dir = fs::path(plan.primary.final_path).parent_path().string();
+    plan.model_dir = fs_path_to_utf8(fs::u8path(plan.primary.final_path).parent_path());
     const auto dir = fs::path(configs.front()).parent_path();
     std::unordered_set<std::string> selected;
     auto select = [&](const std::string & name) {
@@ -785,7 +785,7 @@ static common_download_hf_plan safetensors_plan(
         // Fetch only the small manifest before scheduling the large weights.
         common_download_run_tasks({common_download_task(index->second, opts)});
         const std::string index_path = hf_cache::finalize_file(index->second);
-        std::ifstream input(index_path);
+        std::ifstream input(fs::u8path(index_path));
         if (!input) {
             throw std::runtime_error("cannot read safetensors index: " + index_path);
         }
@@ -1184,7 +1184,7 @@ bool common_download_remove(const std::string & hf_repo_with_tag) {
     for (const auto & f : files) {
         auto split = get_gguf_split_info(f.path);
         if (split.tag == tag_upper) {
-            to_remove.emplace_back(f.local_path);
+            to_remove.emplace_back(fs::u8path(f.local_path));
         }
     }
 
@@ -1209,7 +1209,7 @@ bool common_download_remove(const std::string & hf_repo_with_tag) {
         std::error_code ec;
         fs::remove(p, ec);
         if (ec) {
-            LOG_WRN("%s: failed to remove %s: %s\n", __func__, p.string().c_str(), ec.message().c_str());
+            LOG_WRN("%s: failed to remove %s: %s\n", __func__, fs_path_to_utf8(p).c_str(), ec.message().c_str());
         }
     }
 
@@ -1220,23 +1220,23 @@ bool common_download_remove(const std::string & hf_repo_with_tag) {
     // collect blobs still referenced by remaining snapshot entries
     std::unordered_set<std::string> still_referenced;
     for (const auto & f : hf_cache::get_cached_files(repo_id)) {
-        fs::path p(f.local_path);
+        fs::path p = fs::u8path(f.local_path);
         std::error_code ec;
         if (fs::is_symlink(p, ec)) {
             auto target = fs::read_symlink(p, ec);
             if (!ec) {
-                still_referenced.insert((p.parent_path() / target).lexically_normal().string());
+                still_referenced.insert(fs_path_to_utf8((p.parent_path() / target).lexically_normal()));
             }
         }
     }
 
     // remove orphaned blobs
     for (const auto & blob : blobs_to_check) {
-        if (still_referenced.find(blob.string()) == still_referenced.end()) {
+        if (still_referenced.find(fs_path_to_utf8(blob)) == still_referenced.end()) {
             std::error_code ec;
             fs::remove(blob, ec);
             if (ec) {
-                LOG_WRN("%s: failed to remove blob %s: %s\n", __func__, blob.string().c_str(), ec.message().c_str());
+                LOG_WRN("%s: failed to remove blob %s: %s\n", __func__, fs_path_to_utf8(blob).c_str(), ec.message().c_str());
             }
         }
     }

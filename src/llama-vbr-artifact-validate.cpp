@@ -2,6 +2,7 @@
 #include "llama-vbr-precision.h"
 
 #include "llama-cache-budget.h"
+#include "llama-cparams.h"
 #include "llama-vbr-identity-digest.h"
 
 #include <algorithm>
@@ -125,10 +126,67 @@ const vbr_artifact_unit_reference * find_reference(
     return found == manifest.unit_references.end() ? nullptr : &*found;
 }
 
+// Each child's co-resident rows, sorted. A co-resident names its own
+// destination, only streams the artifact itself placed, and rows no other
+// co-resident holds.
+bool co_resident_cells(
+        const std::vector<vbr_import_co_resident> & co_residents,
+        llama_seq_id destination,
+        const vbr_artifact_reference_manifest & manifest,
+        std::vector<std::vector<uint32_t>> & cells) {
+    std::set<llama_seq_id> destinations = { destination };
+    for (const auto & co : co_residents) {
+        if (co.destination < 0 || co.destination >= LLAMA_MAX_SEQ ||
+            co.placements.empty() ||
+            !destinations.insert(co.destination).second) {
+            return false;
+        }
+        for (const auto & placement : co.placements) {
+            if (placement.child_id >= cells.size() ||
+                placement.cells.empty() ||
+                std::none_of(
+                    manifest.stream_placements.begin(),
+                    manifest.stream_placements.end(),
+                    [&](const vbr_artifact_stream_placement & own) {
+                        return own.child_id == placement.child_id &&
+                               own.stream_index == placement.stream_index;
+                    })) {
+                return false;
+            }
+            for (const auto & cell : placement.cells) {
+                if (cell.logical_position < 0) {
+                    return false;
+                }
+                cells[placement.child_id].push_back(cell.physical_cell);
+            }
+        }
+    }
+    for (auto & child : cells) {
+        std::sort(child.begin(), child.end());
+        if (std::adjacent_find(child.begin(), child.end()) != child.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// extend the last run while both the destination cell and the source row follow on
+void append_cell_run(
+        std::vector<vbr_authorized_cell_run> & runs, uint32_t cell, uint64_t row) {
+    if (runs.empty() ||
+        uint64_t(runs.back().first_physical_cell) + runs.back().cell_count != cell ||
+        runs.back().first_source_row + runs.back().cell_count != row) {
+        runs.push_back({ cell, 1, row });
+    } else {
+        ++runs.back().cell_count;
+    }
+}
+
 bool authorized_placement_plan(
         const vbr_artifact_reference_manifest & manifest,
         uint32_t child_id,
         const vbr_artifact_unit_reference & reference,
+        const std::vector<uint32_t> & co_cells,
         std::vector<vbr_artifact_stream_placement> & placements,
         std::vector<vbr_authorized_cell_run> & runs) {
     std::vector<uint32_t> cells;
@@ -152,14 +210,44 @@ bool authorized_placement_plan(
     }
     std::sort(cells.begin(), cells.end());
     cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
-    for (uint32_t cell : cells) {
-        if (runs.empty() ||
-            uint64_t(runs.back().first_physical_cell) +
-                    runs.back().cell_count != cell) {
-            runs.push_back({ cell, 1 });
-        } else {
-            ++runs.back().cell_count;
+    if (!co_cells.empty()) {
+        // The dense image holds the co-residents' rows too; they transfer with
+        // the reference's own, and may not alias them.
+        const size_t own = cells.size();
+        cells.insert(cells.end(), co_cells.begin(), co_cells.end());
+        std::inplace_merge(cells.begin(), cells.begin() + own, cells.end());
+        if (std::adjacent_find(cells.begin(), cells.end()) != cells.end()) {
+            return false;
         }
+    }
+    for (uint32_t cell : cells) {
+        append_cell_run(runs, cell, cell);
+    }
+    return !runs.empty();
+}
+
+// A projected package packs its rows: re-split the physical runs wherever the
+// source rows stop being contiguous with them.
+bool projected_source_runs(
+        const vbr_artifact_package_view & package,
+        const std::vector<vbr_artifact_stream_placement> & placements,
+        std::vector<vbr_authorized_cell_run> & runs,
+        std::vector<uint64_t> & packed_rows) {
+    if (placements.size() != 1 ||
+        !vbr_projected_packed_rows(package, placements.front(), packed_rows)) {
+        return false;
+    }
+    std::vector<std::pair<uint32_t, uint64_t>> rows;
+    rows.reserve(placements.front().cells.size());
+    std::vector<const vbr_artifact_cell_placement *> ordered;
+    if (!vbr_order_placement_cells(placements.front(), ordered)) { return false; }
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        rows.push_back({ordered[i]->physical_cell, packed_rows[i]});
+    }
+    std::sort(rows.begin(), rows.end());
+    runs.clear();
+    for (const auto & [cell, row] : rows) {
+        append_cell_run(runs, cell, row);
     }
     return !runs.empty();
 }
@@ -214,10 +302,94 @@ bool same_geometry(
            target.shards.size() == source.shards.size();
 }
 
+// rows every shard of the target unit backs
+uint64_t unit_capacity(const vbr_target_unit_snapshot & target) {
+    uint64_t rows = target.shards.empty() ? 0 : UINT64_MAX;
+    for (const auto & shard : target.shards) {
+        rows = shard.row_bytes == 0
+            ? 0 : std::min(rows, shard.mapped_bytes / shard.row_bytes);
+    }
+    return rows;
+}
+
+// A pool image wider than the target pool (an iSWA window child restored
+// with fewer slots) lands its reference's rows as a dense prefix, in source
+// physical order: a cell's position, not its index, carries its meaning.
+// When they still overflow, the oldest cells the window already masks are
+// dropped, as a live cache of that size would have pruned them. A projected
+// package has packed its rows already: a cell then reads the row its range
+// proofs select, in canonical temporal/spatial cell order.
+bool pack_placement(
+        std::vector<vbr_artifact_stream_placement> & placements,
+        std::vector<vbr_authorized_cell_run> & runs,
+        uint64_t capacity, llama_pos live_from,
+        const std::vector<uint64_t> * source_rows) {
+    if (placements.size() != 1 || placements.front().cells.empty()) {
+        return false;
+    }
+    auto & cells = placements.front().cells;
+    std::vector<std::pair<uint32_t, uint64_t>> physical_rows;
+    if (source_rows) {
+        std::vector<const vbr_artifact_cell_placement *> ordered;
+        if (source_rows->size() != cells.size() ||
+            !vbr_order_placement_cells(placements.front(), ordered)) { return false; }
+        physical_rows.reserve(cells.size());
+        for (size_t i = 0; i < ordered.size(); ++i) {
+            physical_rows.push_back({ordered[i]->physical_cell, (*source_rows)[i]});
+        }
+        std::sort(physical_rows.begin(), physical_rows.end());
+    }
+    if (cells.size() > capacity) {
+        std::vector<llama_pos> masked;
+        for (const auto & cell : cells) {
+            if (cell.logical_position < live_from) {
+                masked.push_back(cell.logical_position);
+            }
+        }
+        const size_t excess = cells.size() - capacity;
+        if (masked.size() < excess) {
+            return false;
+        }
+        std::nth_element(masked.begin(), masked.begin() + (excess - 1), masked.end());
+        const llama_pos cutoff = masked[excess - 1];
+        cells.erase(std::remove_if(cells.begin(), cells.end(),
+            [&](const vbr_artifact_cell_placement & cell) {
+                return cell.logical_position <= cutoff;
+            }), cells.end());
+        if (cells.empty() || cells.size() > capacity) {
+            return false;
+        }
+    }
+    std::sort(cells.begin(), cells.end(),
+        [](const vbr_artifact_cell_placement & a,
+           const vbr_artifact_cell_placement & b) {
+            return a.physical_cell < b.physical_cell;
+        });
+    if (std::adjacent_find(cells.begin(), cells.end(),
+            [](const vbr_artifact_cell_placement & a,
+               const vbr_artifact_cell_placement & b) {
+                return a.physical_cell == b.physical_cell;
+            }) != cells.end()) {
+        return false;
+    }
+    runs.clear();
+    size_t source_index = 0;
+    for (size_t i = 0; i < cells.size(); ++i) {
+        while (source_rows && source_index < physical_rows.size() &&
+               physical_rows[source_index].first < cells[i].physical_cell) { ++source_index; }
+        if (source_rows && (source_index == physical_rows.size() ||
+            physical_rows[source_index].first != cells[i].physical_cell)) { return false; }
+        append_cell_run(runs, uint32_t(i), source_rows
+            ? physical_rows[source_index].second
+            : cells[i].physical_cell);
+        cells[i].physical_cell = uint32_t(i);
+    }
+    return true;
+}
+
 bool shard_domain_matches(
         const vbr_artifact_shard_descriptor & source,
         const vbr_target_shard_snapshot & target,
-        uint64_t source_wm_cells,
         const vbr_artifact_package_view & package,
         const vbr_adopt_policy & policy) {
     llama_cache_acct_resource_domain resolved;
@@ -238,9 +410,7 @@ bool shard_domain_matches(
            target.row_count == source.row_count &&
            target.domain == resolved &&
            target.pool_cookie != nullptr &&
-           target.row_bytes != 0 &&
-           source_wm_cells <= UINT64_MAX / target.row_bytes &&
-           target.mapped_bytes >= source_wm_cells * target.row_bytes;
+           target.row_bytes != 0;
 }
 
 bool digest_nonzero(const std::array<uint8_t, 32> & digest) {
@@ -833,7 +1003,7 @@ bool vbr_quote_import_schedule(
         vbr_import_schedule_quote & output) noexcept {
     output = {};
     try {
-        if (!package || package.validate() != vbr_artifact_status::ok ||
+        if (!package || package.validate_authenticated() != vbr_artifact_status::ok ||
             !package.manifest().manifest_digest.valid() ||
             target.memory_instance_cookie == 0 ||
             target.target_state_serial == 0 ||
@@ -1110,6 +1280,7 @@ vbr_validated_manifest & vbr_validated_manifest::operator=(
         authenticated_identity_.tokens = &token_block_.tokens;
     }
     children_ = std::move(other.children_);
+    co_residents_ = std::move(other.co_residents_);
     companions_ = std::move(other.companions_);
     accounting_leaves_ = std::move(other.accounting_leaves_);
     tracker_install_ = std::move(other.tracker_install_);
@@ -1173,11 +1344,14 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                  policy.destination_sequence ||
              policy.occupied_replacement->incoming_artifact() !=
                  package.reference_artifact() ||
-             !policy.occupied_replacement->recovery_package() ||
+             (!policy.occupied_replacement->recovery_package() &&
+              !policy.occupied_replacement->absent_destination()) ||
              policy.occupied_representation_identity == nullptr)) {
             return terminal_result(
                 vbr_manifest_validation_status::unavailable);
         }
+        const bool absent_insertion = occupied_replacement &&
+            policy.occupied_replacement->absent_destination();
         if (manifest.version <
                 VBR_UNIT_ARTIFACT_FORMAT_VERSION_REFERENCE_PLACEMENT) {
             return terminal_result(
@@ -1264,9 +1438,27 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             }
         }
 
+        std::vector<std::vector<uint32_t>> co_cells(target.children.size());
+        const bool has_co_residents =
+            policy.co_residents != nullptr && !policy.co_residents->empty();
+        if (has_co_residents) {
+            if (occupied_replacement) {
+                return terminal_result(
+                    vbr_manifest_validation_status::target_not_empty);
+            }
+            if (!co_resident_cells(
+                    *policy.co_residents, policy.destination_sequence,
+                    manifest, co_cells)) {
+                return terminal_result(
+                    vbr_manifest_validation_status::ownership_mismatch);
+            }
+        }
+
         std::vector<vbr_validated_child_plan> child_plans;
         vbr_tracker_install_plan tracker;
-        bool needs_live_rebase =
+        // Captured page generations cover the reference's rows only, so
+        // co-residents cannot be cloned natively.
+        bool needs_live_rebase = has_co_residents ||
             manifest.consistency.kind ==
                 vbr_artifact_consistency_kind::live_rebased;
         bool needs_downward = false;
@@ -1414,12 +1606,14 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 const auto & target_shard =
                     target_unit->shards[shard_index];
                 if (!shard_domain_matches(
-                        shard, target_shard, descriptor.wm_cells,
-                        package, policy)) {
+                        shard, target_shard, package, policy)) {
                     return terminal_result(
                         vbr_manifest_validation_status::topology_mismatch);
                 }
             }
+            const uint64_t capacity = unit_capacity(*target_unit);
+            const bool projected = !package.projected_ranges().empty();
+            const bool pack = capacity < descriptor.wm_cells || policy.pack_rows;
             const auto & controller =
                 manifest.generation.controllers[descriptor.child_id];
             if (descriptor.logical_unit_id >= controller.units.size()) {
@@ -1443,8 +1637,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 for (size_t i = 0; i < descriptor.shards.size(); ++i) {
                     if (target_unit->shards[i].row_bytes !=
                             descriptor.shards[i].row_bytes ||
-                        target_unit->shards[i].mapped_bytes <
-                            descriptor.shards[i].payload_bytes) {
+                        (!pack && target_unit->shards[i].mapped_bytes <
+                                      descriptor.shards[i].payload_bytes)) {
                         return terminal_result(
                             vbr_manifest_validation_status::geometry_mismatch);
                     }
@@ -1457,11 +1651,35 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             }
             std::vector<vbr_artifact_stream_placement> placements;
             std::vector<vbr_authorized_cell_run> runs;
+            const auto & unit_co_cells = co_cells[descriptor.child_id];
             if (!authorized_placement_plan(
                     manifest, descriptor.child_id, *reference,
-                    placements, runs)) {
+                    unit_co_cells, placements, runs) ||
+                (!unit_co_cells.empty() &&
+                 unit_co_cells.back() >= descriptor.wm_cells)) {
                 return terminal_result(
                     vbr_manifest_validation_status::ownership_mismatch);
+            }
+            std::vector<uint64_t> packed_rows;
+            if (projected &&
+                (!unit_co_cells.empty() ||
+                 !projected_source_runs(package, placements, runs, packed_rows))) {
+                return terminal_result(
+                    vbr_manifest_validation_status::geometry_mismatch);
+            }
+            // Packed rows leave their captured cells, so neither the page
+            // generations nor a clean stash keyed by source cell carry over.
+            uint64_t packed_cells = 0;
+            if (pack) {
+                if (occupied_replacement || !unit_co_cells.empty() ||
+                    !pack_placement(placements, runs, capacity,
+                                    target_child->window_live_from,
+                                    projected ? &packed_rows : nullptr)) {
+                    return terminal_result(
+                        vbr_manifest_validation_status::topology_mismatch);
+                }
+                packed_cells = placements.front().cells.size();
+                needs_live_rebase = true;
             }
             for (const auto & placement : placements) {
                 for (const auto & cell : placement.cells) {
@@ -1546,6 +1764,12 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             plan.unit_reference = *reference;
             plan.controller_policy =
                 manifest.controller_policy[descriptor.child_id];
+            if (pack) {
+                plan.stash_action =
+                    vbr_validated_stash_action::omit_live_rebased;
+                plan.descriptor.wm_cells = packed_cells;
+                plan.controller_policy.wm_cells = packed_cells;
+            }
             plan.operation_target.instance_id = target_child->instance_id;
             plan.operation_target.operation_class =
                 vbr_operation_class::state_api;
@@ -1639,7 +1863,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             plan.target_cookie = target_companion->target_cookie;
             plan.source = companion.payload;
             plan.parsed = std::move(parsed);
-            if (occupied_replacement &&
+            // An absent destination has nothing to roll back to.
+            if (occupied_replacement && !absent_insertion &&
                 (companion.descriptor.kind ==
                      vbr_artifact_companion_kind::recurrent ||
                  companion.descriptor.kind ==
@@ -1829,12 +2054,17 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             return terminal_result(vbr_manifest_validation_status::internal_error);
         }
         if (occupied_replacement) {
-            if (target.destination_sequence_absent || target.children.size() != 1 ||
+            if (target.destination_sequence_absent != absent_insertion ||
+                target.children.size() != 1 ||
                 target.children.front().empty ||
                 manifest.stream_placements.size() != 1 ||
                 child_plans.empty()) {
                 return terminal_result(
                     vbr_manifest_validation_status::target_not_empty);
+            }
+            if (absent_insertion && needs_transform) {
+                return terminal_result(
+                    vbr_manifest_validation_status::geometry_mismatch);
             }
             const auto & mappings =
                 policy.occupied_replacement->cell_mapping();
@@ -1843,13 +2073,13 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 return terminal_result(
                     vbr_manifest_validation_status::geometry_mismatch);
             }
-            for (const auto & source : placement.cells) {
-                if (source.logical_position < 0 ||
-                    size_t(source.logical_position) >= mappings.size()) {
-                    return terminal_result(
-                        vbr_manifest_validation_status::ownership_mismatch);
-                }
-                const auto & mapping = mappings[size_t(source.logical_position)];
+            std::vector<const vbr_artifact_cell_placement *> ordered;
+            if (!vbr_order_placement_cells(placement, ordered)) {
+                return terminal_result(vbr_manifest_validation_status::ownership_mismatch);
+            }
+            for (size_t i = 0; i < ordered.size(); ++i) {
+                const auto & source = *ordered[i];
+                const auto & mapping = mappings[i];
                 if (mapping.source_stream != placement.stream_index ||
                     mapping.logical_position != source.logical_position ||
                     mapping.source_physical_cell != source.physical_cell ||
@@ -1913,7 +2143,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             if (shard_count == 0 ||
                 recovery_runs.size() >
                     VBR_OCCUPIED_REPLACEMENT_MAX_RUNS-guard_runs.size() ||
-                guard_runs.size()+recovery_runs.size() > 4096/shard_count) {
+                vbr_occupied_relocation_read_count(guard_runs) +
+                    vbr_occupied_relocation_read_count(recovery_runs) > 4096/shard_count) {
                 return terminal_result(
                     vbr_manifest_validation_status::geometry_mismatch);
             }
@@ -1986,6 +2217,9 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
         proof->authenticated_identity_ = policy.identity;
         proof->token_block_ = manifest.token_block;
         proof->children_ = std::move(child_plans);
+        if (has_co_residents) {
+            proof->co_residents_ = *policy.co_residents;
+        }
         proof->companions_ = std::move(companion_plans);
         proof->accounting_leaves_ = std::move(leaves);
         proof->tracker_install_ = std::move(tracker);
@@ -2035,6 +2269,12 @@ vbr_manifest_validation_result vbr_validate_attention_prefix_projection(
         if (!policy.authorized) {
             return terminal_result(
                 vbr_manifest_validation_status::unauthorized);
+        }
+        if (policy.co_residents != nullptr && !policy.co_residents->empty()) {
+            // A projection packs a fresh dense destination; it has no image
+            // for other sequences to share.
+            return terminal_result(
+                vbr_manifest_validation_status::ownership_mismatch);
         }
         if (prefix_tokens == 0 || prefix_tokens > UINT32_MAX ||
             projection.parent_artifact() != source.artifact ||
@@ -2357,7 +2597,7 @@ vbr_manifest_validation_result vbr_validate_attention_prefix_projection(
             plan.target_pool_cookie = target_unit.shards.front().pool_cookie;
             plan.descriptor = descriptor;
             plan.descriptor.wm_cells = prefix_tokens;
-            plan.authorized_runs.push_back({ 0, uint32_t(prefix_tokens) });
+            plan.authorized_runs.push_back({ 0, uint32_t(prefix_tokens), 0 });
             if (unit_index == 0) {
                 plan.placements.push_back(std::move(dense_placement));
             }
@@ -2560,7 +2800,8 @@ vbr_manifest_validation_result vbr_validate_attention_prefix_projection(
             if (shard_count == 0 || incoming_runs.empty() ||
                 recovery_runs.size() >
                     VBR_OCCUPIED_REPLACEMENT_MAX_RUNS-incoming_runs.size() ||
-                incoming_runs.size()+recovery_runs.size() >
+                vbr_occupied_relocation_read_count(incoming_runs) +
+                    vbr_occupied_relocation_read_count(recovery_runs) >
                     4096/shard_count) {
                 return terminal_result(
                     vbr_manifest_validation_status::geometry_mismatch);

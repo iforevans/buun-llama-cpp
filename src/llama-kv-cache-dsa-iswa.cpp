@@ -1,4 +1,5 @@
 #include "llama-kv-cache-dsa-iswa.h"
+#include "llama-io.h"
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -246,7 +247,16 @@ void llama_kv_cache_dsa_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_
         kv_dsa->state_read(io, seq_id, flags);
     }
 
-    kv_swa->state_read(io, seq_id, flags);
+    try {
+        kv_swa->state_read(io, seq_id, flags);
+    } catch (...) {
+        io.discard();
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            kv_dsa->get_mla()->state_clear(seq_id);
+            kv_dsa->get_lid()->state_clear(seq_id);
+        }
+        throw;
+    }
 }
 
 llama_kv_cache_dsa * llama_kv_cache_dsa_iswa::get_dsa() const {

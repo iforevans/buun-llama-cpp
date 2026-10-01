@@ -26,6 +26,31 @@
 static void test(void) {
     common_params params;
 
+    {
+        common_params base;
+        base.n_batch = 4096;
+        base.speculative.draft.mparams.path = "mtp.gguf";
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        for (int32_t physical : { 0, 64, 256, 512, 2048 }) {
+            base.n_ubatch = physical;
+            const auto draft = common_base_params_to_speculative(base);
+            assert(draft.n_ubatch == std::min(physical, 256));
+            assert(draft.n_batch == base.n_batch);
+            assert(base.n_ubatch == physical);
+        }
+
+        // Other external drafters, including an external+native-MTP combination,
+        // must keep their own batching contract.
+        for (const auto type : { COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
+                                 COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,
+                                 COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK }) {
+            base.speculative.types = { type };
+            assert(common_base_params_to_speculative(base).n_ubatch == 2048);
+            base.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+            assert(common_base_params_to_speculative(base).n_ubatch == 2048);
+        }
+    }
+
     auto assert_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,
                                    int32_t total, int32_t per_seq) {
         const auto limits = common_speculative_get_output_limits(n_batch, n_parallel, n_draft);

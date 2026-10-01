@@ -55,6 +55,7 @@ struct server_cache_checkpoint_floor_input {
     server_cache_checkpoint_protection protection =
         server_cache_checkpoint_protection::none;
     bool recovery_pinned = false;
+    int64_t n_tokens = 0;
 };
 
 struct server_cache_checkpoint_floor_plan {
@@ -64,7 +65,9 @@ struct server_cache_checkpoint_floor_plan {
         common_cache_plan_destruction_reason::mandatory_anchor;
 };
 
-// Capacity's legacy-order floor. Heuristic members remain eligible when every
+// Capacity's bounded-history floor. Prefer thinning tightly spaced interior
+// frontiers over losing the earliest rewind point. Unknown/unordered geometry
+// retains legacy ordering. Heuristic members remain eligible when every
 // unprotected member is gone; hard/mandatory/current-task/pinned members never
 // are. No selection means the incoming checkpoint publication must be skipped.
 server_cache_checkpoint_floor_plan server_cache_plan_checkpoint_capacity_floor(

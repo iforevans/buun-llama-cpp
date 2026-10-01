@@ -109,6 +109,7 @@ class vbr_recurrent_prepared_image final :
     std::vector<uint32_t> rollback_valid_depth;
     std::unique_ptr<vbr_recurrent_parsed_image> recovery;
     bool destination_was_empty = false;
+    bool insertion = false;
     size_t replacement_physical = 0;
     uint32_t replacement_source_row = 0;
     llama_pos replacement_position = -1;
@@ -417,6 +418,71 @@ class vbr_recurrent_prepared_image final :
         return write_rows(*target, uint32_t(physical), *parsed);
     }
 
+    // An empty cell whose row no live cell reads: its bytes are not logical
+    // state, so writing it needs no rollback journal.
+    static bool insertion_cell_free(
+            const llama_memory_recurrent & target, size_t physical) noexcept {
+        if (physical >= target.cells.size() ||
+            !target.cells[physical].is_empty()) {
+            return false;
+        }
+        return std::none_of(target.cells.begin(), target.cells.end(),
+            [physical](const llama_memory_recurrent::mem_cell & cell) {
+                return !cell.is_empty() && cell.src == int32_t(physical);
+            });
+    }
+
+    static bool destination_absent(
+            const llama_memory_recurrent & target,
+            llama_seq_id destination) noexcept {
+        return destination >= 0 &&
+            uint32_t(destination) < target.n_seq_max &&
+            size_t(destination) < target.cells.size() &&
+            target.cells[size_t(destination)].tail < 0 &&
+            std::none_of(target.cells.begin(), target.cells.end(),
+                [destination](const llama_memory_recurrent::mem_cell & cell) {
+                    return cell.has_seq_id(destination);
+                });
+    }
+
+    static bool prepare_insertion(
+            const void * context,
+            std::unique_ptr<vbr_parsed_companion_image> parsed_base,
+            llama_seq_id destination,
+            std::unique_ptr<vbr_prepared_companion_image> & output) noexcept {
+        output.reset();
+        auto * target = static_cast<llama_memory_recurrent *>(
+            const_cast<void *>(context));
+        const auto * parsed = dynamic_cast<const vbr_recurrent_parsed_image *>(
+            parsed_base.get());
+        if (!target || !parsed || !parsed_compatible(*target, *parsed) ||
+            !destination_absent(*target, destination)) {
+            return false;
+        }
+        size_t physical = 0;
+        while (physical < target->cells.size() &&
+               !insertion_cell_free(*target, physical)) {
+            ++physical;
+        }
+        if (physical == target->cells.size() || physical > UINT32_MAX) {
+            return false;
+        }
+        try {
+            auto image = std::make_unique<vbr_recurrent_prepared_image>();
+            image->target = target;
+            image->destination = destination;
+            image->insertion = true;
+            image->replacement_physical = physical;
+            image->replacement_source_row = uint32_t(physical);
+            image->replacement_position = parsed->position;
+            image->replacement_binding_epoch = target->tensor_binding_epoch_;
+            output = std::move(image);
+        } catch (...) {
+            return false;
+        }
+        return write_rows(*target, uint32_t(physical), *parsed);
+    }
+
     static void publish(
             const void * context,
             vbr_prepared_companion_image & base) noexcept {
@@ -436,6 +502,12 @@ class vbr_recurrent_prepared_image final :
         } else {
             GGML_ASSERT(image.replacement_physical < target->cells.size());
             auto & cell = target->cells[image.replacement_physical];
+            if (image.insertion) {
+                cell.seq_id.insert(image.destination);
+                target->cells[size_t(image.destination)].tail =
+                    int32_t(image.replacement_physical);
+                target->used += 1;
+            }
             cell.pos = image.replacement_position;
             cell.src = int32_t(image.replacement_physical);
             cell.src0 = -1;
@@ -459,6 +531,12 @@ class vbr_recurrent_prepared_image final :
                     image->replacement_binding_epoch &&
                 target_empty(context);
         }
+        if (image->insertion) {
+            return target->tensor_binding_epoch_ ==
+                    image->replacement_binding_epoch &&
+                destination_absent(*target, image->destination) &&
+                insertion_cell_free(*target, image->replacement_physical);
+        }
         size_t physical = 0;
         uint32_t row = 0;
         // The controller operation excludes decode writers until the no-fail
@@ -480,7 +558,7 @@ class vbr_recurrent_prepared_image final :
         if (!image.target) {
             return false;
         }
-        if (image.destination_was_empty) {
+        if (image.destination_was_empty || image.insertion) {
             return true;
         }
         // A pending speculative rollback reads a snapshot plane. Preparation
@@ -618,6 +696,8 @@ vbr_companion_adoption_provider vbr_recurrent_companion_adoption_provider(
     provider.prepare = &vbr_recurrent_prepared_image::prepare;
     provider.prepare_replacement =
         &vbr_recurrent_prepared_image::prepare_replacement;
+    provider.prepare_insertion =
+        &vbr_recurrent_prepared_image::prepare_insertion;
     provider.target_empty = &vbr_recurrent_prepared_image::target_empty;
     provider.recheck = &vbr_recurrent_prepared_image::recheck;
     provider.publish_swap = &vbr_recurrent_prepared_image::publish;
@@ -2074,23 +2154,22 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));
 
-    bool res = true;
-
-    res = res && state_read_meta(io, cell_count, seq_id);
-
+    // save the head of the restored cells - could be needed to clear the state
+    // the head is valid only when state_read_meta() succeeded
+    bool res = false;
+    bool meta_read = false;
+    uint32_t cell_head = 0;
     try {
-        res = res && state_read_data(io, cell_count);
+        meta_read = state_read_meta(io, cell_count, seq_id);
+        cell_head = head;
+        res = meta_read && state_read_data(io, cell_count);
     } catch (...) {
         res = false;
     }
 
     if (!res) {
-        // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
-        if (seq_id == -1) {
-            clear(true);
-        } else {
-            seq_rm(seq_id, -1, -1);
-        }
+        io.discard();
+        state_clear(seq_id, cell_head, meta_read ? cell_count : 0);
         throw std::runtime_error("failed to restore kv cache");
     }
 
@@ -2103,6 +2182,13 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
         reset_rollback_state(seq_id);
         GGML_ASSERT(rollback_valid_depth[seq_id] == 0);
     }
+}
+
+// a recurrent state is not addressable by position: it has no base part, all of it is the partial part
+void llama_memory_recurrent::state_write_range(llama_io_write_i & /*io*/, llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/) const {
+}
+
+void llama_memory_recurrent::state_append_range(llama_io_read_i & /*io*/, llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/, llama_pos /*p_limit*/) {
 }
 
 void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
@@ -2222,6 +2308,11 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id) {
     if (dest_seq_id != -1) {
         // single sequence
+        if (cell_count > size) {
+            LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
+            return false;
+        }
+
         seq_rm(dest_seq_id, -1, -1);
 
         if (cell_count == 0) {
@@ -2451,6 +2542,41 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     }
 
     return true;
+}
+
+// the cleared ranges mirror the write pattern of state_read_data() - keep both in sync
+// the transposed s layout is not handled - state_read_data() rejects it before any write
+void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count) {
+    // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
+    if (seq_id == -1) {
+        clear(true);
+        return;
+    }
+
+    seq_rm(seq_id, -1, -1);
+
+    if (cell_count == 0) {
+        return;
+    }
+
+    const uint32_t n_layer = hparams.n_layer();
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (r_l[il] != nullptr) {
+            const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+            llama_clear_tensor_data(r_l[il], cell_head * r_size_row, cell_count * r_size_row);
+        }
+
+        if (s_l[il] != nullptr) {
+            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            llama_clear_tensor_data(s_l[il], cell_head * s_size_row, cell_count * s_size_row);
+        }
+
+        if (p_l[il] != nullptr) {
+            const size_t p_size_row = ggml_row_size(p_l[il]->type, hparams.ple_conv_state());
+            llama_clear_tensor_data(p_l[il], cell_head * p_size_row, cell_count * p_size_row);
+        }
+    }
 }
 
 //

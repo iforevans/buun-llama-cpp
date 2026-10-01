@@ -13,11 +13,16 @@ struct SeparateMain : Retained::Main {
                                               Shape<_64, _128>{},
                                               _1{}));
 
-    struct Arguments : Base::Arguments {
+    // Name the inherited types explicitly: NVCC 13.3 otherwise emits an invalid
+    // qualified elaborated type in the generated host-side base-specifier.
+    using BaseArguments = Base::Arguments;
+    using BaseParams    = Base::Params;
+
+    struct Arguments : BaseArguments {
         const cutlass::float_e4m3_t * ptr_up;
     };
 
-    struct Params : Base::Params {
+    struct Params : BaseParams {
         HalfTma gate;
         HalfTma up;
     };

@@ -12,6 +12,7 @@
 #include <vector>
 
 struct vbr_artifact_stream_placement;
+struct vbr_import_co_resident;
 struct vbr_tracker_install_child;
 struct vbr_generation_stream_state;
 class vbr_occupied_replacement_guard;
@@ -255,13 +256,15 @@ class vbr_generation_tracker {
 
     // Validated import is built completely off-side. Preparation may allocate; the
     // final swap is allocation-free and preserves this tracker's enrolled
-    // process-local runtime instance.
+    // process-local runtime instance. Co-residents are whole-import only:
+    // captured page generations cover the destination's rows alone.
     bool prepare_import_image(
         const vbr_tracker_install_child & plan,
         const vbr_checkpoint_generation_controller & source,
         llama_seq_id destination,
         const std::vector<vbr_artifact_stream_placement> & placements,
-        vbr_tracker_import_image & output) noexcept;
+        vbr_tracker_import_image & output,
+        const std::vector<vbr_import_co_resident> * co_residents = nullptr) noexcept;
     // Occupied replacement already owns a canonical, strictly ordered cell
     // map.  Consume it in place instead of cloning a million-cell placement
     // and rebuilding uniqueness through a node-allocating set.
@@ -306,6 +309,7 @@ class vbr_generation_tracker {
         llama_seq_id destination,
         const std::vector<vbr_artifact_stream_placement> * placements,
         const vbr_occupied_replacement_guard * replacement,
+        const std::vector<vbr_import_co_resident> * co_residents,
         vbr_tracker_import_image & output) noexcept;
     friend struct vbr_generation_event;
     bool reset_page_generations_before_wrap();

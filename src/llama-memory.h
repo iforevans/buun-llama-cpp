@@ -464,6 +464,15 @@ struct llama_memory_i {
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
 
+    // position-range form of the base part (the part PARTIAL_ONLY leaves out) of one sequence:
+    // exactly the cells at positions [p0, p1), in ascending position order, with no stream header,
+    // so a blob moves between split and unified caches. A memory with no base part writes nothing
+    virtual void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+
+    // appends a range blob behind the sequence's last position without clearing the sequence.
+    // cells at pos >= p_limit are read and dropped. on failure the cells of this call are removed
+    virtual void state_append_range(llama_io_read_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos p_limit);
+
     // DFlash: force per-seq ubatch splits so each ubatch carries exactly one slot's tokens.
     // Default no-op; hybrid memories override.
     virtual void set_force_split_seq(bool /*v*/) {}

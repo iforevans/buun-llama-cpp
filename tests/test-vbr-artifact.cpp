@@ -19,6 +19,7 @@
 #include "server-retention-sidecar.h"
 #include "server-vbr-capture-readiness.h"
 #include "server-vbr-prompt-cache-support.h"
+#include "mtmd.h"
 #endif
 
 #include <algorithm>
@@ -1132,6 +1133,12 @@ static void test_validation_and_ordering() {
     auto duplicate_position = package;
     duplicate_position.manifest.stream_placements[0].cells[1]
         .logical_position = 0;
+    // A repeated temporal position with different spatial coordinates is a
+    // legitimate M-RoPE cell, including in a co-resident of a text capture.
+    CHECK(vbr_artifact_encode_vector(
+              duplicate_position, encoded, 1024*1024) == vbr_artifact_status::ok);
+    duplicate_position.manifest.stream_placements[0].cells[1].ext_x = 10;
+    duplicate_position.manifest.stream_placements[0].cells[1].ext_y = 20;
     CHECK(vbr_artifact_encode_vector(
               duplicate_position, encoded, 1024*1024) !=
           vbr_artifact_status::ok);
@@ -1170,6 +1177,8 @@ static void test_validation_and_ordering() {
     auto cross_stream_duplicate_position = cross_stream;
     cross_stream_duplicate_position.manifest.stream_placements[1]
         .cells[0].logical_position = 1;
+    cross_stream_duplicate_position.manifest.stream_placements[1].cells[0].ext_x = 11;
+    cross_stream_duplicate_position.manifest.stream_placements[1].cells[0].ext_y = 21;
     CHECK(vbr_artifact_encode_vector(
               cross_stream_duplicate_position, encoded, 1024*1024) !=
           vbr_artifact_status::ok);
@@ -1210,6 +1219,19 @@ static void test_validation_and_ordering() {
               canonical, constrained, decoded) !=
           vbr_artifact_status::ok);
 }
+
+struct vector_sink {
+    std::vector<uint8_t> bytes;
+
+    static bool write(
+            void * context,
+            const uint8_t * data,
+            size_t size) noexcept {
+        auto & out = static_cast<vector_sink *>(context)->bytes;
+        out.insert(out.end(), data, data + size);
+        return true;
+    }
+};
 
 static void test_companion_payload() {
     fixture_storage storage;
@@ -1269,6 +1291,60 @@ static void test_companion_payload() {
           vbr_artifact_companion_kind::frontier_logits);
     CHECK(decoded.companions[1].payload_digest ==
           decoded.manifest.companions[1].payload_digest);
+
+    auto parallel = package;
+    for (uint32_t workers : { 0u, 1u, 2u, 3u, 4u, 8u, 64u }) {
+        parallel = package;
+        for (auto & value : parallel.companions) {
+            value.section_checksum = {};
+            value.payload_digest = {};
+        }
+        CHECK(vbr_artifact_prepare(parallel, workers) == vbr_artifact_status::ok);
+        CHECK(parallel.manifest.manifest_digest == package.manifest.manifest_digest);
+        CHECK(vbr_artifact_validate_prepared_package(parallel, workers) == vbr_artifact_status::ok);
+        vector_sink sink;
+        CHECK(vbr_artifact_encode(parallel, { &sink, vector_sink::write },
+                  1024*1024, nullptr, workers) == vbr_artifact_status::ok);
+        CHECK(sink.bytes == encoded);
+    }
+    // Parallel validation still reads the bytes, including stash/companions.
+    for (auto * source : { &storage.payload0, &storage.stash0, &storage.recurrent, &frontier_logits }) {
+        source->bytes[0] ^= 1;
+        CHECK(vbr_artifact_validate_prepared_package(parallel, 4) != vbr_artifact_status::ok);
+        source->bytes[0] ^= 1;
+    }
+    CHECK(vbr_artifact_validate_prepared_package(parallel, 4) == vbr_artifact_status::ok);
+    for (uint32_t workers : { 1u, 4u }) {
+        auto unreadable = package;
+        unreadable.companions[0].payload.read = nullptr;
+        CHECK(vbr_artifact_prepare(unreadable, workers) == vbr_artifact_status::content_id_mismatch);
+        CHECK(unreadable.manifest.manifest_digest == package.manifest.manifest_digest);
+
+        // Both companion jobs may read concurrently. Fail after the first
+        // full transfer chunk, not just in metadata validation.
+        struct failing_reader {
+            mutable std::atomic<unsigned> late_reads { 0 };
+        } reader;
+        unreadable = package;
+        auto & value = unreadable.companions[0];
+        value.payload_bytes = value.payload.size = 1024*1024 + 1;
+        value.payload.context = &reader;
+        value.payload.read = [](const void * context, uint64_t offset,
+                                uint8_t * destination, size_t size) noexcept {
+            if (offset != 0) {
+                static_cast<const failing_reader *>(context)->late_reads.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            std::memset(destination, 0, size);
+            return true;
+        };
+        CHECK(vbr_artifact_prepare(unreadable, workers) == vbr_artifact_status::content_id_mismatch);
+        CHECK(reader.late_reads.load() != 0);
+        CHECK(unreadable.manifest.manifest_digest == package.manifest.manifest_digest);
+    }
+    parallel.unit_blobs[0].descriptor.shards[0].payload.read = nullptr;
+    auto serial_failure = parallel;
+    CHECK(vbr_artifact_prepare(parallel, 4) == vbr_artifact_prepare(serial_failure));
 }
 
 struct discard_writer {
@@ -1283,6 +1359,25 @@ struct discard_writer {
         return true;
     }
 };
+
+// Several hash workers (immutable sources) must write the same bytes.
+static void test_parallel_encode_matches_serial() {
+    fixture_storage storage;
+    auto package = make_package(storage);
+    std::vector<uint8_t> serial;
+    CHECK(vbr_artifact_encode_vector(package, serial, 1024*1024) ==
+          vbr_artifact_status::ok);
+    // Worker count and work-claim order must not affect canonical bytes,
+    // including zero (serial fallback) and more workers than work items.
+    for (uint32_t workers : { 0u, 1u, 2u, 3u, 4u, 8u, 64u }) {
+        auto copy = package;
+        vector_sink parallel;
+        const vbr_artifact_stream_writer sink { &parallel, vector_sink::write };
+        CHECK(vbr_artifact_encode(copy, sink, 1024*1024, nullptr, workers) ==
+              vbr_artifact_status::ok);
+        CHECK(!serial.empty() && parallel.bytes == serial);
+    }
+}
 
 static void test_stream_larger_than_capture_ring() {
     constexpr uint64_t ring_bytes = 256ull*1024*1024;
@@ -1790,6 +1885,37 @@ static void test_catalog_streaming_protocol() {
     CHECK(adopted_state.published == 1);
     CHECK(adopted_state.adopted == 1);
 
+    {
+        vbr_artifact_package_view original, deduplicated, retained;
+        CHECK(f.catalog->resolve_reference(streamed.reference_artifact, original) ==
+              vbr_artifact_resolve_status::ok);
+        CHECK(f.catalog->resolve_reference(adopted.reference_artifact, deduplicated) ==
+              vbr_artifact_resolve_status::ok);
+        CHECK(deduplicated.retain(retained) == vbr_artifact_resolve_status::ok);
+        CHECK(original.validate_authenticated() == vbr_artifact_status::ok);
+        CHECK(deduplicated.validate_authenticated() == vbr_artifact_status::ok);
+        CHECK(retained.validate_authenticated() == vbr_artifact_status::ok);
+        // Reusing the published ids writes the same bytes as a full encode.
+        vbr_artifact_package exact;
+        std::vector<uint8_t> full;
+        CHECK(original.exact_package(exact) == vbr_artifact_status::ok);
+        CHECK(vbr_artifact_encode_vector(exact, full, 1024*1024) == vbr_artifact_status::ok);
+        vector_sink reused;
+        CHECK(original.encode_exact({ &reused, vector_sink::write }, 1024*1024) ==
+              vbr_artifact_status::ok);
+        CHECK(!full.empty() && reused.bytes == full);
+        CHECK(original.units()[0].payload_shards[0] ==
+              deduplicated.units()[0].payload_shards[0]);
+        auto chain = std::const_pointer_cast<artifact_segment_chain>(
+            original.units()[0].payload_shards[0]);
+        const uint8_t extra = 0;
+        CHECK(chain->append(&extra, 1));
+        // This single-unit legacy route still uses full validation.
+        CHECK(original.validate_authenticated() != vbr_artifact_status::ok);
+        CHECK(deduplicated.validate_authenticated() != vbr_artifact_status::ok);
+        CHECK(retained.validate_authenticated() != vbr_artifact_status::ok);
+    }
+
     catalog_fixture fake_equivalent;
     const auto fake_first = publish_fixture(*fake_equivalent.catalog,
         fake_equivalent.package,
@@ -1939,6 +2065,13 @@ static void test_catalog_multi_unit_atomic_publish() {
     package.manifest.manifest_digest = {};
     package.manifest.capture_generation_id = {};
     package.manifest.consistency = {};
+
+    auto serial = package;
+    auto parallel = package;
+    CHECK(vbr_artifact_prepare(serial) == vbr_artifact_status::ok);
+    CHECK(vbr_artifact_prepare(parallel, 4) == vbr_artifact_status::ok);
+    CHECK(parallel.manifest.manifest_digest == serial.manifest.manifest_digest);
+    CHECK(vbr_artifact_validate_prepared_package(parallel, 4) == vbr_artifact_status::ok);
 
     CHECK(f.catalog->configure_accounting(package));
     vbr_capture_stream_status status;
@@ -2709,6 +2842,9 @@ static void test_catalog_package_lease_and_reference_placement() {
     CHECK(f.catalog->resolve_reference(second.reference_artifact, second_view) ==
           vbr_artifact_resolve_status::ok);
     CHECK(first_view.reference_artifact() == first.reference_artifact);
+    // an exact package is a durable copy but never a projection parent
+    CHECK(f.catalog->projection_parent_status(first_view) ==
+          vbr_artifact_prefix_projection_status::parent_stale);
     CHECK(first_view.units().size() == 1);
     CHECK(first_view.units()[0].payload_shards.size() == 2);
     CHECK(first_view.manifest().stream_placements[0].cells[1].physical_cell == 1);
@@ -3922,6 +4058,170 @@ struct validator_fixture {
     }
 };
 
+static void test_catalog_authentication_reuse() {
+    vbr_artifact_package_view empty;
+    CHECK(empty.validate_authenticated() == vbr_artifact_status::invalid_argument);
+
+    // Replacing even identical bytes must invalidate publication evidence.
+    // Full validation still succeeds, distinguishing reuse from a fresh hash.
+    for (int kind = 0; kind < 3; ++kind) {
+        validator_fixture f;
+        CHECK(f.view.validate_authenticated() == vbr_artifact_status::ok);
+        // Dedup must retain the original backing's authenticated revision,
+        // not the different revision of the newly submitted chain.
+        vbr_capture_stream_status status;
+        auto build = f.base.catalog->begin_capture(f.base.package, f.base.budget, {}, status);
+        CHECK(build && status == vbr_capture_stream_status::ok);
+        auto unit = build->begin_unit(0, status);
+        CHECK(unit && status == vbr_capture_stream_status::ok);
+        for (const auto & completion : f.base.completions()) {
+            auto segment = verified_segment(completion, 1);
+            CHECK(unit->accept_verified_segment(segment) == vbr_capture_stream_status::ok);
+        }
+        CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
+        auto companion = std::make_shared<artifact_segment_chain>();
+        CHECK(companion->append(f.base.storage.recurrent.bytes.data(),
+                                f.base.storage.recurrent.bytes.size()));
+        vbr_verified_companion verified;
+        verified.companion_index = 0;
+        verified.bytes = companion;
+        verified.streaming_digest = vbr_capture_stream_digest(*companion);
+        CHECK(build->accept_verified_companion(verified) == vbr_capture_stream_status::ok);
+        const auto published = build->publish_reference();
+        CHECK(published.status == vbr_capture_stream_status::ok);
+        CHECK(published.adopted);
+        vbr_artifact_package_view deduplicated, retained;
+        CHECK(f.base.catalog->resolve_reference(published.reference_artifact, deduplicated) ==
+              vbr_artifact_resolve_status::ok);
+        CHECK(f.view.retain(retained) == vbr_artifact_resolve_status::ok);
+        CHECK(deduplicated.validate_authenticated() == vbr_artifact_status::ok);
+        CHECK(retained.validate_authenticated() == vbr_artifact_status::ok);
+        auto backing = kind == 0 ? f.view.units()[0].payload_shards[0] :
+                       kind == 1 ? f.view.units()[0].stash_shards[0] :
+                                   f.view.companions()[0].payload;
+        auto chain = std::const_pointer_cast<artifact_segment_chain>(backing);
+        std::vector<uint8_t> bytes(chain->size());
+        CHECK(chain->read(0, bytes.data(), bytes.size()));
+        artifact_segment_chain replacement;
+        CHECK(replacement.append(bytes.data(), bytes.size()));
+        *chain = std::move(replacement);
+        CHECK(f.view.validate() == vbr_artifact_status::ok);
+        CHECK(f.view.validate_authenticated() == vbr_artifact_status::checksum_mismatch);
+
+        CHECK(retained.validate_authenticated() == vbr_artifact_status::checksum_mismatch);
+        // Companions belong to each reference; only payload/stash are deduped.
+        CHECK(deduplicated.validate_authenticated() == (kind == 2
+            ? vbr_artifact_status::ok : vbr_artifact_status::checksum_mismatch));
+
+        vbr_artifact_package_view resolved;
+        CHECK(f.base.catalog->resolve_reference(f.reference_artifact, resolved) ==
+              vbr_artifact_resolve_status::ok);
+        CHECK(resolved.validate_authenticated() == vbr_artifact_status::checksum_mismatch);
+
+        artifact_segment_chain moved(std::move(*chain));
+        CHECK(f.view.validate() == vbr_artifact_status::malformed);
+        CHECK(f.view.validate_authenticated() == vbr_artifact_status::checksum_mismatch);
+        *chain = std::move(moved);
+        CHECK(f.view.validate() == vbr_artifact_status::ok);
+        CHECK(f.view.validate_authenticated() == vbr_artifact_status::checksum_mismatch);
+        bytes[0] ^= 1;
+        artifact_segment_chain corrupt;
+        CHECK(corrupt.append(bytes.data(), bytes.size()));
+        *chain = std::move(corrupt);
+        CHECK(f.view.validate() != vbr_artifact_status::ok);
+        CHECK(f.view.validate_authenticated() == vbr_artifact_status::checksum_mismatch);
+        // Stale evidence is not reused: export hashes the changed bytes.
+        vbr_artifact_package exact;
+        std::vector<uint8_t> full;
+        CHECK(f.view.exact_package(exact) == vbr_artifact_status::ok);
+        CHECK(vbr_artifact_encode_vector(exact, full, 1024*1024) == vbr_artifact_status::ok);
+        vector_sink exported;
+        CHECK(f.view.encode_exact({ &exported, vector_sink::write }, 1024*1024) ==
+              vbr_artifact_status::ok);
+        CHECK(!full.empty() && exported.bytes == full);
+    }
+
+    // Legacy publication has no reusable evidence and must still hash bytes.
+    validator_fixture legacy(true);
+    auto chain = std::const_pointer_cast<artifact_segment_chain>(
+        legacy.view.units()[0].payload_shards[0]);
+    std::vector<uint8_t> bytes(chain->size());
+    CHECK(chain->read(0, bytes.data(), bytes.size()));
+    artifact_segment_chain replacement;
+    CHECK(replacement.append(bytes.data(), bytes.size()));
+    *chain = std::move(replacement);
+    CHECK(legacy.view.validate_authenticated() == vbr_artifact_status::ok);
+    bytes[0] ^= 1;
+    artifact_segment_chain corrupt;
+    CHECK(corrupt.append(bytes.data(), bytes.size()));
+    *chain = std::move(corrupt);
+    CHECK(legacy.view.validate_authenticated() != vbr_artifact_status::ok);
+}
+
+static void test_catalog_preparation_reuse() {
+    // Same immutable chains may reuse preparation. Changing schema, payload,
+    // or stash must instead produce exactly the fresh canonical result.
+    for (int change = 0; change < 4; ++change) {
+        validator_fixture f;
+        auto incoming = f.base.package;
+        if (change == 1) {
+            incoming.unit_blobs[0].descriptor.codebook_digest[0] ^= 1;
+        } else if (change >= 2) {
+            auto chain = std::const_pointer_cast<artifact_segment_chain>(change == 2
+                ? f.view.units()[0].payload_shards[0] : f.view.units()[0].stash_shards[0]);
+            std::vector<uint8_t> bytes(chain->size());
+            CHECK(chain->read(0, bytes.data(), bytes.size()));
+            bytes[0] ^= 1;
+            artifact_segment_chain replacement;
+            CHECK(replacement.append(bytes.data(), bytes.size()));
+            *chain = std::move(replacement);
+        }
+        vbr_capture_stream_status status;
+        auto build = f.base.catalog->begin_capture(incoming, f.base.budget, {}, status);
+        CHECK(build && status == vbr_capture_stream_status::ok);
+        auto unit = build->begin_unit(0, status);
+        CHECK(unit && status == vbr_capture_stream_status::ok);
+        for (bool stash : { false, true }) {
+            const auto & chains = stash ? f.view.units()[0].stash_shards : f.view.units()[0].payload_shards;
+            auto & descriptors = stash ? incoming.unit_blobs[0].descriptor.clean_stash.shards :
+                                         incoming.unit_blobs[0].descriptor.shards;
+            for (size_t i = 0; i < chains.size(); ++i) {
+                vbr_verified_segment segment;
+                segment.unit_index = 0;
+                segment.shard_index = uint32_t(i);
+                segment.clean_stash = stash;
+                segment.bytes = chains[i];
+                segment.streaming_digest = vbr_capture_stream_digest(*chains[i]);
+                CHECK(unit->accept_verified_segment(segment) == vbr_capture_stream_status::ok);
+                descriptors[i].payload = chains[i]->source();
+            }
+        }
+        CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
+        for (size_t i = 0; i < f.view.companions().size(); ++i) {
+            vbr_verified_companion companion;
+            companion.companion_index = uint32_t(i);
+            companion.bytes = f.view.companions()[i].payload;
+            companion.streaming_digest = vbr_capture_stream_digest(*companion.bytes);
+            CHECK(build->accept_verified_companion(companion) == vbr_capture_stream_status::ok);
+            incoming.companions[i].payload = companion.bytes->source();
+        }
+        CHECK(vbr_artifact_prepare(incoming) == vbr_artifact_status::ok);
+        const auto published = build->publish_reference();
+        CHECK(published.status == vbr_capture_stream_status::ok);
+        vbr_artifact_package_view view;
+        CHECK(f.base.catalog->resolve_reference(published.reference_artifact, view) ==
+              vbr_artifact_resolve_status::ok);
+        CHECK(view.validate() == vbr_artifact_status::ok);
+        CHECK(view.units()[0].unit_version_id == incoming.unit_blobs[0].unit_version_id);
+        CHECK(view.manifest().manifest_digest == incoming.manifest.manifest_digest);
+        CHECK((view.units()[0].unit_version_id == f.view.units()[0].unit_version_id) == (change == 0));
+        build.reset();
+        unit.reset();
+        view.reset();
+        CHECK(f.base.catalog->retire(published.reference_artifact) == vbr_artifact_retire_status::retired);
+    }
+}
+
 static vbr_manifest_validation_result validate(
         validator_fixture & fixture,
         const vbr_target_validation_snapshot & target,
@@ -5131,6 +5431,25 @@ static vbr_adopt_stage_policy stage_policy_for(
 }
 
 static void test_validated_manifest_staging() {
+    {
+        validator_fixture changed(false, 0, true);
+        auto validated = validate(changed, changed.target, changed.policy);
+        CHECK(validated.proof);
+        auto chain = std::const_pointer_cast<artifact_segment_chain>(
+            changed.view.units()[0].payload_shards[0]);
+        std::vector<uint8_t> bytes(chain->size());
+        CHECK(chain->read(0, bytes.data(), bytes.size()));
+        artifact_segment_chain replacement;
+        CHECK(replacement.append(bytes.data(), bytes.size()));
+        *chain = std::move(replacement);
+        const auto baseline_ops = changed.base.ledger.snapshot().live_ops;
+        llama_cache_budget_config budget;
+        const auto policy = stage_policy_for(changed, budget);
+        auto refused = vbr_stage_validated_manifest(std::move(validated.proof), policy);
+        CHECK(refused.status == vbr_adopt_stage_status::source_hash_mismatch);
+        CHECK(!refused.staged);
+        CHECK(changed.base.ledger.snapshot().live_ops == baseline_ops);
+    }
     validator_fixture fixture(false, 0, true);
     auto validated = validate(fixture, fixture.target, fixture.policy);
     CHECK(validated.status == vbr_manifest_validation_status::validated);
@@ -5493,6 +5812,265 @@ public:
 private:
     std::shared_ptr<void> owner_ = std::make_shared<int>(1);
 };
+
+static void test_prompt_cache_vbr_media_lookup() {
+    catalog_fixture fixture;
+    const auto image = [](const char * id) {
+        server_tokens tokens(llama_tokens {}, true);
+        auto * chunk = mtmd_test_create_image_chunk(id, 2);
+        tokens.push_back(chunk);
+        mtmd_input_chunk_free(chunk);
+        return tokens;
+    };
+    server_prompt prompt;
+    prompt.tokens = image("image-a");
+    prompt.sequence_epoch = 3;
+    auto & identity = fixture.package.manifest.identity;
+    CHECK(prompt.tokens.media_content_identity(prompt.n_tokens(), identity.media_content_identity));
+    identity.next_position = prompt.tokens.pos_next();
+    fixture.package.manifest.token_block.tokens = prompt.tokens.retention_token_ids();
+    const auto published = publish_fixture(*fixture.catalog,
+        fixture.package, fixture.completions(), fixture.budget);
+    CHECK(published.status == llama_vbr_artifact_publish_status::published);
+    vbr_artifact_package_view view;
+    CHECK(fixture.catalog->resolve_reference(published.reference_artifact, view) == vbr_artifact_resolve_status::ok);
+    auto owner = server_prompt_cache_vbr_payload::adopt(std::move(view));
+    CHECK(owner);
+    if (!owner) { return; }
+
+    server_cache_authority authority;
+    server_retention_sidecar_store retention;
+    retention.configure(&fixture.ledger, fixture.host, &authority.leases);
+    CHECK(retention.enable_prefix_tracking());
+    constexpr int source_slot = 4;
+    const auto source_key = server_retention_instance_key::for_slot(source_slot);
+    common_chat_msg_spans spans;
+    spans.add(COMMON_CHAT_ROLE_USER, 0, prompt.n_tokens());
+    CHECK(retention.publish(source_key, common_retention_pool::attention,
+        spans, true, prompt.n_tokens(), prompt.n_tokens(), true));
+    CHECK(server_prompt_retention_publish_exact_prefix(retention, source_key,
+        prompt, identity.adapter_config_identity, prompt.n_tokens()));
+    server_prompt_cache cache(0, 0);
+    cache.acct = &fixture.ledger;
+    cache.retention_obs = &retention;
+    cache.lease_obs = &authority.leases;
+    cache.lease_execution_identity = &identity.execution_identity;
+    server_prompt_cache_vbr_publication_metadata metadata;
+    CHECK(cache.prepare_vbr_publication_metadata(prompt, identity.execution_identity,
+        identity.adapter_config_identity, source_slot, metadata));
+    CHECK(cache.publish_vbr(metadata, server_prompt_cache_payload::from_vbr(owner), {}, false));
+    CHECK(server_vbr_restored_stem_for_test(
+        cache, prompt, identity.execution_identity, identity.adapter_config_identity, true));
+
+    const auto lookup = [&](const server_tokens & request, bool expected) {
+        server_prompt_cache_vbr_restore_candidate candidate;
+        CHECK(cache.prepare_vbr_restore(request, identity.execution_identity,
+            identity.adapter_config_identity, candidate, true) == expected);
+        if (expected && candidate.ready()) {
+            CHECK(candidate.prefix_tokens() == 2);
+            CHECK(!candidate.requires_prefix_projection());
+            server_prompt destination;
+            destination.tokens.has_mtmd = true;
+            CHECK(cache.prepare_vbr_restore_destination(candidate, destination, 7));
+            // Abandoning the prepared import leaves the live slot untouched.
+            CHECK(destination.tokens.empty());
+        }
+    };
+    lookup(prompt.tokens, true);
+    auto extended = prompt.tokens.clone();
+    extended.push_back(104);
+    lookup(extended, true);
+    auto * second = mtmd_test_create_image_chunk("image-b", 2);
+    extended.push_back(second);
+    mtmd_input_chunk_free(second);
+    extended.push_back(105);
+    CHECK((extended.media_prefix_boundaries() == std::vector<size_t> {0, 3, 6}));
+    lookup(extended, true); // full request scope differs from the saved prefix
+    lookup(image("image-c"), false); // same null token IDs, different content
+    lookup(image(""), false);
+    server_prompt stem_source;
+    stem_source.sequence_epoch = prompt.sequence_epoch;
+    stem_source.tokens = extended.clone();
+    const auto find_stem = [&](int64_t coverage) {
+        return cache.find_vbr_durable_stem(stem_source, coverage,
+            identity.execution_identity, identity.adapter_config_identity);
+    };
+    CHECK(find_stem(2).v != 0);
+    CHECK(find_stem(1).v == 0); // never cut through an image
+    stem_source.tokens = image("image-c");
+    stem_source.tokens.push_back(104);
+    CHECK(find_stem(2).v == 0); // matching placeholders are not matching media
+    stem_source.tokens = extended.clone();
+    for (auto & state : cache.states) {
+        retention.retire(server_retention_instance_key::for_host_entry(&state));
+    }
+    CHECK(find_stem(2).v == 0);
+    CHECK(server_vbr_restored_stem_for_test(
+        cache, prompt, identity.execution_identity, identity.adapter_config_identity, false));
+    cache.states.clear();
+}
+
+static void test_prompt_cache_vbr_exchange() {
+    for (int mode = 0; mode < 13; ++mode) {
+        // 0: cancelled, 1: exact, 2: transcoded, 3: exact soft lease, 4: hard lease,
+        // 5: externally borrowed, 6: no pressure, 7: uncommitted publication,
+        // 8: late hard lease, 9: cancelled after publishing an outgoing entry,
+        // 10: destructor cancellation, 11: transcoded with outgoing publication.
+        // 12: exact with outgoing publication, then reuse the scope and cancel.
+        catalog_fixture fixture;
+        server_prompt prompt;
+        prompt.tokens = server_tokens(llama_tokens { 101, 102 }, false);
+        prompt.sequence_epoch = 3;
+        auto & identity = fixture.package.manifest.identity;
+        CHECK(prompt.tokens.media_content_identity(prompt.n_tokens(), identity.media_content_identity));
+        identity.next_position = prompt.tokens.pos_next();
+        const auto published = publish_fixture(*fixture.catalog,
+                fixture.package, fixture.completions(), fixture.budget);
+        vbr_artifact_package_view view;
+        CHECK(fixture.catalog->resolve_reference(published.reference_artifact, view) ==
+                vbr_artifact_resolve_status::ok);
+        auto owner = server_prompt_cache_vbr_payload::adopt_owned(std::move(view));
+        CHECK(owner);
+        if (!owner) { return; }
+        const size_t payload_bytes = size_t(owner->resident_bytes());
+        server_cache_authority authority;
+        occupied_replacement_fallback fallback;
+        authority.leases.bind_fallback_provider(&fallback);
+        server_retention_sidecar_store retention;
+        retention.configure(&fixture.ledger, fixture.host, &authority.leases);
+        CHECK(retention.enable_prefix_tracking());
+        constexpr int32_t source_slot = 4, target_slot = 0;
+        const auto source_key = server_retention_instance_key::for_slot(source_slot);
+        common_chat_msg_spans spans;
+        spans.add(COMMON_CHAT_ROLE_USER, 0, prompt.n_tokens());
+        CHECK(retention.publish(source_key, common_retention_pool::attention,
+                spans, true, prompt.n_tokens(), prompt.n_tokens(), true));
+        CHECK(server_prompt_retention_publish_exact_prefix(retention, source_key, prompt,
+                identity.adapter_config_identity, prompt.n_tokens()));
+        server_prompt_cache cache(0, 0);
+        cache.acct = &fixture.ledger;
+        cache.publish_authority = &authority;
+        cache.retention_obs = &retention;
+        cache.lease_obs = &authority.leases;
+        cache.lease_execution_identity = &identity.execution_identity;
+        auto payload = server_prompt_cache_payload::from_vbr(owner);
+        owner.reset();
+        auto staged = cache.stage_vbr(prompt, std::move(payload),
+                identity.execution_identity, identity.adapter_config_identity);
+        server_prompt_cache::iterator source;
+        CHECK(cache.publish(std::move(staged), &prompt, source_slot, &source));
+        if (cache.states.empty()) { return; }
+        cache.limit_size = cache.size() + 1;
+        if (mode == 6) { cache.limit_size += payload_bytes * 2; }
+        const size_t steady_limit = cache.limit_size;
+        const auto grant_host_lease = [&](bool hard) {
+            server_cache_lease_identity lease_identity;
+            CHECK(server_cache_lease_build_identity(identity.execution_identity,
+                    identity.adapter_config_identity, source->prompt.tokens,
+                    source->prompt.n_tokens(), lease_identity));
+            const server_cache_lease_subject subject {
+                retention.artifact_id(server_retention_instance_key::for_host_entry(&*source)),
+                common_retention_artifact_kind::host_entry, -1,
+            };
+            const auto scope = server_cache_lease_scope::from(authority.leases.new_context_scope());
+            if (hard) {
+                CHECK(authority.leases.grant_hard(subject, scope, lease_identity, UINT64_MAX/2));
+            } else {
+                CHECK(authority.leases.grant_soft(subject, scope, lease_identity, UINT64_MAX/2));
+            }
+        };
+        if (mode == 3 || mode == 4) { grant_host_lease(mode == 4); }
+        server_prompt_cache_vbr_owner borrowed;
+        if (mode == 5) { borrowed = source->payload.vbr_variants()->compact_current(); }
+        server_prompt_cache_vbr_restore_candidate incoming;
+        const auto select = [&](server_prompt_cache_vbr_restore_candidate & candidate) {
+            return cache.prepare_vbr_restore(prompt.tokens, identity.execution_identity,
+                    identity.adapter_config_identity, candidate, false);
+        };
+        CHECK(select(incoming));
+        server_prompt destination;
+        common_cache_family_binding family;
+        {
+            server_prompt_cache_vbr_exchange exchange;
+            const bool admitted = cache.begin_vbr_exchange(std::move(incoming), target_slot, exchange);
+            CHECK(admitted == (mode <= 3 || mode >= 7));
+            CHECK(cache.limit_size == steady_limit);
+            if (admitted) {
+                CHECK(source->recovery_pins == 2);
+                CHECK(cache.fits_bytes(steady_limit + payload_bytes));
+                CHECK(!cache.fits_bytes(steady_limit + payload_bytes + 1));
+                server_prompt_cache_vbr_restore_candidate nested_candidate;
+                CHECK(select(nested_candidate));
+                server_prompt_cache_vbr_exchange nested;
+                CHECK(!cache.begin_vbr_exchange(std::move(nested_candidate), target_slot, nested));
+                CHECK(source->recovery_pins == 2);
+                if (mode == 8) { grant_host_lease(true); }
+                if (mode >= 9) {
+                    auto peer_package = fixture.package;
+                    peer_package.manifest.identity.adapter_config_identity = "outgoing";
+                    const auto peer_published = publish_fixture(*fixture.catalog,
+                            peer_package, fixture.completions(), fixture.budget);
+                    vbr_artifact_package_view peer_view;
+                    CHECK(fixture.catalog->resolve_reference(peer_published.reference_artifact, peer_view) ==
+                            vbr_artifact_resolve_status::ok);
+                    auto peer_payload = server_prompt_cache_payload::from_vbr(
+                            server_prompt_cache_vbr_payload::adopt_owned(std::move(peer_view)));
+                    auto outgoing = cache.stage_vbr(prompt, std::move(peer_payload),
+                            identity.execution_identity, "outgoing");
+                    CHECK(outgoing.size() == 1);
+                    CHECK(cache.publish(std::move(outgoing), &prompt, source_slot));
+                    CHECK(cache.states.size() == 2);
+                }
+                if (mode == 1 || mode == 2 || mode == 3 || mode == 7 || mode == 8 || mode >= 11) {
+                    CHECK(cache.prepare_vbr_restore_destination(*exchange.candidate(), destination, target_slot));
+                    CHECK(cache.publish_vbr_restore(*exchange.candidate()));
+                    if (mode != 7) {
+                        CHECK(cache.commit_vbr_restore(*exchange.candidate(), destination,
+                                family, target_slot, mode != 2 && mode != 11));
+                    }
+                }
+                if (mode != 10) {
+                    CHECK(exchange.settle() == (mode == 1 || mode == 3 || mode == 12));
+                    CHECK(!exchange.settle());
+                }
+                if (mode == 12) {
+                    CHECK(cache.states.size() == 1);
+                    CHECK(cache.states.front().adapter_config_key == "outgoing");
+                    CHECK(cache.states.front().recovery_pins == 0);
+                    CHECK(cache.fits_bytes(cache.size()));
+                    server_prompt_cache_vbr_restore_candidate next;
+                    CHECK(cache.prepare_vbr_restore(prompt.tokens, identity.execution_identity,
+                            "outgoing", next, false));
+                    CHECK(cache.begin_vbr_exchange(std::move(next), target_slot, exchange));
+                    CHECK(!exchange.settle()); // previous exact commit is not authority for this source
+                    CHECK(cache.states.size() == 1);
+                    CHECK(cache.states.front().adapter_config_key == "outgoing");
+                }
+            }
+        }
+        CHECK(cache.limit_size == steady_limit);
+        CHECK(!cache.fits_bytes(steady_limit + 1));
+        CHECK(cache.fits_bytes(cache.size()));
+        CHECK(cache.states.empty() == (mode == 1 || mode == 3));
+        if (mode >= 9) { CHECK(cache.states.size() == 1); }
+        if (!cache.states.empty()) {
+            if (mode != 12) { CHECK(&cache.states.front() == &*source); }
+            CHECK(cache.states.front().recovery_pins == 0);
+        }
+        if (mode == 1 || mode == 3) { CHECK(destination.tokens.size() == 2); }
+        if (mode == 3) {
+            server_cache_lease_identity live_identity;
+            CHECK(server_cache_lease_build_identity(identity.execution_identity,
+                    identity.adapter_config_identity, destination.tokens,
+                    destination.n_tokens(), live_identity));
+            const auto live_lease = authority.leases.inspect(
+                    retention.artifact_id(server_retention_instance_key::for_slot(target_slot)),
+                    live_identity);
+            CHECK(live_lease.state == server_cache_lease_eval_state::known);
+            CHECK(live_lease.cls == server_cache_lease_class::soft);
+        }
+    }
+}
 
 static void test_prompt_cache_vbr_atomic_logical_publication() {
     static_assert(!std::is_copy_constructible_v<
@@ -5950,6 +6528,45 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(!prepared.ready());
     CHECK(logical != cache.states.end());
     CHECK(cache.states.size() == 1);
+    CHECK(server_vbr_restored_stem_for_test(cache, prompt,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity, true));
+    {
+        const auto & identity = fixture.package.manifest.identity;
+        auto extended = prompt.clone();
+        extended.tokens.push_back(777);
+        const auto saved = cache.vbr_host_artifact_id(logical);
+        CHECK(saved.v != 0);
+        const auto find_stem = [&](int64_t coverage) {
+            return cache.find_vbr_durable_stem(
+                extended, coverage, identity.execution_identity,
+                identity.adapter_config_identity);
+        };
+        CHECK(find_stem(prompt.n_tokens()) == saved);
+        CHECK(find_stem(0).v == 0);
+        CHECK(find_stem(-1).v == 0);
+        CHECK(find_stem(prompt.n_tokens() - 1).v == 0);
+        CHECK(find_stem(extended.n_tokens()).v == 0);
+        CHECK(find_stem(extended.n_tokens() + 1).v == 0);
+        extended.tokens.set_token(size_t(prompt.n_tokens()), 778);
+        CHECK(find_stem(prompt.n_tokens()) == saved);
+        extended.sequence_epoch++;
+        CHECK(find_stem(prompt.n_tokens()).v == 0);
+        extended.sequence_epoch--;
+        extended.tokens.set_token(0, extended.tokens[0] + 1);
+        CHECK(find_stem(prompt.n_tokens()).v == 0);
+        extended.tokens.set_token(0, prompt.tokens[0]);
+        CHECK(cache.find_vbr_durable_stem(extended, prompt.n_tokens(),
+            identity.execution_identity + "-other",
+            identity.adapter_config_identity).v == 0);
+        CHECK(cache.find_vbr_durable_stem(extended, prompt.n_tokens(),
+            identity.execution_identity,
+            identity.adapter_config_identity + "-other").v == 0);
+        cache.retention_obs = nullptr;
+        CHECK(find_stem(prompt.n_tokens()).v == 0);
+        cache.retention_obs = &retention;
+        CHECK(find_stem(prompt.n_tokens()) == saved);
+    }
     CHECK(!cache.contains(
         prompt.tokens,
         fixture.package.manifest.identity.adapter_config_identity));
@@ -6571,6 +7188,29 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(retention.artifact_id(recovery_host_key).v != 0);
     CHECK(recovery_logical->payload.vbr_compact_owner()->reference_artifact() ==
           recovery_published.reference_artifact);
+
+    // Equal token ledgers are not necessarily equally reusable recurrent
+    // states. Keep the default no-op rejection, but allow a scheduler quote
+    // of zero usable live tokens through the full recovery/lease checks.
+    for (const bool live_usable : { true, false }) {
+        server_prompt_cache_vbr_restore_candidate same_prefix;
+        CHECK(cache.prepare_vbr_restore(
+            incumbent_prompt.tokens,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            same_prefix));
+        server_prompt_cache_vbr_replacement_ticket same_ticket;
+        CHECK(cache.prepare_vbr_occupied_replacement(
+            std::move(same_prefix), incumbent_prompt, incumbent_family,
+            incumbent_family, replacement_slot,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            same_ticket, nullptr, live_usable ? SIZE_MAX : 0) == !live_usable);
+        if (!live_usable) {
+            CHECK(same_ticket.ready());
+            CHECK(same_ticket.incumbent_live_lcp() == 0);
+        }
+    }
 
     // A state prompt cannot launder a different sealed token block into a
     // recovery capability. This simulates a corrupted host association while
@@ -7302,6 +7942,344 @@ static vbr_artifact_package prompt_cache_quality_anchor_package(
     result.manifest.capture_generation_id = {};
     result.manifest.consistency = {};
     return result;
+}
+
+enum class pressure_scenario {
+    ordinary, alternative_pair, contracted_quote, contracted_pair, contracted_singleton, stale_quote,
+};
+
+static void test_prompt_cache_vbr_pressure(
+        bool compound, pressure_scenario scenario = pressure_scenario::ordinary,
+        bool ranked = false) {
+    const bool alternative_pair = scenario != pressure_scenario::ordinary;
+    const bool conservative_quote = scenario == pressure_scenario::contracted_quote ||
+                                    scenario == pressure_scenario::contracted_pair ||
+                                    scenario == pressure_scenario::contracted_singleton ||
+                                    scenario == pressure_scenario::stale_quote;
+    const bool contracted_pair = scenario == pressure_scenario::contracted_pair;
+    catalog_fixture fixture;
+    server_prompt prompt;
+    prompt.tokens = server_tokens(llama_tokens { 101, 102 }, false);
+    prompt.sequence_epoch = 3;
+    CHECK(prompt.tokens.media_content_identity(prompt.n_tokens(),
+        fixture.package.manifest.identity.media_content_identity));
+    fixture.package.manifest.identity.next_position = prompt.tokens.pos_next();
+    const auto & identity = fixture.package.manifest.identity;
+    server_cache_authority authority;
+    server_retention_sidecar_store retention;
+    retention.configure(&fixture.ledger, fixture.host, &authority.leases);
+    CHECK(retention.enable_prefix_tracking());
+    constexpr int32_t source_slot = 9;
+    const auto source_key = server_retention_instance_key::for_slot(source_slot);
+    common_chat_msg_spans spans;
+    if (ranked) {
+        spans.add(COMMON_CHAT_ROLE_USER, 0, prompt.n_tokens());
+    }
+    CHECK(retention.publish(source_key, common_retention_pool::attention,
+        spans, ranked, prompt.n_tokens(), prompt.n_tokens(), true));
+    CHECK(server_prompt_retention_publish_exact_prefix(retention, source_key,
+        prompt, identity.adapter_config_identity, prompt.n_tokens()));
+
+    server_prompt_cache cache(0, 0);
+    cache.acct = &fixture.ledger;
+    cache.publish_authority = &authority;
+    cache.destruction_obs = &authority.destruction;
+    cache.retention_obs = &retention;
+    cache.lease_obs = &authority.leases;
+    cache.lease_execution_identity = &identity.execution_identity;
+    cache.retention_capacity_authority = true;
+    CHECK(cache.enable_retention_shadow());
+    const auto make_payload = [&](uint8_t salt) {
+        fixture_storage storage;
+        storage.payload0.bytes[0] ^= salt;
+        storage.payload1.bytes[0] ^= salt;
+        storage.stash0.bytes[0] ^= salt;
+        storage.stash1.bytes[0] ^= salt;
+        auto package = make_package(storage);
+        package.manifest.identity = identity;
+        const auto published = publish_fixture(*fixture.catalog, package, {
+            { 0, 1, true, true, storage.stash1.bytes },
+            { 0, 0, false, true, storage.payload0.bytes },
+            { 0, 0, true, true, storage.stash0.bytes },
+            { 0, 1, false, true, storage.payload1.bytes },
+        }, fixture.budget);
+        CHECK(published.status == llama_vbr_artifact_publish_status::published ||
+              published.status == llama_vbr_artifact_publish_status::adopted);
+        vbr_artifact_package_view view;
+        CHECK(fixture.catalog->resolve_reference(published.reference_artifact, view) ==
+            vbr_artifact_resolve_status::ok);
+        return server_prompt_cache_payload::from_vbr(
+            server_prompt_cache_vbr_payload::adopt_owned(std::move(view)));
+    };
+    // The cheapest first victim need not belong to a pair that frees enough.
+    // An external owner keeps the older pair's backing alive; the newer pair
+    // can release its shared units together. Admission must try that pair,
+    // without erasing anything until publication or ignoring recovery pins.
+    if (alternative_pair) {
+        const auto publish_entry = [&](uint8_t salt) {
+            auto staged = cache.stage_vbr(prompt, make_payload(salt),
+                identity.execution_identity, identity.adapter_config_identity);
+            server_prompt_cache::iterator state;
+            CHECK(cache.publish(std::move(staged), &prompt, source_slot, &state));
+            return state;
+        };
+        cache.limit_size = 0;
+        auto older_a = publish_entry(1);
+        auto older_b = publish_entry(1);
+        auto external = make_payload(1);
+        auto newer_a = publish_entry(2);
+        const bool singleton_quote = scenario == pressure_scenario::contracted_singleton;
+        auto newer_b = publish_entry(singleton_quote ? 4 : 2);
+        if (ranked) {
+            // Make list order disagree with the stable semantic ranking.
+            // Both admission retries and publication must keep using scores.
+            cache.states.reverse();
+        }
+        auto incoming_payload = make_payload(3);
+        const auto older_key_a = server_retention_instance_key::for_host_entry(&*older_a);
+        const auto older_key_b = server_retention_instance_key::for_host_entry(&*older_b);
+        const auto newer_key_a = server_retention_instance_key::for_host_entry(&*newer_a);
+        const auto newer_key_b = server_retention_instance_key::for_host_entry(&*newer_b);
+        std::vector<const server_prompt_cache_payload *> survivors {
+            &older_a->payload, &older_b->payload, &incoming_payload,
+        };
+        server_prompt_cache_vbr_budget_summary survivor_budget;
+        CHECK(server_prompt_cache_payload::summarize_vbr_budgets(survivors, survivor_budget));
+        cache.limit_size = size_t(survivor_budget.compact_resident_bytes);
+        uint64_t quoted_bytes = incoming_payload.size();
+        if (conservative_quote) {
+            // Capture's upper bound needs newer backing; its smaller measured
+            // publication can retire one or both cheaper older entries instead.
+            llama_cache_acct_release_set_preview preview;
+            CHECK(older_a->payload.preview_vbr_retire(fixture.ledger.serial(), preview));
+            uint64_t singleton_bytes = 0;
+            for (const auto & row : preview.rows) { singleton_bytes += row.resident_allocated; }
+            if (contracted_pair) { singleton_bytes *= 2; }
+            auto all_payloads = survivors;
+            all_payloads.push_back(&newer_a->payload);
+            all_payloads.push_back(&newer_b->payload);
+            server_prompt_cache_vbr_budget_summary all_budget;
+            CHECK(server_prompt_cache_payload::summarize_vbr_budgets(all_payloads, all_budget));
+            const uint64_t projected = all_budget.compact_resident_bytes;
+            uint64_t pair_bytes = projected - cache.limit_size;
+            if (singleton_quote) {
+                CHECK(newer_a->payload.preview_vbr_retire(fixture.ledger.serial(), preview));
+                pair_bytes = 0;
+                for (const auto & row : preview.rows) { pair_bytes += row.resident_allocated; }
+            }
+            CHECK(pair_bytes > singleton_bytes && singleton_bytes > 0);
+            quoted_bytes += pair_bytes - singleton_bytes;
+            cache.limit_size = size_t(projected - singleton_bytes);
+        }
+        server_prompt_cache_vbr_publication_metadata metadata;
+        CHECK(cache.prepare_vbr_publication_metadata(prompt, identity.execution_identity,
+            identity.adapter_config_identity, source_slot, metadata));
+        server_prompt_cache_vbr_publication_metadata * batch[] = { &metadata };
+        server_prompt_cache_vbr_capacity_claim capacity;
+        newer_a->recovery_pins++;
+        if (singleton_quote) { newer_b->recovery_pins++; }
+        CHECK(!cache.prepare_vbr_publication_capacity(batch, 1, quoted_bytes, capacity));
+        newer_a->recovery_pins--;
+        if (singleton_quote) { newer_b->recovery_pins--; }
+        const bool admitted = cache.prepare_vbr_publication_capacity(
+            batch, 1, quoted_bytes, capacity);
+        CHECK(admitted);
+        CHECK(cache.states.size() == 4);
+        if (admitted) {
+            const bool stale = scenario == pressure_scenario::stale_quote;
+            if (stale) { CHECK(retention.begin_competition_wave()); }
+            const auto epoch = retention.competition_epoch_value();
+            CHECK(cache.publish_vbr(metadata, std::move(incoming_payload), {}, false,
+                nullptr, &capacity) == !stale);
+            CHECK(retention.competition_epoch_value() == epoch);
+            CHECK(cache.states.size() == (conservative_quote && !contracted_pair ? 4u : 3u));
+            CHECK((retention.artifact_id(older_key_a).v != 0) == (!conservative_quote || stale));
+            CHECK((retention.artifact_id(older_key_b).v != 0) == !contracted_pair);
+            CHECK((retention.artifact_id(newer_key_a).v != 0) == conservative_quote);
+            CHECK((retention.artifact_id(newer_key_b).v != 0) == conservative_quote);
+        }
+        external = {};
+        incoming_payload = {};
+        cache.limit_size = 1;
+        cache.update();
+        CHECK(cache.states.empty());
+        CHECK(fixture.catalog->snapshot().references == 0);
+        if (ranked) {
+            CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+        }
+        return;
+    }
+    std::vector<server_prompt_cache::iterator> states;
+    for (uint8_t salt : { 1, 2, 3 }) {
+        auto staged = cache.stage_vbr(prompt, make_payload(salt),
+            identity.execution_identity, identity.adapter_config_identity);
+        server_prompt_cache::iterator state;
+        CHECK(cache.publish(std::move(staged), &prompt, source_slot, &state));
+        states.push_back(state);
+    }
+    auto incoming = make_payload(4);
+    auto pinned_alias = states[1]->payload;
+    CHECK(states[1]->payload.vbr_logical_erase_only());
+    const auto pinned_key = server_retention_instance_key::for_host_entry(&*states[1]);
+    const auto pinned_artifact = retention.artifact_id(pinned_key);
+    std::vector<const server_prompt_cache_payload *> survivors {
+        &states[1]->payload, &incoming,
+    };
+    if (!compound) { survivors.push_back(&states[2]->payload); }
+    server_prompt_cache_vbr_budget_summary budget;
+    CHECK(server_prompt_cache_payload::summarize_vbr_budgets(survivors, budget));
+    cache.limit_size = size_t(budget.compact_resident_bytes);
+    server_prompt_cache_vbr_publication_metadata metadata;
+    CHECK(cache.prepare_vbr_publication_metadata(prompt, identity.execution_identity,
+        identity.adapter_config_identity, source_slot, metadata));
+    server_prompt_cache_vbr_publication_metadata * batch[] = { &metadata };
+    server_prompt_cache_vbr_capacity_claim capacity;
+    for (auto state : states) { state->recovery_pins++; }
+    CHECK(!cache.prepare_vbr_publication_capacity(batch, 1, incoming.size(), capacity));
+    CHECK(cache.states.size() == 3);
+    states[0]->recovery_pins--;
+    states[2]->recovery_pins--;
+    CHECK(cache.prepare_vbr_publication_capacity(batch, 1, incoming.size(), capacity));
+    CHECK(capacity.requires_publication_revalidation());
+    const auto cited_epoch = retention.competition_epoch_value();
+    CHECK(cache.publish_vbr(metadata, std::move(incoming), {}, false, nullptr, &capacity));
+    // Pre-transfer pricing and publication revalidation are the same pressure
+    // wave. Advancing decay again can change the winner and reject the capture.
+    CHECK(retention.competition_epoch_value() == cited_epoch);
+    CHECK(cache.states.size() == (compound ? 2u : 3u));
+    CHECK(retention.artifact_id(pinned_key) == pinned_artifact);
+    CHECK(states[1]->recovery_pins == 1);
+    states[1]->recovery_pins--;
+    pinned_alias = {};
+    cache.limit_size = 1;
+    cache.update();
+    CHECK(cache.states.empty());
+    CHECK(fixture.catalog->snapshot().references == 0);
+}
+
+static void test_prompt_cache_vbr_pressure_lossless_pair() {
+    enum class scenario { retained_provider, pinned, mutual_only, unscored, decayed_singleton };
+    for (const auto mode : { scenario::retained_provider, scenario::pinned,
+                            scenario::mutual_only, scenario::unscored, scenario::decayed_singleton }) {
+        catalog_fixture fixture;
+        CHECK(server_tokens(llama_tokens { 101, 102 }, false).media_content_identity(
+            2, fixture.package.manifest.identity.media_content_identity));
+        server_cache_authority authority;
+        server_retention_sidecar_store retention;
+        retention.configure(&fixture.ledger, fixture.host, &authority.leases);
+        CHECK(retention.enable_prefix_tracking());
+        const auto & identity = fixture.package.manifest.identity;
+        server_prompt_cache cache(0, 0);
+        cache.acct = &fixture.ledger;
+        cache.publish_authority = &authority;
+        cache.destruction_obs = &authority.destruction;
+        cache.retention_obs = &retention;
+        cache.lease_obs = &authority.leases;
+        cache.lease_execution_identity = &identity.execution_identity;
+        cache.retention_capacity_authority = true;
+        CHECK(cache.enable_retention_shadow());
+
+        const auto make_prompt = [&](int slot, llama_token first) {
+            server_prompt prompt;
+            prompt.tokens = server_tokens(llama_tokens { first, first + 1 }, false);
+            prompt.sequence_epoch = 3;
+            common_chat_msg_spans spans;
+            spans.add(COMMON_CHAT_ROLE_USER, 0, 2);
+            const auto key = server_retention_instance_key::for_slot(slot);
+            CHECK(retention.publish(key, common_retention_pool::attention,
+                spans, mode != scenario::unscored, 2, 2, true));
+            CHECK(server_prompt_retention_publish_exact_prefix(retention, key,
+                prompt, identity.adapter_config_identity, 2));
+            return prompt;
+        };
+        const auto make_payload = [&](llama_token first, uint8_t salt) {
+            fixture_storage storage;
+            storage.payload0.bytes[0] ^= salt;
+            storage.payload1.bytes[0] ^= salt;
+            storage.stash0.bytes[0] ^= salt;
+            storage.stash1.bytes[0] ^= salt;
+            auto package = make_package(storage);
+            package.manifest.identity = identity;
+            package.manifest.token_block.tokens = { first, first + 1 };
+            const auto published = publish_fixture(*fixture.catalog, package, {
+                { 0, 1, true, true, storage.stash1.bytes },
+                { 0, 0, false, true, storage.payload0.bytes },
+                { 0, 0, true, true, storage.stash0.bytes },
+                { 0, 1, false, true, storage.payload1.bytes },
+            }, fixture.budget);
+            CHECK(published.status == llama_vbr_artifact_publish_status::published ||
+                  published.status == llama_vbr_artifact_publish_status::adopted);
+            vbr_artifact_package_view view;
+            CHECK(fixture.catalog->resolve_reference(published.reference_artifact, view) ==
+                vbr_artifact_resolve_status::ok);
+            return server_prompt_cache_payload::from_vbr(
+                server_prompt_cache_vbr_payload::adopt_owned(std::move(view)));
+        };
+        auto redundant = make_prompt(9, 101);
+        auto useful = make_prompt(10, 201);
+        auto incoming_prompt = make_prompt(11, 301);
+        const auto publish = [&](const server_prompt & prompt, int slot, llama_token first, uint8_t salt) {
+            auto staged = cache.stage_vbr(prompt, make_payload(first, salt),
+                identity.execution_identity, identity.adapter_config_identity);
+            server_prompt_cache::iterator state;
+            CHECK(cache.publish(std::move(staged), &prompt, slot, &state));
+            return state;
+        };
+        auto large = publish(useful, 10, 201, 2);
+        auto small_a = publish(redundant, 9, 101, 1);
+        auto small_b = publish(redundant, 9, 101, 1);
+        auto external = make_payload(101, 1);
+        retention.retire(server_retention_instance_key::for_slot(10));
+        if (mode == scenario::pinned) { small_a->recovery_pins++; }
+        if (mode == scenario::mutual_only) { retention.retire(server_retention_instance_key::for_slot(9)); }
+        const auto key_a = server_retention_instance_key::for_host_entry(&*small_a);
+        const auto key_b = server_retention_instance_key::for_host_entry(&*small_b);
+        const auto key_large = server_retention_instance_key::for_host_entry(&*large);
+        const auto released = [&](const server_prompt_cache_payload & payload) {
+            llama_cache_acct_release_set_preview preview;
+            CHECK(payload.preview_vbr_retire(fixture.ledger.serial(), preview));
+            uint64_t bytes = 0;
+            for (const auto & row : preview.rows) { bytes += row.resident_allocated; }
+            return bytes;
+        };
+        const uint64_t deficit = mode == scenario::decayed_singleton ? 1 :
+            std::max(released(small_a->payload), released(small_b->payload)) + 1;
+        CHECK(released(large->payload) >= deficit);
+        if (mode == scenario::decayed_singleton) {
+            CHECK(released(small_a->payload) >= deficit);
+            for (unsigned epoch = 0; epoch < 512; ++epoch) {
+                CHECK(retention.begin_competition_wave());
+            }
+        }
+        auto incoming = make_payload(301, 3);
+        server_prompt_cache_vbr_budget_summary budget;
+        CHECK(server_prompt_cache_payload::summarize_vbr_budgets(
+            { &small_a->payload, &small_b->payload, &large->payload, &incoming }, budget));
+        cache.limit_size = size_t(budget.compact_resident_bytes - deficit);
+        server_prompt_cache_vbr_publication_metadata metadata;
+        CHECK(cache.prepare_vbr_publication_metadata(incoming_prompt,
+            identity.execution_identity, identity.adapter_config_identity, 11, metadata));
+        server_prompt_cache_vbr_publication_metadata * batch[] = { &metadata };
+        server_prompt_cache_vbr_capacity_claim capacity;
+        CHECK(cache.prepare_vbr_publication_capacity(batch, 1, incoming.size(), capacity));
+        CHECK(cache.states.size() == 3);
+        const auto epoch = retention.competition_epoch_value();
+        CHECK(cache.publish_vbr(metadata, std::move(incoming), {}, false, nullptr, &capacity));
+        CHECK(retention.competition_epoch_value() == epoch);
+        // Only a jointly redundant, unpinned pair may displace the useful singleton.
+        CHECK((retention.artifact_id(key_large).v != 0) == (mode == scenario::retained_provider));
+        CHECK((retention.artifact_id(key_a).v != 0) == (mode != scenario::retained_provider));
+        CHECK((retention.artifact_id(key_b).v != 0) == (mode != scenario::retained_provider));
+        if (mode != scenario::unscored) {
+            CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+        }
+        if (mode == scenario::pinned) { small_a->recovery_pins--; }
+        external = {};
+        cache.limit_size = 1;
+        cache.update();
+        CHECK(cache.states.empty());
+        CHECK(fixture.catalog->snapshot().references == 0);
+    }
 }
 
 static void test_prompt_cache_vbr_pressure_retires_physical_union() {
@@ -8483,6 +9461,45 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
           recovery_refresh_reference.reference_artifact);
     CHECK(fixture.catalog->snapshot().references == 1);
 
+    // A same-size recovery refresh fits a full cache when the old backing is
+    // exclusively owned. Neither the preflight's own borrow, a real external
+    // owner, nor deduplicated catalog storage may manufacture release credit.
+    const size_t refresh_bytes = cache.size();
+    cache.limit_size = refresh_bytes;
+    const auto refresh_fits = [&]() {
+        return cache.preview_vbr_compact_refresh_capacity(
+            prompt, fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity, refresh_bytes);
+    };
+    CHECK(refresh_fits());
+    cache.states.front().recovery_pins++;
+    CHECK(!refresh_fits());
+    cache.states.front().recovery_pins--;
+    auto external_compact = cache.states.front().payload.vbr_compact_owner();
+    CHECK(!refresh_fits());
+    external_compact.reset();
+    CHECK(refresh_fits());
+    const auto shared_refresh_reference = publish_fixture(*fixture.catalog,
+        fixture.package, fixture.completions(), fixture.budget);
+    auto shared_refresh = owned_payload(shared_refresh_reference.reference_artifact);
+    CHECK(cache.states.front().payload.vbr_retirement_exclusive());
+    CHECK(shared_refresh_reference.status == llama_vbr_artifact_publish_status::adopted);
+    llama_cache_acct_release_set_preview refresh_preview;
+    CHECK(cache.states.front().payload.preview_vbr_retire(fixture.ledger.serial(), refresh_preview));
+    uint64_t refresh_released = 0;
+    for (const auto & row : refresh_preview.rows) { refresh_released += row.resident_allocated; }
+    CHECK(refresh_released > 0 && refresh_released < refresh_bytes);
+    // The external catalog row now owns the shared unit's accounting charge;
+    // the cache contains only the old reference's metadata charge. Replacing
+    // that exact charge, not the full logical payload, still fits this limit.
+    CHECK(cache.size() == refresh_released);
+    CHECK(refresh_fits());
+    shared_refresh = {};
+    CHECK(refresh_fits());
+    cache.limit_size = refresh_bytes - 1;
+    CHECK(!refresh_fits());
+    cache.limit_size = 0;
+
     // Without an anchor allowance the same degraded refresh still updates
     // compact-current, but retires the former high-quality owner instead of
     // creating hidden anchor debt or a second logical node.
@@ -9525,6 +10542,10 @@ static void test_sequence_projected_capture_union() {
     duplicate_logical.placements[0].cells[1].logical_position =
         duplicate_logical.placements[0].cells[0].logical_position;
     expect_refused({ 77, { duplicate_logical } }, limits);
+    duplicate_logical.placements[0].cells[1].ext_x = 1;
+    vbr_capture_projection media_positions;
+    CHECK(vbr_artifact_project_capture_union(
+        { 77, { duplicate_logical } }, limits, media_positions));
 
     vbr_capture_projection_manifest cross_placement;
     cross_placement.manifest_id = 30;
@@ -9532,6 +10553,11 @@ static void test_sequence_projected_capture_union() {
         0, 0, 5, 10, {{1, 2}}));
     cross_placement.placements.push_back(capture_placement(
         1, 0, 5, 10, {{2, 2}}));
+    vbr_capture_projection child_scoped;
+    CHECK(vbr_artifact_project_capture_union(
+        { 77, { cross_placement } }, limits, child_scoped));
+    cross_placement.placements[1].child_id = 0;
+    cross_placement.placements[1].stream_index = 1;
     expect_refused({ 77, { cross_placement } }, limits);
 
     // Logical positions are sequence-scoped, so two independent sequences
@@ -9599,6 +10625,16 @@ int main(int argc, char ** argv) {
     }
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
     if (argc == 2 && strcmp(argv[1], "--host-pressure-only") == 0) {
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::alternative_pair, true);
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_quote, true);
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::alternative_pair);
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_quote);
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_pair);
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_singleton);
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::stale_quote);
+        test_prompt_cache_vbr_pressure(false);
+        test_prompt_cache_vbr_pressure(true);
+        test_prompt_cache_vbr_pressure_lossless_pair();
         test_prompt_cache_vbr_pressure_retires_physical_union();
         return failures == 0 ? 0 : 1;
     }
@@ -9642,6 +10678,7 @@ int main(int argc, char ** argv) {
     test_encoder_rejects_source_mutation();
     test_validation_and_ordering();
     test_companion_payload();
+    test_parallel_encode_matches_serial();
     test_stream_larger_than_capture_ring();
     test_catalog_streaming_protocol();
     test_catalog_accounting_setup_preserves_shared_gauges();
@@ -9658,6 +10695,8 @@ int main(int argc, char ** argv) {
     test_prompt_cache_vbr_payload_fanout_lifetime();
     test_prompt_cache_vbr_same_frontier_variants();
     test_sequence_projected_capture_union();
+    test_catalog_authentication_reuse();
+    test_catalog_preparation_reuse();
     test_manifest_validator_matrix();
     test_validated_manifest_staging();
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
@@ -9665,7 +10704,19 @@ int main(int argc, char ** argv) {
     test_vbr_capture_readiness_contract();
     test_server_vbr_occupied_failure_terminal();
     test_prompt_cache_vbr_longest_feasible_restore_selection();
+    test_prompt_cache_vbr_media_lookup();
     test_prompt_cache_vbr_atomic_logical_publication();
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::alternative_pair, true);
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_quote, true);
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::alternative_pair);
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_quote);
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_pair);
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_singleton);
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::stale_quote);
+    test_prompt_cache_vbr_pressure(false);
+    test_prompt_cache_vbr_exchange();
+    test_prompt_cache_vbr_pressure(true);
+    test_prompt_cache_vbr_pressure_lossless_pair();
     test_prompt_cache_vbr_pressure_retires_physical_union();
 #endif
     if (failures != 0) {

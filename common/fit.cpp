@@ -1,4 +1,5 @@
 #include "fit.h"
+#include "fit-internal.h"
 #include "llama-vbr-codec.h"
 
 #include "common.h"
@@ -427,18 +428,28 @@ static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
     std::vector<common_moe_cache_fit_device_input> device_inputs;
     size_t min_expert_bytes = 0;
     for (size_t index = 0; index < devices.size(); index++) {
-        ggml_moe_cache_device_caps caps = {};
-        if (!ggml_moe_cache.query_device(devices[index], &config, &caps)) {
-            continue;
-        }
         if (margins[index] < 0 || memory[index].free < margins[index]) {
             result.reason = "the fitted device margin exceeds free memory";
             return result;
         }
-        device_inputs.push_back({caps.physical_device, caps.compute_capability,
-                memory[index].free - margins[index], memory[index].mb.total(),
-                caps.recommended_reserve_bytes});
-        min_expert_bytes = std::max(min_expert_bytes, caps.min_expert_bytes);
+        const bool meta = ggml_backend_dev_is_meta(devices[index]);
+        const size_t count = meta ? ggml_backend_meta_dev_n_devs(devices[index]) : 1;
+        for (size_t child = 0; child < count; ++child) {
+            ggml_backend_dev_t device = meta
+                ? ggml_backend_meta_dev_simple_dev(devices[index], child) : devices[index];
+            ggml_moe_cache_device_caps caps = {};
+            if (!ggml_moe_cache.query_device(device, &config, &caps)) {
+                continue;
+            }
+            // Tensor fit already reports a balanced aggregate capped by the
+            // tightest GPU. Keep that conservative budget, not the raw sum of
+            // free VRAM, when pricing each physical device's cache pools.
+            const size_t used = memory[index].mb.total();
+            device_inputs.push_back({caps.physical_device, caps.compute_capability,
+                    (memory[index].free - margins[index]) / (int64_t)count,
+                    used / count + (used % count != 0), caps.recommended_reserve_bytes});
+            min_expert_bytes = std::max(min_expert_bytes, caps.min_expert_bytes);
+        }
     }
 
     std::vector<common_moe_cache_fit_shape_input> shape_inputs;
@@ -533,6 +544,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     const size_t nd = llama_model_n_devices(model.get());
     std::vector<llama_device_memory_data> ret(nd + 1);
+    std::vector<std::vector<llama_memory_breakdown_data>> physical(nd);
+    for (size_t i = 0; i < nd; ++i) {
+        ggml_backend_dev_t dev = llama_model_get_device(model.get(), i);
+        if (ggml_backend_dev_is_meta(dev)) {
+            physical[i].resize(ggml_backend_meta_dev_n_devs(dev));
+        }
+    }
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx.get());
 
@@ -551,15 +569,24 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             continue;
         }
         for (size_t i = 0; i < nd; i++) {
-            if (dev == llama_model_get_device(model.get(), i)) {
-                ret[i].mb.model         += mb.model;
-                ret[i].mb.context       += mb.context;
-                ret[i].mb.compute       += mb.compute;
-                ret[i].mb.context_fixed += mb.context_fixed;
-                ret[i].mb.context_vbr_managed += mb.context_vbr_managed;
+            ggml_backend_dev_t model_dev = llama_model_get_device(model.get(), i);
+            if (dev == model_dev) {
+                common_fit_add_breakdown(ret[i].mb, mb);
                 break;
             }
+            if (ggml_backend_dev_is_meta(model_dev)) {
+                for (size_t child = 0; child < ggml_backend_meta_dev_n_devs(model_dev); ++child) {
+                    if (dev == ggml_backend_meta_dev_simple_dev(model_dev, child)) {
+                        common_fit_add_breakdown(physical[i][child], mb);
+                        break;
+                    }
+                }
+            }
         }
+    }
+
+    for (size_t i = 0; i < nd; ++i) {
+        common_fit_add_breakdown(ret[i].mb, common_fit_physical_memory(physical[i]));
     }
 
     {
@@ -905,8 +932,11 @@ static void common_params_fit_impl(
 
                     bool mapped_device = false;
                     for (size_t id = 0; id < devs.size(); id++) {
-                        if (devs_extra[je] == devs[id]) {
-                            common_fit_add_breakdown(mapped[id], mb_extra);
+                        const size_t scale = common_fit_extra_device_scale(devs[id], devs_extra[je]);
+                        if (scale != 0) {
+                            for (size_t copy = 0; copy < scale; ++copy) {
+                                common_fit_add_breakdown(mapped[id], mb_extra);
+                            }
                             mapped_device = true;
                             break;
                         }
@@ -995,16 +1025,14 @@ static void common_params_fit_impl(
     margins.reserve(nd);
     int64_t margin_per_dev = margins_s[0];
     if (sm_tensor) {
-        // the single meta device carries the SUM of the per-real-device margins, while the
-        // headroom handed to the VBR runtime stays a single-device figure — the controller
-        // applies it to each device's own free memory
-        int64_t sum    = 0;
+        // Tensor fit uses a balanced-equivalent aggregate. Charge the largest
+        // per-device margin on every shard; averaging unequal targets could
+        // admit a placement that violates the tightest GPU's requested headroom.
         margin_per_dev = 0;
         for (size_t j = 0; j < ggml_backend_meta_dev_n_devs(devs[0]); j++) {
-            sum           += margins_s[j];
             margin_per_dev = std::max<int64_t>(margin_per_dev, margins_s[j]);
         }
-        margins.push_back(sum);
+        margins.push_back(margin_per_dev * ggml_backend_meta_dev_n_devs(devs[0]));
     } else if (nd == 0) {
         margins.push_back(margins_s[0]);
     } else {
@@ -1504,8 +1532,63 @@ static void common_params_fit_impl(
     }
 
     if (sm_tensor) {
-        // every layer is sharded across every device — there is no layer redistribution or CPU
-        // overflow to fall back on, and tensor_split already belongs to the user
+        // Dense layers remain tensor-sharded; only routed experts move to host
+        // memory. This does not redistribute layers or alter the user's split.
+        // Keep explicit placements and soft mode's minimal-eviction policy intact.
+        if (moe_cache && (moe_cache->mode == COMMON_MOE_CACHE_MODE_AUTO ||
+                          moe_cache->mode == COMMON_MOE_CACHE_MODE_ON) &&
+                !moe_tensors.empty() && tensor_buft_overrides &&
+                mparams->n_gpu_layers == default_mparams.n_gpu_layers &&
+                (!mparams->tensor_buft_overrides ||
+                 (!mparams->tensor_buft_overrides[0].pattern && !mparams->tensor_buft_overrides[0].buft))) {
+            llama_model_tensor_buft_override overrides[] = {
+                {common_moe_cache_tensor_override_pattern(), ggml_backend_cpu_buffer_type()},
+                {nullptr, nullptr},
+            };
+            llama_model_params candidate = *mparams;
+            candidate.tensor_buft_overrides = overrides;
+            candidate.use_extra_bufts = false;
+            std::vector<ggml_backend_dev_t> candidate_devs;
+            uint32_t candidate_ngl = 0, candidate_nct = 0, candidate_nex = 0;
+            dmds_t candidate_memory = common_get_device_memory_data_impl(
+                    path_model, &candidate, cparams, candidate_devs,
+                    candidate_ngl, candidate_nct, candidate_nex, log_level);
+            bool candidate_valid = common_fit_same_devices(candidate_devs, devs) &&
+                    candidate_memory.size() == nd + 1;
+            if (candidate_valid) {
+                // Shared/borrowed drafts follow this candidate's CPU-expert
+                // placement. Include them before accepting the target or sizing
+                // cache pools, just as in the ordinary layer-split fit path.
+                add_extra_memory(candidate_memory, &candidate);
+                for (size_t id = 0; id < nd; ++id) {
+                    if (candidate_memory[id].mb.total() > INT64_MAX ||
+                            candidate_memory[id].free - (int64_t)candidate_memory[id].mb.total() < margins[id]) {
+                        candidate_valid = false;
+                        break;
+                    }
+                }
+            }
+            if (candidate_valid) {
+                const auto cache_fit = common_moe_cache_evaluate_fit(
+                        moe_cache, moe_tensors, candidate_devs, candidate_memory, margins);
+                std::copy(std::begin(overrides), std::end(overrides), tensor_buft_overrides);
+                mparams->tensor_buft_overrides = tensor_buft_overrides;
+                mparams->use_extra_bufts = false;
+                moe_cache->fit_selected = cache_fit.feasible;
+                if (cache_fit.feasible) {
+                    LOG_INF("%s: MoE cache fit selected tensor-sharded dense weights with CPU experts; %zu MiB projected cache capacity\n",
+                            __func__, cache_fit.cache_bytes / MiB);
+                } else {
+                    // A cache-ineligible expert is still executable on the CPU.
+                    // Do not fall back to the known oversized all-GPU allocation.
+                    LOG_WRN("%s: tensor-sharded dense weights fit with CPU experts, but a complete MoE cache layout is unavailable (%s); uncached experts stay on CPU\n",
+                            __func__, cache_fit.reason.c_str());
+                }
+                return;
+            }
+        }
+        // Without a validated CPU-expert candidate, there is no automatic layer
+        // redistribution to fall back on; tensor_split still belongs to the user.
         throw common_params_fit_exception("model does not fit at the minimum context size and layer "
             "redistribution is not available under SPLIT_MODE_TENSOR, abort");
     }

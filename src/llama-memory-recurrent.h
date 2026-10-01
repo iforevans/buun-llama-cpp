@@ -73,6 +73,9 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    void state_write_range (llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const override;
+    void state_append_range(llama_io_read_i  & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos p_limit) override;
+
     // cell management for speculative decoding checkpoint/restore
     void copy_cell(int32_t i_src, int32_t i_dst);
     int  get_cell_count(llama_seq_id seq_id) const;
@@ -184,6 +187,8 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+
+    void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {

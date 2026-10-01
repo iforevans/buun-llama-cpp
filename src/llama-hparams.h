@@ -73,6 +73,12 @@ struct llama_hparams {
     uint32_t n_layer_all;
     uint32_t n_layer_nextn = 0;
 
+    // HRM's physical H/L stacks repeat across distinct cache slots.
+    uint32_t n_hrm_layers_per_stack = 0;
+    uint32_t n_hrm_h_cycles = 0;
+    uint32_t n_hrm_l_cycles = 0;
+    bool hrm_prefix_lm = false;
+
     // Registry key for the baked KV affine means. Zero means this model has no calibrated table.
     int turbo_meansub_id = 0;
     // granite-switch: index of the single-head "router" KV layer that encodes
@@ -220,6 +226,8 @@ struct llama_hparams {
     // mis-detected as DFlash by the server's block_size>0 auto-detect. DFlash's
     // load_arch_hparams sets the real value (16, or from GGUF).
     uint32_t dflash_block_size        = 0;
+    bool     dflash_shared_kv         = false;
+    bool     dflash_tied_output       = false;
     uint32_t dflash_mask_token_id     = 0;
     uint32_t dflash_n_target_features = 25600;
     uint32_t dflash_n_target_layers   = 0;

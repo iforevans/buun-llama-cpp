@@ -364,7 +364,10 @@ bool vbr_artifact_project_capture_union(
                 }
             }
             manifest_ids.push_back(manifest.manifest_id);
-            std::vector<std::pair<llama_seq_id, llama_pos>> logical_positions;
+            // Media cells may share a temporal position. Uniqueness is per
+            // child/sequence and full temporal/spatial coordinate, as in the
+            // exact artifact validator.
+            std::vector<std::tuple<uint32_t, llama_seq_id, llama_pos, llama_pos, llama_pos>> logical_positions;
             for (const auto & placement : manifest.placements) {
                 if (placement.child_id == UINT32_MAX ||
                     placement.stream_index == UINT32_MAX ||
@@ -394,8 +397,11 @@ bool vbr_artifact_project_capture_union(
                         return false;
                     }
                     logical_positions.push_back({
+                        placement.child_id,
                         placement.source_sequence,
                         cell.logical_position,
+                        cell.ext_x,
+                        cell.ext_y,
                     });
                 }
             }
@@ -686,6 +692,7 @@ struct artifact_segment_chain::impl {
     uint64_t stream_digest_expected = 0;
     llama_sha256_writer stream_digest_hash;
     std::array<uint8_t, 32> stream_digest = {};
+    uint64_t ring_digest_revision = 0;
 
     template<typename Consumer>
     bool for_each_span(
@@ -750,13 +757,100 @@ artifact_segment_chain::artifact_segment_chain(
 }
 artifact_segment_chain::~artifact_segment_chain() = default;
 artifact_segment_chain::artifact_segment_chain(
-        artifact_segment_chain &&) noexcept = default;
+        artifact_segment_chain && other) noexcept : impl_(std::move(other.impl_)) {
+    other.invalidate_revision();
+}
 artifact_segment_chain & artifact_segment_chain::operator=(
-        artifact_segment_chain &&) noexcept = default;
+        artifact_segment_chain && other) noexcept {
+    if (this != &other) {
+        invalidate_revision();
+        other.invalidate_revision();
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
+
+void artifact_segment_chain::invalidate_revision() noexcept {
+    if (impl_) {
+        impl_->ring_digest_revision = 0;
+    }
+    // Saturate at the permanently invalid value instead of allowing ABA on wrap.
+    if (revision_ != 0) {
+        revision_ = revision_ == UINT64_MAX ? 0 : revision_ + 1;
+    }
+}
+
+uint64_t artifact_segment_chain::content_revision() const noexcept {
+    return impl_ ? revision_ : 0;
+}
+
+bool artifact_segment_chain::prefix_matches(
+        const artifact_segment_chain & prefix) const noexcept {
+    if (!impl_ || !prefix.impl_ || prefix.size() == 0 || prefix.size() > size() ||
+        size() > SIZE_MAX) {
+        return false;
+    }
+    bool equal = true;
+    uint64_t offset = 0;
+    return prefix.impl_->for_each_span(0, prefix.size(), [&](const uint8_t * data, size_t count) {
+        if (!equal) {
+            return;
+        }
+        size_t compared = 0;
+        equal = impl_->for_each_span(offset, count, [&](const uint8_t * current, size_t bytes) {
+            equal = equal && std::memcmp(current, data + compared, bytes) == 0;
+            compared += bytes;
+        }) && equal;
+        offset += count;
+    }) && equal;
+}
+
+std::shared_ptr<const artifact_segment_chain> artifact_segment_chain::with_shared_prefix(
+        const artifact_segment_chain & prefix) const noexcept {
+    if (!prefix_matches(prefix)) {
+        return {};
+    }
+    try {
+        auto result = std::make_shared<artifact_segment_chain>();
+        // No content or authentication change. Only the immutable allocation
+        // owners change, after a byte-for-byte comparison of the entire prefix.
+        *result->impl_ = *impl_;
+        result->revision_ = revision_;
+        auto & out = *result->impl_;
+        out.segments = prefix.impl_->segments;
+        out.segment_ends = prefix.impl_->segment_ends;
+        uint64_t end = prefix.size();
+        uint64_t begin = 0;
+        for (const auto & segment : impl_->segments) {
+            const uint64_t segment_end = begin + segment.length;
+            if (segment_end > end) {
+                // Whole suffix allocations can keep their existing owners.
+                // A boundary slice must be copied so it cannot retain the
+                // duplicate prefix while accounting charges only the suffix.
+                if (end == begin && segment.offset == 0 &&
+                    segment.length == segment.storage->size()) {
+                    out.segments.push_back(segment);
+                } else {
+                    const auto * data = segment.storage->data() + segment.offset + (end - begin);
+                    const size_t count = size_t(segment_end - end);
+                    auto bytes = std::make_shared<const std::vector<uint8_t>>(data, data + count);
+                    out.segments.push_back({ std::move(bytes), 0, count });
+                }
+                end = segment_end;
+                out.segment_ends.push_back(end);
+            }
+            begin = segment_end;
+        }
+        out.max_segment = std::max(out.max_segment, prefix.impl_->max_segment);
+        return result;
+    } catch (...) {
+        return {};
+    }
+}
 
 bool artifact_segment_chain::append(
         const uint8_t * data, size_t size) noexcept {
-    if ((!data && size != 0) || impl_->authenticated_closed ||
+    if (!impl_ || (!data && size != 0) || impl_->authenticated_closed ||
         size > std::numeric_limits<uint64_t>::max() - impl_->total ||
         (impl_->stream_digest_enabled &&
          size > impl_->stream_digest_expected - impl_->total)) {
@@ -786,7 +880,7 @@ bool artifact_segment_chain::append_owned(
 bool artifact_segment_chain::append_storage(
         std::shared_ptr<std::vector<uint8_t>> bytes) noexcept {
     try {
-        if (!bytes || impl_->authenticated_closed ||
+        if (!impl_ || !bytes || impl_->authenticated_closed ||
             bytes->size() > std::numeric_limits<uint64_t>::max() -
                 impl_->total ||
             (impl_->stream_digest_enabled &&
@@ -822,6 +916,7 @@ bool artifact_segment_chain::append_storage(
             }
             impl_->segment_ends.reserve(next);
         }
+        invalidate_revision();
         impl_->segments.push_back({
             std::move(bytes), 0, uint64_t(size),
         });
@@ -904,6 +999,10 @@ std::array<uint8_t, 32> vbr_capture_stream_digest(
                chain.impl_->total == chain.impl_->stream_digest_expected
             ? chain.impl_->stream_digest
             : std::array<uint8_t, 32> {};
+    }
+    if (chain.content_revision() != 0 &&
+        chain.impl_->ring_digest_revision == chain.content_revision()) {
+        return chain.impl_->stream_digest;
     }
     llama_sha256_writer hash;
     capture_stream_digest_begin(hash, chain.size());
@@ -1931,6 +2030,7 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
     } else if (!source.read) {
         return vbr_capture_stream_status::invalid_argument;
     }
+    const uint64_t destination_revision = destination.content_revision();
     const bool legacy_digest = !destination.authenticated();
     llama_sha256_writer hash;
     static constexpr char domain_label[] =
@@ -2055,12 +2155,20 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
     if (pumped != vbr_capture_stream_status::ok) {
         return pumped;
     }
-    if (stats.bytes != transfer_bytes) {
+    if (stats.bytes != transfer_bytes || destination.size() != transfer_bytes) {
         return vbr_capture_stream_status::short_read;
     }
     stats.max_segment_size = destination.max_segment_size();
     if (legacy_digest) {
         stats.streaming_digest = hash.finish();
+        // The ring just hashed exactly the bytes appended to this owned chain.
+        // Keep that evidence for sink admission, publication and staging;
+        // append/replacement invalidates it through the backing revision.
+        if (destination_revision != 0 && stats.chunks < UINT64_MAX - destination_revision &&
+            destination.content_revision() == destination_revision + stats.chunks) {
+            destination.impl_->stream_digest = stats.streaming_digest;
+            destination.impl_->ring_digest_revision = destination.content_revision();
+        }
     }
     return vbr_capture_stream_status::ok;
 }

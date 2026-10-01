@@ -132,12 +132,25 @@ public:
     // sealed the complete chain. Restore staging can reuse this capability
     // instead of rereading a multi-GiB catalog payload.
     std::array<uint8_t, 32> sealed_digest() const noexcept;
+    // Object-local backing revision for catalog authentication reuse. Append,
+    // replacement and move-out invalidate prior revisions; zero is never
+    // reusable. Does not authorize mutation concurrent with readers.
+    uint64_t content_revision() const noexcept;
     bool read(uint64_t offset, uint8_t * destination, size_t size) const noexcept;
     vbr_artifact_byte_source source() const noexcept;
+    // Storage-only sharing: compare actual bytes, never token/codec identity.
+    // The returned immutable chain keeps this chain's authentication metadata
+    // and owns only the suffix; its prefix retains the existing allocations.
+    bool prefix_matches(const artifact_segment_chain & prefix) const noexcept;
+    std::shared_ptr<const artifact_segment_chain> with_shared_prefix(
+        const artifact_segment_chain & prefix) const noexcept;
 
 private:
     struct impl;
     std::unique_ptr<impl> impl_;
+    uint64_t revision_ = 1;
+    void invalidate_revision() noexcept;
+    friend class vbr_pinned_chunk_ring;
     bool append_storage(
         std::shared_ptr<std::vector<uint8_t>> bytes) noexcept;
     friend bool vbr_capture_range_seal(

@@ -100,6 +100,8 @@ public:
 
     const server_prompt_cache_vbr_owner & compact_current() const noexcept;
     const server_prompt_cache_vbr_owner & quality_anchor() const noexcept;
+    // the variant a restore reads first: the anchor when present, else compact
+    const server_prompt_cache_vbr_owner & preferred() const noexcept;
     uint64_t logical_bytes() const noexcept;
     uint64_t resident_bytes() const noexcept;
     uint64_t anchor_resident_bytes() const noexcept;

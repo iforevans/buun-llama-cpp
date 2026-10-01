@@ -17,6 +17,8 @@
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <type_traits>
 
+#include "kernel-params.cuh"
+
 using namespace cute;
 namespace fusion = cutlass::epilogue::fusion;
 
@@ -94,7 +96,7 @@ template <bool Scale, bool Add, bool RegisterSplit = false, bool SmallN = false>
             cutlass::gemm::collective::KernelScheduleAuto>>::CollectiveOp;
     using Main = std::conditional_t<RegisterSplit, RegisterSplitMain<BaseMain>, BaseMain>;
     using Kernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, Main, Epi, void>;
-    using Op     = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+    using Op     = ggml_cuda_cutlass_adapter<Kernel>;
 
     static typename Op::Arguments args(const void *  w,
                                        const void *  x,

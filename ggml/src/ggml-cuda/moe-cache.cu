@@ -72,14 +72,18 @@ void ggml_moe_cache_register(const void * owner) {
 #define MOE_CACHE_LOG(...) GGML_LOG_INFO(__VA_ARGS__)
 
 static constexpr int    moe_cache_cc_forced_min               = 700;
+static constexpr int    moe_cache_cc_turing                   = 750;
 static constexpr int    moe_cache_cc_ampere                   = 800;
 static constexpr size_t moe_cache_expert_bytes_ampere_min     = 512u << 10;
+static constexpr size_t moe_cache_expert_bytes_turing_min     = 256u << 10;
 static constexpr size_t moe_cache_expert_bytes_pre_ampere_min = 1u << 20;
 static constexpr int    moe_cache_batch_max                   = 10;
 static constexpr int    moe_cache_pool_slots_min              = 64;
 static constexpr size_t moe_cache_slab_bytes_auto_min         = 1ull << 30;
 static constexpr int    moe_cache_node_rows_max               = 64;
 static constexpr int    moe_cache_expert_parallel_max         = 8;
+static constexpr int    moe_cache_stream_stage_max            = 4;
+static constexpr int    moe_cache_stream_stage_slots_max      = 3 * moe_cache_stream_stage_max;
 static constexpr size_t moe_cache_overlap_bytes_per_token     = 8u << 20;
 
 enum class moe_cache_slot_state : uint8_t {
@@ -129,6 +133,9 @@ struct moe_cache_pool {
     std::unordered_map<moe_cache_key, int, moe_cache_key_hash> map;
     int lru_head = -1;
     int lru_tail = -1;
+    // Compute-stream scratch remains accounted in the slab, outside the resident LRU.
+    int stream_stage_slots[moe_cache_stream_stage_slots_max] = {};
+    int n_stream_stage_slots = 0;
 };
 
 struct moe_cache_shape {
@@ -145,6 +152,7 @@ struct moe_cache_seen_tensor {
     size_t expert_size = 0;
     int wtype = -1;
     int64_t n_expert = 0;
+    int stream_stage_registered = -1;
 };
 
 struct moe_cache_job {
@@ -187,7 +195,7 @@ struct moe_cache_config {
     bool serial_fill = true;
     bool serial_fill_explicit = false;
     bool force_dedicated_mmv = false;
-    bool force_dedicated_down_mmv = false;
+    int dedicated_down_mmv = -1; // auto, generic (0), or dedicated (1)
     int overlap_cpu_rows = -1;
     bool overlap_cpu_rows_explicit = false;
     int expert_parallel = 0;
@@ -291,6 +299,7 @@ struct moe_cache_device {
     long long full_fused_nodes = 0;
     long long dedicated_down_mmv_dispatches = 0;
     long long nodes = 0;
+    long long stream_stage_experts = 0;
     long long collect_calls = 0;
     // Dispatch mutex contention that turned a potential cache hit into a
     // complete CPU fallback (try_to_lock failed). Measured first so a bounded
@@ -363,6 +372,22 @@ struct moe_cache_node {
     int n_result_rows = 0;
     int row_indices[moe_cache_node_rows_max];
     std::vector<std::unique_ptr<moe_cache_node>> children;
+    // Fused operation staged by fused_plan until fused_dispatch.
+    bool fused_pending = false;
+    int fused_hits = 0;
+    int fused_candidates = 0;
+    int glu_op = -1;
+    float up_min = 0.0f;
+    float up_max = 0.0f;
+    float gate_min = 0.0f;
+    float gate_max = 0.0f;
+    int32_t up_slots[moe_cache_node_rows_max];
+    int32_t gate_slots[moe_cache_node_rows_max];
+    int32_t down_slots[moe_cache_node_rows_max];
+    const float * hit_acts[moe_cache_node_rows_max];
+    int n_stream_stage_copies = 0;
+    const void * stream_stage_sources[moe_cache_stream_stage_slots_max] = {};
+    int stream_stage_slots[moe_cache_stream_stage_slots_max] = {};
 };
 
 static std::mutex g_registry_mu;
@@ -585,9 +610,15 @@ static int moe_cache_min_compute_capability() {
 }
 
 static size_t moe_cache_default_min_expert_bytes(int compute_capability) {
-    return compute_capability >= moe_cache_cc_ampere
-        ? moe_cache_expert_bytes_ampere_min
-        : moe_cache_expert_bytes_pre_ampere_min;
+    if (compute_capability >= moe_cache_cc_ampere) {
+        return moe_cache_expert_bytes_ampere_min;
+    }
+    // The old 1 MiB floor excluded every APEX expert (412--900 KiB).
+    // SM75 serving measurements favor caching these in both split modes.
+    if (compute_capability >= moe_cache_cc_turing) {
+        return moe_cache_expert_bytes_turing_min;
+    }
+    return moe_cache_expert_bytes_pre_ampere_min;
 }
 
 static void moe_cache_apply_mode_defaults(moe_cache_config & config) {
@@ -681,7 +712,7 @@ static moe_cache_config moe_cache_read_config() {
         config.force_dedicated_mmv = value != 0;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_DOWN_DEDICATED_MMV", 0, 1, value)) {
-        config.force_dedicated_down_mmv = value != 0;
+        config.dedicated_down_mmv = (int)value;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", 0, 8, value)) {
         config.overlap_cpu_rows = (int)value;
@@ -1469,8 +1500,12 @@ static bool moe_cache_grow_host(
 }
 
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
+#if defined(GGML_USE_HIP)
+    // Keep ROCm's pageable sources on a bounded pinned buffer: direct transfers
+    // can retain pins across the expert arena and exhaust KFD's host allowance.
     char * stage = nullptr;
     size_t stage_capacity = 0;
+#endif
     cudaStream_t stream = nullptr;
 
     for (;;) {
@@ -1515,10 +1550,10 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                         &stream, cudaStreamNonBlocking);
             }
         }
+#if defined(GGML_USE_HIP)
         if (error == cudaSuccess && stage_capacity < job.bytes) {
             char * fresh = nullptr;
-            cudaError_t alloc_error = cudaMallocHost((void **)&fresh, job.bytes);
-            if (alloc_error == cudaSuccess) {
+            if (cudaMallocHost((void **)&fresh, job.bytes) == cudaSuccess) {
                 if (stage) {
                     cudaFreeHost(stage);
                 }
@@ -1528,7 +1563,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 (void)cudaGetLastError();
             }
         }
-
+#endif
         moe_cache_pool * pool = nullptr;
         char * destination = nullptr;
         {
@@ -1550,16 +1585,28 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             if (session->config.serial_fill) {
                 fill_lock.lock();
             }
-            if (error == cudaSuccess && stage && stage_capacity >= job.bytes) {
-                memcpy(stage, job.source, job.bytes);
+            if (error == cudaSuccess) {
+#if defined(GGML_USE_HIP)
+                if (stage && stage_capacity >= job.bytes) {
+                    memcpy(stage, job.source, job.bytes);
+                    error = cudaMemcpyAsync(
+                            destination, stage, job.bytes, cudaMemcpyHostToDevice, stream);
+                    if (error == cudaSuccess) {
+                        error = cudaStreamSynchronize(stream);
+                    }
+                } else {
+                    error = cudaMemcpy(destination, job.source, job.bytes, cudaMemcpyHostToDevice);
+                }
+#else
+                // Source invalidation waits until this stream finishes. Registered
+                // sources can DMA directly; pageable sources use the runtime's
+                // staging, without an additional application bounce buffer.
                 error = cudaMemcpyAsync(
-                        destination, stage, job.bytes, cudaMemcpyHostToDevice, stream);
+                        destination, job.source, job.bytes, cudaMemcpyHostToDevice, stream);
                 if (error == cudaSuccess) {
                     error = cudaStreamSynchronize(stream);
                 }
-            } else if (error == cudaSuccess) {
-                error = cudaMemcpy(
-                        destination, job.source, job.bytes, cudaMemcpyHostToDevice);
+#endif
             }
         }
 
@@ -1597,9 +1644,11 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         cudaStreamSynchronize(stream);
         cudaStreamDestroy(stream);
     }
+#if defined(GGML_USE_HIP)
     if (stage) {
         cudaFreeHost(stage);
     }
+#endif
 }
 
 static bool moe_cache_start_worker(
@@ -1879,7 +1928,7 @@ static int moe_cache_discover_pool(
 
     if (pool >= 0) {
         device.pools[pool]->covers_all_entries =
-            (uint64_t)device.pools[pool]->n_slots >= shape->n_entries;
+            (uint64_t)(device.pools[pool]->n_slots - device.pools[pool]->n_stream_stage_slots) >= shape->n_entries;
         return pool;
     }
 
@@ -1916,6 +1965,9 @@ static void moe_cache_log_stats(moe_cache_device & device) {
             device.full_fused_rows, device.full_fused_nodes,
             device.dedicated_down_mmv_dispatches,
             device.contention_bypasses);
+    if (device.stream_stage_experts) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d stream-stage-experts=%lld\n", device.physical, device.stream_stage_experts);
+    }
 }
 
 static void moe_cache_log_configuration(moe_cache_session & session) {
@@ -1946,7 +1998,8 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
             overlap_cpu_rows.c_str(),
             session.config.serial_fill ? "serial" : "parallel",
             session.config.expert_parallel,
-            session.config.force_dedicated_down_mmv ? "dedicated" : "generic");
+            session.config.dedicated_down_mmv < 0 ? "auto" :
+            session.config.dedicated_down_mmv ? "dedicated" : "generic");
 }
 
 static void * moe_cache_session_create(
@@ -2004,7 +2057,7 @@ static void * moe_cache_session_create(
         session->config = std::move(config);
 
         std::unordered_set<int> seen_devices;
-        size_t default_min_expert_bytes = moe_cache_expert_bytes_ampere_min;
+        size_t default_min_expert_bytes = 0;
         int minimum_capability = INT_MAX;
         const auto add_backend = [&](ggml_backend_t backend) {
             if (!backend || !ggml_backend_is_cuda(backend) ||
@@ -2230,6 +2283,96 @@ static void moe_cache_session_destroy(void * opaque) {
     }
 
     delete session;
+}
+
+struct moe_cache_pp_copy_refs {
+    uint32_t packed[512]; // destination expert in high16, resident slot in low16
+};
+
+static __global__ void moe_cache_pp_gather(
+        const uint4 * slab, uint4 * destination, size_t vectors_per_expert,
+        moe_cache_pp_copy_refs refs) {
+    const uint32_t ref = refs.packed[blockIdx.y];
+    const uint4 * src = slab + size_t(ref & 65535u) * vectors_per_expert;
+    uint4 * dst = destination + size_t(ref >> 16) * vectors_per_expert;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+            i < vectors_per_expert; i += size_t(gridDim.x) * blockDim.x) dst[i] = src[i];
+}
+
+static int moe_cache_prefill_copy(void * opaque, void * backend_opaque,
+        const ggml_tensor * source, ggml_tensor * destination, const uint32_t * selected, size_t n_words) {
+    if (!opaque) return false;
+    auto backend = (ggml_backend_t) backend_opaque;
+    if (!backend || !ggml_backend_is_cuda(backend) ||
+            !moe_cache_type_supported(source->type) || destination->type != source->type ||
+            !source->buffer || !ggml_backend_buffer_is_host(source->buffer) ||
+            !ggml_is_contiguous(source) || !ggml_is_contiguous(destination) ||
+            !ggml_are_same_shape(source, destination) || source->ne[3] != 1 ||
+            source->ne[2] > 512 || source->ne[2] < 1 || !selected ||
+            n_words < size_t((source->ne[2] + 31) / 32)) return false;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    // Pools contain unmodified host bytes. The scheduler's compute destination
+    // also uses canonical bytes, unlike immutable backend-repacked weights.
+    const auto buffer = destination->view_src ? destination->view_src->buffer : destination->buffer;
+    if (!buffer || buffer->buft != ggml_backend_cuda_buffer_type(ctx->device) ||
+            ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) return false;
+    const size_t expert_size = source->nb[2];
+    if (!expert_size || expert_size % sizeof(uint4) || uintptr_t(destination->data) % alignof(uint4)) return false;
+
+    auto & session = *(moe_cache_session *) opaque;
+    std::unique_lock<std::mutex> lock(session.mu);
+    if (session.stopping || session.dormant || session.active_scopes == 0) return false;
+    const auto local = std::find_if(session.devices.begin(), session.devices.end(), [&](const auto & device) {
+        return device->logical == ctx->device;
+    });
+    if (local == session.devices.end() || (*local)->dead) return false;
+    auto & device = **local;
+    const int pool_index = moe_cache_find_pool(device, expert_size, source->type);
+    if (pool_index < 0) return false;
+    const auto & pool = *device.pools[pool_index];
+    if (!pool.slab) return false;
+
+    const int n_expert = source->ne[2];
+    const auto used = [&](int e) { return (selected[e / 32] >> (e % 32)) & 1u; };
+    bool resident[512] = {};
+    moe_cache_pp_copy_refs refs = {};
+    int hits = 0;
+    for (int e = 0; e < n_expert; ++e) {
+        if (!used(e)) continue;
+        const auto found = pool.map.find({source->data, e});
+        if (found != pool.map.end() && pool.slots[found->second].state == moe_cache_slot_state::valid) {
+            if (found->second > 65535) return false;
+            resident[e] = true;
+            refs.packed[hits++] = (uint32_t(e) << 16) | uint32_t(found->second);
+        }
+    }
+    if (!hits) return false;
+
+    ggml_cuda_set_device(ctx->device);
+    const size_t vectors = expert_size / sizeof(uint4);
+    const unsigned blocks = std::min<size_t>(32, (vectors + 255) / 256);
+    moe_cache_pp_gather<<<dim3(blocks, hits), 256, 0, ctx->stream()>>>(
+        (const uint4 *) pool.slab, (uint4 *) destination->data, vectors, refs);
+    CUDA_CHECK(cudaGetLastError());
+    for (int e = 0; e < n_expert;) {
+        if (!used(e)) { ++e; continue; }
+        int end = e + 1;
+        while (end < n_expert && used(end) && resident[end] == resident[e]) ++end;
+        // Preserve the ordinary copy's 512B pad only at selected-run boundaries.
+        // A cache/host transition inside a selected run does not need padding.
+        const size_t padding = end < n_expert && !used(end) ? std::min<size_t>(expert_size, 512) : 0;
+        const size_t offset = size_t(resident[e] ? end : e) * expert_size;
+        const size_t bytes = (resident[e] ? 0 : size_t(end - e) * expert_size) + padding;
+        if (bytes) {
+            CUDA_CHECK(cudaMemcpyAsync((char *) destination->data + offset,
+                (const char *) source->data + offset, bytes, cudaMemcpyHostToDevice, ctx->stream()));
+        }
+        e = end;
+    }
+    // Keep cached sources valid until the gather finishes. No admission, LRU
+    // changes, additional resident allocation, or altered matmul arithmetic.
+    CUDA_CHECK(cudaStreamSynchronize(ctx->stream()));
+    return true;
 }
 
 static void moe_cache_session_enter(void * opaque) {
@@ -3100,8 +3243,14 @@ static int moe_cache_dispatch_internal(
     }
 
     (void)cudaGetLastError();
-    bool ok =
-        moe_cache_cuda_ok(device, cudaMemcpyAsync(
+    bool ok = true;
+    for (int i = 0; i < node->n_stream_stage_copies && ok; ++i) {
+        ok = moe_cache_cuda_ok(device, cudaMemcpyAsync(
+                pool.slab + (size_t)node->stream_stage_slots[i]*pool.expert_size,
+                node->stream_stage_sources[i], pool.expert_size,
+                cudaMemcpyHostToDevice, device.compute_stream), "stream expert staging", true);
+    }
+    ok = ok && moe_cache_cuda_ok(device, cudaMemcpyAsync(
                 device.d_input, device.h_input, input_bytes,
                 cudaMemcpyHostToDevice, device.compute_stream), "input upload", true);
     if (ok && !exl3) {
@@ -3152,12 +3301,18 @@ static int moe_cache_dispatch_internal(
     ggml_cuda_moe_cache_mmv_path down_mmv_path =
         ggml_cuda_moe_cache_mmv_path::generic;
     if (ok && full) {
+        // The short Q2 down projection benefits from the dedicated MMV on
+        // consumer Blackwell. Leave unmeasured shapes and architectures alone.
+        const bool dedicated_down = session.config.dedicated_down_mmv >= 0
+            ? session.config.dedicated_down_mmv != 0
+            : ggml_cuda_info().devices[device.logical].cc == GGML_CUDA_CC_BLACKWELL &&
+              down_pool->wtype == GGML_TYPE_Q2_0 && n_out == 640 && node->n_out == 2560;
         down_mmv_path = ggml_cuda_moe_cache_mmv(
                 down_pool->slab, (ggml_type)down_pool->wtype,
                 (const char *)device.d_act_q8, d_ids + 2 * n_hits,
                 nullptr, device.d_out, n_out, node->n_out,
                 down_pool->n_slots, (int64_t)down_pool->expert_size,
-                n_hits, n_hits, session.config.force_dedicated_down_mmv,
+                n_hits, n_hits, dedicated_down,
                 device.compute_stream);
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "down expert matvec launch", true);
@@ -3379,7 +3534,47 @@ static void moe_cache_end(void * opaque) {
     }
 }
 
-static void * moe_cache_fused_begin_expert_parallel(
+// Called under session.mu and the device dispatch lock. Retire a few unpinned
+// resident slots once; they remain accounted in the slab but are never LRU keys.
+static bool moe_cache_stream_stage_reserve(moe_cache_device & device, moe_cache_pool & pool, int count) {
+    if (pool.covers_all_entries || count > moe_cache_stream_stage_slots_max || pool.n_slots < 2*count) return false;
+    while (pool.n_stream_stage_slots < count) {
+        int slot = -1;
+        if (!pool.free_slots.empty()) {
+            slot = pool.free_slots.back();
+            pool.free_slots.pop_back();
+        } else {
+            slot = pool.lru_head;
+            while (slot >= 0 && pool.slots[slot].readers != 0) slot = pool.slots[slot].next;
+            if (slot < 0) return false;
+            moe_cache_slot_reset(pool, slot, false);
+            device.evictions++;
+        }
+        pool.stream_stage_slots[pool.n_stream_stage_slots++] = slot;
+    }
+    return true;
+}
+
+static bool moe_cache_stream_stage_source(moe_cache_device & device, const void * base) {
+#if !defined(GGML_USE_HIP)
+    auto found = device.seen_tensors.find(base);
+    if (found != device.seen_tensors.end() && found->second.stream_stage_registered >= 0)
+        return found->second.stream_stage_registered != 0;
+    // Partial pools stop extending the census; absence there does not imply a
+    // pageable source (including a source rediscovered after invalidation).
+    cudaPointerAttributes attributes = {};
+    const cudaError_t error = cudaPointerGetAttributes(&attributes, base);
+    const bool registered = error == cudaSuccess && attributes.type == cudaMemoryTypeHost;
+    if (error != cudaSuccess) (void)cudaGetLastError();
+    if (found != device.seen_tensors.end()) found->second.stream_stage_registered = registered;
+    return registered;
+#else
+    (void)device; (void)base;
+    return false;
+#endif
+}
+
+static void * moe_cache_fused_plan_expert_parallel(
         moe_cache_session & session,
         const ggml_moe_cache_tensor_desc * up,
         const ggml_moe_cache_tensor_desc * gate,
@@ -3387,8 +3582,8 @@ static void * moe_cache_fused_begin_expert_parallel(
         int layer, int glu_op, float up_min, float up_max,
         float gate_min, float gate_max,
         const int32_t * ids, int n_ids, int64_t n_tokens,
-        const float * const * act_rows, uint64_t * hit_mask) {
-    if (!down || session.devices.size() < 2) {
+        const float * const * act_rows, uint64_t * hit_mask, int stage_experts = 0) {
+    if (!down || session.devices.empty()) {
         return nullptr;
     }
 
@@ -3442,12 +3637,16 @@ static void * moe_cache_fused_begin_expert_parallel(
         int rows[moe_cache_node_rows_max];
         int n_rows = 0;
         int n_hits = 0;
+        int n_stage_rows = 0;
         int up_slots[moe_cache_node_rows_max];
         int gate_slots[moe_cache_node_rows_max];
         int down_slots[moe_cache_node_rows_max];
         const float * acts[moe_cache_node_rows_max];
         moe_cache_pin pins[3 * moe_cache_node_rows_max];
         int n_pins = 0;
+        int n_stage_copies = 0;
+        const void * stage_sources[moe_cache_stream_stage_slots_max] = {};
+        int stage_slots[moe_cache_stream_stage_slots_max] = {};
         std::unique_lock<std::mutex> dispatch_lock;
         moe_cache_node * child = nullptr;
     };
@@ -3508,7 +3707,7 @@ static void * moe_cache_fused_begin_expert_parallel(
             result.down_pool_index = down_pool;
         }
     }
-    if (routes.size() < 2) {
+    if (routes.empty()) {
         return nullptr;
     }
 
@@ -3620,6 +3819,19 @@ static void * moe_cache_fused_begin_expert_parallel(
                     session, profile_key, ids, n_ids, up->n_expert);
         }
         for (route & current : routes) {
+            // The single-device staging route replaces the ordinary fused plan,
+            // including its profile-driven prefetch. Keep EP placement unchanged.
+            if (session.devices.size() == 1 && !session.profile_heat.empty()) {
+                moe_cache_profile_seed_locked(
+                        session, *current.device, *current.pair_pool, current.pair_pool_index,
+                        up->data, profile_keys[0], up->expert_size, up->n_expert, wake_worker);
+                moe_cache_profile_seed_locked(
+                        session, *current.device, *current.pair_pool, current.pair_pool_index,
+                        gate->data, profile_keys[1], gate->expert_size, gate->n_expert, wake_worker);
+                moe_cache_profile_seed_locked(
+                        session, *current.device, *current.down_pool, current.down_pool_index,
+                        down->data, profile_keys[2], down->expert_size, down->n_expert, wake_worker);
+            }
             int inserts_left = session.config.inserts_per_plan;
             for (int local = 0; local < current.n_rows; local++) {
                 const int row = current.rows[local];
@@ -3659,6 +3871,49 @@ static void * moe_cache_fused_begin_expert_parallel(
                     current.pins[current.n_pins++] = pin;
                 }
                 mask |= UINT64_C(1) << row;
+            }
+            if (stage_experts > 0 && routes.size() == 1 && n_tokens >= 2 && n_tokens <= 4 &&
+                current.pair_pool == current.down_pool && up->type == GGML_TYPE_Q2_0 &&
+                down->type == up->type && up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
+                !current.pair_pool->covers_all_entries &&
+                moe_cache_stream_stage_source(*current.device, up->data) &&
+                moe_cache_stream_stage_source(*current.device, gate->data) &&
+                moe_cache_stream_stage_source(*current.device, down->data)) {
+                for (int staged = 0; staged < stage_experts; ++staged) {
+                    int best = -1, best_rows = 1;
+                    for (int r = 0; r < n_ids; ++r) {
+                        if (mask & (UINT64_C(1) << r)) continue;
+                        int count = 0;
+                        for (int j = 0; j < n_ids; ++j)
+                            count += ids[j] == ids[r] && !(mask & (UINT64_C(1) << j));
+                        if (count > best_rows) {best = ids[r]; best_rows = count;}
+                    }
+                    if (best < 0 || !moe_cache_stream_stage_reserve(
+                            *current.device, *current.pair_pool, 3*(staged+1))) break;
+                    const int * slots = current.pair_pool->stream_stage_slots + 3*staged;
+                    const void * bases[] = {up->data, gate->data, down->data};
+                    for (int k = 0; k < 3; ++k) {
+                        const int copy = current.n_stage_copies++;
+                        current.stage_sources[copy] = (const char *)bases[k] + (size_t)best*up->expert_size;
+                        current.stage_slots[copy] = slots[k];
+                    }
+                    for (int r = 0; r < n_ids; ++r) {
+                        if (ids[r] != best || (mask & (UINT64_C(1) << r))) continue;
+                        const int hit = current.n_hits++;
+                        current.n_stage_rows++;
+                        current.rows[hit] = r;
+                        current.up_slots[hit] = slots[0];
+                        current.gate_slots[hit] = slots[1];
+                        current.down_slots[hit] = slots[2];
+                        current.acts[hit] = act_rows[r];
+                        for (int k = 0; k < 3; ++k) {
+                            current.pair_pool->slots[slots[k]].readers++;
+                            current.pins[current.n_pins++] = {current.pair_pool, slots[k]};
+                        }
+                        mask |= UINT64_C(1) << r;
+                    }
+                    current.device->stream_stage_experts++;
+                }
             }
         }
     }
@@ -3748,9 +4003,26 @@ static void * moe_cache_fused_begin_expert_parallel(
         child->planned = true;
         child->owns_active = false;
         child->n_result_rows = current.n_hits;
+        child->fused_pending = true;
+        child->fused_hits = current.n_hits;
+        child->fused_candidates = current.n_rows;
+        child->glu_op = glu_op;
+        child->up_min = up_min;
+        child->up_max = up_max;
+        child->gate_min = gate_min;
+        child->gate_max = gate_max;
         child->dispatch_lock = std::move(current.dispatch_lock);
+        child->n_stream_stage_copies = current.n_stage_copies;
+        for (int i = 0; i < current.n_stage_copies; ++i) {
+            child->stream_stage_sources[i] = current.stage_sources[i];
+            child->stream_stage_slots[i] = current.stage_slots[i];
+        }
         for (int local = 0; local < current.n_hits; local++) {
             child->row_indices[local] = hit_ranks[current.rows[local]];
+            child->up_slots[local] = current.up_slots[local];
+            child->gate_slots[local] = current.gate_slots[local];
+            child->down_slots[local] = current.down_slots[local];
+            child->hit_acts[local] = current.acts[local];
         }
         current.child = child.get();
         root->children.push_back(std::move(child));
@@ -3768,40 +4040,19 @@ static void * moe_cache_fused_begin_expert_parallel(
                 child->pins[child->n_pins++] = current.pins[index];
             }
             current.n_pins = 0;
-            current.device->hits += 3 * current.n_hits;
+            // Staged misses execute on the GPU but are not resident cache hits.
+            current.device->hits += 3 * (current.n_hits - current.n_stage_rows);
             current.device->nodes++;
             current.device->fused_attempts++;
         }
     }
 
-    for (route & current : routes) {
-        if (current.n_hits == 0) {
-            continue;
-        }
-        if (!moe_cache_dispatch_internal(
-                current.child, up->type, up->n_in, up->n_out,
-                current.child->n_result_rows,
-                current.up_slots, current.acts,
-                current.pair_pool, current.gate_slots,
-                current.down_pool, current.down_slots,
-                glu_op, up_min, up_max, gate_min, gate_max)) {
-            moe_cache_end(root.release());
-            return nullptr;
-        }
-        std::lock_guard<std::mutex> lock(session.mu);
-        current.device->fused_rows += current.child->n_result_rows;
-        current.device->fused_candidates += current.n_rows;
-        current.device->fused_nodes++;
-        current.device->full_fused_rows += current.child->n_result_rows;
-        current.device->full_fused_nodes++;
-    }
-
-    root->dispatched = true;
+    root->fused_pending = true;
     *hit_mask = mask;
     return root.release();
 }
 
-static void * moe_cache_fused_begin(
+static void * moe_cache_fused_plan(
         const ggml_moe_cache_tensor_desc * up,
         const ggml_moe_cache_tensor_desc * gate,
         const ggml_moe_cache_tensor_desc * down,
@@ -3866,7 +4117,8 @@ static void * moe_cache_fused_begin(
         return nullptr;
     }
     moe_cache_log_configuration(*session);
-    if (up->expert_size < session->config.min_expert_bytes) {
+    if (up->expert_size < ggml_moe_cache_effective_min_expert_bytes(up->type,
+            session->config.min_expert_explicit, session->config.min_expert_bytes)) {
         return nullptr;
     }
     if (n_tokens > session->config.max_batch) {
@@ -3899,11 +4151,29 @@ static void * moe_cache_fused_begin(
         return nullptr;
     }
 
-    if (expert_parallel && down) {
-        return moe_cache_fused_begin_expert_parallel(
+    bool stream_stage = false;
+#if !defined(GGML_USE_HIP)
+    // Measured for small speculative Q2 batches on consumer Blackwell. Use the
+    // same full-FFN planner for resident and transient experts, without changing
+    // the existing multi-device routing or larger prompt-processing batches.
+    stream_stage = down && session->devices.size() == 1 && n_tokens <= 4 &&
+        up->type == GGML_TYPE_Q2_0 && down->type == up->type &&
+        up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
+        ggml_cuda_info().devices[session->devices.front()->logical].cc == GGML_CUDA_CC_BLACKWELL;
+#endif
+    if (down && (expert_parallel || stream_stage)) {
+        if (!expert_parallel) {
+            std::lock_guard<std::mutex> lock(session->mu);
+            const auto & device = *session->devices.front();
+            const int up_index = moe_cache_find_pool(device, up->expert_size, up->type);
+            const int down_index = moe_cache_find_pool(device, down->expert_size, down->type);
+            if (up_index < 0 || down_index < 0 ||
+                !device.pools[up_index]->slab || !device.pools[down_index]->slab) return nullptr;
+        }
+        return moe_cache_fused_plan_expert_parallel(
                 *session, up, gate, down, up_layer, glu_op,
                 up_min, up_max, gate_min, gate_max,
-                ids, n_ids, n_tokens, act_rows, hit_mask);
+                ids, n_ids, n_tokens, act_rows, hit_mask, stream_stage ? moe_cache_stream_stage_max : 0);
     }
 
     const bool profile_enabled = !session->config.profile_path.empty();
@@ -4067,13 +4337,13 @@ static void * moe_cache_fused_begin(
     node->dispatch_lock = std::move(dispatch_lock);
     node->planned = true;
 
-    int32_t up_slots[moe_cache_node_rows_max];
-    int32_t gate_slots[moe_cache_node_rows_max];
-    int32_t down_slots[moe_cache_node_rows_max];
+    int32_t * up_slots = node->up_slots;
+    int32_t * gate_slots = node->gate_slots;
+    int32_t * down_slots = node->down_slots;
     int32_t resident_up[moe_cache_node_rows_max];
     int32_t resident_gate[moe_cache_node_rows_max];
     int32_t resident_down[moe_cache_node_rows_max];
-    const float * hit_acts[moe_cache_node_rows_max];
+    const float ** hit_acts = node->hit_acts;
     uint64_t mask = 0;
     int hits = 0;
     bool full_ready = true;
@@ -4248,28 +4518,65 @@ static void * moe_cache_fused_begin(
         session->cv.notify_all();
     }
 
-    if (hits == 0 || !moe_cache_dispatch_internal(
-            node.get(), up->type, up->n_in, up->n_out, hits,
-            up_slots, hit_acts, pool, gate_slots,
-            down_pool, down ? down_slots : nullptr, glu_op,
-            up_min, up_max, gate_min, gate_max)) {
+    if (hits == 0) {
         moe_cache_end(node.release());
         return nullptr;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(session->mu);
-        selected->fused_rows += hits;
-        selected->fused_candidates += n_ids;
-        selected->fused_nodes++;
-        if (down) {
-            selected->full_fused_rows += hits;
-            selected->full_fused_nodes++;
-        }
-    }
-
+    node->fused_pending = true;
+    node->fused_hits = hits;
+    node->fused_candidates = n_ids;
+    node->glu_op = glu_op;
+    node->up_min = up_min;
+    node->up_max = up_max;
+    node->gate_min = gate_min;
+    node->gate_max = gate_max;
     *hit_mask = mask;
     return node.release();
+}
+
+static int moe_cache_fused_dispatch(void * opaque) {
+    moe_cache_node * node = (moe_cache_node *)opaque;
+    if (!node->fused_pending) {
+        return node->dispatched;
+    }
+    node->fused_pending = false;
+    if (node->composite) {
+        // Keep successful children alive on failure: end() drains them before
+        // releasing their pins, and collect() must not publish a partial result.
+        for (const auto & child : node->children) {
+            if (child != node->children.front() &&
+                    moe_cache_fail(*node->session, "dispatch-after-first")) {
+                std::lock_guard<std::mutex> lock(node->session->mu);
+                child->device->dispatch_failures++;
+                return 0;
+            }
+            if (!moe_cache_fused_dispatch(child.get())) {
+                return 0;
+            }
+        }
+        node->dispatched = true;
+        return 1;
+    }
+    const bool full = node->down_pool != nullptr;
+    if (!moe_cache_dispatch_internal(
+            node, node->wtype, node->n_in, node->n_mid, node->fused_hits,
+            node->up_slots, node->hit_acts, node->pool, node->gate_slots,
+            node->down_pool, full ? node->down_slots : nullptr, node->glu_op,
+            node->up_min, node->up_max, node->gate_min, node->gate_max)) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(node->session->mu);
+    moe_cache_device & device = *node->device;
+    device.fused_rows += node->fused_hits;
+    device.fused_candidates += node->fused_candidates;
+    device.fused_nodes++;
+    if (full) {
+        device.full_fused_rows += node->fused_hits;
+        device.full_fused_nodes++;
+    }
+    return 1;
 }
 
 static void moe_cache_invalidate_session(
@@ -4326,7 +4633,8 @@ static void moe_cache_invalidate_session(
                         shape.n_tensors = std::max<int64_t>(shape.n_tensors - 1, 0);
                         if (shape.pool >= 0 && shape.pool < (int)device.pools.size()) {
                             device.pools[shape.pool]->covers_all_entries =
-                                (uint64_t)device.pools[shape.pool]->n_slots >= shape.n_entries;
+                                (uint64_t)(device.pools[shape.pool]->n_slots -
+                                    device.pools[shape.pool]->n_stream_stage_slots) >= shape.n_entries;
                         }
                         if (shape.n_tensors == 0 && shape.pool < 0) {
                             shape.finished = false;
@@ -4436,12 +4744,14 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.session_destroy = moe_cache_session_destroy;
     ggml_moe_cache.session_enter = moe_cache_session_enter;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
+    ggml_moe_cache.prefill_copy = moe_cache_prefill_copy;
     ggml_moe_cache.begin = moe_cache_begin;
     ggml_moe_cache.plan = moe_cache_plan;
     ggml_moe_cache.dispatch = moe_cache_dispatch;
     ggml_moe_cache.collect = moe_cache_collect;
     ggml_moe_cache.end = moe_cache_end;
-    ggml_moe_cache.fused_begin = moe_cache_fused_begin;
+    ggml_moe_cache.fused_plan = moe_cache_fused_plan;
+    ggml_moe_cache.fused_dispatch = moe_cache_fused_dispatch;
     ggml_moe_cache.invalidate = moe_cache_invalidate;
 }
 

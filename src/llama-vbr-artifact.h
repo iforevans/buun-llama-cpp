@@ -465,8 +465,24 @@ struct vbr_artifact_package {
     vbr_artifact_reference_manifest manifest;
 };
 
+// Catalog-only evidence for already prepared immutable units. Publication
+// binds this to owned backing/revisions and unit indices under its lock; the
+// codec independently compares the complete incoming schema before reuse.
+class vbr_artifact_preparation_reuse {
+private:
+    uint32_t version = 0;
+    std::vector<vbr_artifact_unit_blob> units;
+    friend class llama_vbr_artifact_catalog;
+    friend class vbr_artifact_package_view;
+    friend vbr_artifact_status vbr_artifact_prepare(
+        vbr_artifact_package &, uint32_t, const vbr_artifact_preparation_reuse *) noexcept;
+};
+
+// More than one worker requires concurrently readable payload sources. Keep
+// arbitrary external readers serial; catalog-owned immutable chains opt in.
 vbr_artifact_status vbr_artifact_prepare(
-    vbr_artifact_package & package) noexcept;
+    vbr_artifact_package & package, uint32_t max_workers = 1,
+    const vbr_artifact_preparation_reuse * reuse = nullptr) noexcept;
 
 // Canonicalizes and validates the non-main-payload portion of a package whose
 // unit bytes were authenticated by the projected-capture Merkle authority.
@@ -480,13 +496,17 @@ vbr_artifact_status vbr_artifact_prepare_projected_metadata(
 // This is the import door: it reuses the codec's canonical metadata, placement,
 // digest, and payload checks rather than growing a second wire validator.
 vbr_artifact_status vbr_artifact_validate_prepared_package(
-    const vbr_artifact_package & package) noexcept;
+    const vbr_artifact_package & package, uint32_t max_workers = 1) noexcept;
 
+// max_workers and reuse as for vbr_artifact_prepare. Reuse evidence also
+// means the sources cannot change while encoding, so ids are not derived twice.
 vbr_artifact_status vbr_artifact_encode(
     vbr_artifact_package & package,
     const vbr_artifact_stream_writer & output,
     uint64_t max_total_bytes,
-    uint64_t * encoded_size = nullptr) noexcept;
+    uint64_t * encoded_size = nullptr,
+    uint32_t max_workers = 1,
+    const vbr_artifact_preparation_reuse * reuse = nullptr) noexcept;
 
 vbr_artifact_status vbr_artifact_decode(
     const vbr_artifact_stream_reader & input,

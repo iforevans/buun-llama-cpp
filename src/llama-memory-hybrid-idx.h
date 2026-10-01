@@ -12,6 +12,8 @@
 // llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
 // the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
+// TODO: this memory module is pending complete reimplementation - do not use for model other than Qwen4
+
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
@@ -158,7 +160,7 @@ public:
     // the caller then adds the attention mask, the only part of the bias that varies within a block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, bool causal_attn) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;

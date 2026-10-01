@@ -71,7 +71,7 @@ test parameters:
   -ncmoe, --n-cpu-moe <n>                   (default: 0)
   --moe-cache <auto|on|off|0|MiB>           (default: auto)
   --[no-]moe-cache-profile                  (default: enabled)
-  --repack <auto|on|off>                    weight repacking policy (default: auto)
+  --repack <auto|on|off|0|1>                weight repacking policies (default: auto)
   -nr, --no-repack                          equivalent to --repack off
   -sm, --split-mode <none|layer|row|tensor> (default: layer)
   -mg, --main-gpu <i>                       (default: 0)
@@ -102,7 +102,7 @@ llama-bench can perform three types of tests:
 - Text generation (tg): generating a sequence of tokens (`-n`)
 - Prompt processing + text generation (pg): processing a prompt followed by generating a sequence of tokens (`-pg`)
 
-List-valued options can be specified multiple times to run multiple tests. Each pp and tg test is run with all combinations of those options. Multiple values can be separated by commas (e.g. `-n 16,32`), or the option can be specified multiple times (e.g. `-n 16 -n 32`). Scalar options such as `-r`, `-o`, `-v`, `--n-gen-warmup`, and `--repack` apply to all generated tests.
+List-valued options can be specified multiple times to run multiple tests. Each pp and tg test is run with all combinations of those options. Multiple values can be separated by commas (e.g. `-n 16,32` or `--repack off,on`), or the option can be specified multiple times (e.g. `-n 16 -n 32`). Scalar options such as `-r`, `-o`, `-v`, and `--n-gen-warmup` apply to all generated tests. Repack values `0` and `1` are aliases for `off` and `on`; all sweep combinations must obey the MoE-cache compatibility rules below.
 
 Each test is repeated the number of times given by `-r`, and the results are averaged. The results are given in average tokens per second (t/s) and standard deviation. Some output formats (e.g. json) also include the individual results of each repetition.
 

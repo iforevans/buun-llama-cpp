@@ -5,6 +5,8 @@
 // MMA/reduction sequence as the generic whole-K kernel.
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
 
+#include "kernel-params.cuh"
+
 namespace {
 
 static_assert(QK_NVFP4 == 64 && sizeof(block_nvfp4) == 36 && sizeof(block_fp4_mmq) == 144);
@@ -97,9 +99,10 @@ static __device__ __forceinline__ void nvfp4_tma_dot(const int * x, const int * 
 #endif
 
 static __global__ __launch_bounds__(256, 1) void mul_mat_nvfp4_tma(
-// Keep the aligned descriptor grid-constant in the host pass too (MSVC C2719).
-// Pascal device compilation cannot use __grid_constant__; this kernel never runs there.
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+// MSVC host stubs cannot take the over-aligned descriptor by value.
+#if defined(_MSC_VER)
+        const CUtensorMap * map,
+#elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
         const __grid_constant__ CUtensorMap map,
 #else
         const CUtensorMap map,
@@ -107,6 +110,12 @@ static __global__ __launch_bounds__(256, 1) void mul_mat_nvfp4_tma(
         const int * activation,
         const float * scale, float * dst, int n, int m, int k) {
 #ifdef BLACKWELL_MMA_AVAILABLE
+#if defined(_MSC_VER)
+    const CUtensorMap * map_ptr = map;
+    ggml_cuda_acquire_kernel_params(map_ptr);
+#else
+    const CUtensorMap * map_ptr = &map;
+#endif
     const int mt = (m + 127) / 128, nt = n / 128;
     const int tid = threadIdx.y * 32 + threadIdx.x;
     int it, jt;
@@ -134,14 +143,14 @@ static __global__ __launch_bounds__(256, 1) void mul_mat_nvfp4_tma(
     __syncthreads();
     const int * y = activation + jt * 128 * 36;
     if (tid == 0) {
-        nvfp4_tma_copy(s.x[0], s.y[0], &map, y, it * 128, 0, s.full);
+        nvfp4_tma_copy(s.x[0], s.y[0], map_ptr, y, it * 128, 0, s.full);
     }
     float sum[64] = {};
     for (int h = 0; h < k / 256; ++h) {
         const int slot = h % 2;
         nvfp4_tma_wait(s.full + slot, (h / 2) & 1);
         if (tid == 0 && h + 1 < k / 256) {
-            nvfp4_tma_copy(s.x[slot ^ 1], s.y[slot ^ 1], &map,
+            nvfp4_tma_copy(s.x[slot ^ 1], s.y[slot ^ 1], map_ptr,
                 y + size_t(m) * (h + 1) * 36, it * 128, h + 1, s.full + (slot ^ 1));
         }
         nvfp4_tma_dot(s.x[slot], s.y[slot], sum);
@@ -159,7 +168,7 @@ static __global__ __launch_bounds__(256, 1) void mul_mat_nvfp4_tma(
 } // namespace
 #endif
 
-bool ggml_cuda_mmq_nvfp4_tma(const mmq_args & a, cudaStream_t stream) {
+bool ggml_cuda_mmq_nvfp4_tma(ggml_backend_cuda_context & ctx, const mmq_args & a, cudaStream_t stream) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
     const auto & device = ggml_cuda_info().devices[ggml_cuda_get_device()];
     if (device.cc != GGML_CUDA_CC_BLACKWELL || !blackwell_mma_available(device.cc) ||
@@ -185,12 +194,20 @@ bool ggml_cuda_mmq_nvfp4_tma(const mmq_args & a, cudaStream_t stream) {
         CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     constexpr size_t bytes = sizeof(nvfp4_tma_storage);
     CUDA_SET_SHARED_MEMORY_LIMIT(mul_mat_nvfp4_tma, bytes);
+#if defined(_MSC_VER)
+    ggml_cuda_pool_alloc<CUtensorMap> device_map(ctx.pool(ggml_cuda_get_device()), 1);
+    CUDA_CHECK(ggml_cuda_upload_kernel_params(map, device_map.get(), stream));
+    const auto launch_map = device_map.get();
+#else
+    GGML_UNUSED(ctx);
+    const auto & launch_map = map;
+#endif
     mul_mat_nvfp4_tma<<<(a.nrows_x / 128) * ((a.ncols_dst + 127) / 128), dim3(32, 8), bytes, stream>>>(
-        map, a.y, a.y_scale, a.dst, int(a.nrows_x), int(a.ncols_dst), int(a.ncols_x));
+        launch_map, a.y, a.y_scale, a.dst, int(a.nrows_x), int(a.ncols_dst), int(a.ncols_x));
     CUDA_CHECK(cudaGetLastError());
     return true;
 #else
-    GGML_UNUSED_VARS(a, stream);
+    GGML_UNUSED_VARS(ctx, a, stream);
     return false;
 #endif
 }

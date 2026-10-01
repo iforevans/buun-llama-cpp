@@ -133,6 +133,78 @@ void test_idle_capture_session_cancellation() {
     }
 }
 
+void test_displacement_capture_session() {
+    for (int route = 0; route < 3; ++route) {
+        server_queue queue;
+        auto capture = queue.try_begin_displacement_capture();
+        CHECK(capture.continue_capture());
+        server_task cancel;
+        cancel.id = 40;
+        cancel.type = SERVER_TASK_TYPE_CANCEL;
+        cancel.id_target = 39;
+        if (route == 0) {
+            queue.post(std::move(cancel));
+        } else if (route == 1) {
+            std::vector<server_task> tasks;
+            tasks.push_back(std::move(cancel));
+            queue.post(std::move(tasks));
+        } else {
+            queue.defer(std::move(cancel));
+        }
+        CHECK(!capture.continue_capture());
+        capture = {};
+        // A queued cancellation must also prevent a fresh foreground wave.
+        CHECK(!queue.try_begin_displacement_capture());
+    }
+    {
+        server_queue queue;
+        auto idle = queue.try_begin_idle_capture();
+        CHECK(idle);
+        CHECK(queue.post(idle_capture_test_task(30)) == 30);
+        CHECK(!idle.continue_capture());
+        // Cancelled work must drain/release before foreground acquisition.
+        CHECK(!queue.try_begin_displacement_capture());
+        idle = {};
+        auto capture = queue.try_begin_displacement_capture();
+        CHECK(capture.continue_capture());
+        CHECK(!queue.try_begin_displacement_capture());
+        CHECK(queue.post(idle_capture_test_task(31)) == 31);
+        std::vector<server_task> tasks;
+        tasks.push_back(idle_capture_test_task(32));
+        CHECK(queue.post(std::move(tasks)) == 0);
+        queue.defer(idle_capture_test_task(33));
+        CHECK(capture.continue_capture());
+        auto moved = std::move(capture);
+        CHECK(!capture);
+        CHECK(moved.continue_capture());
+        moved.cancel();
+        CHECK(!moved.continue_capture());
+        moved = {};
+        auto second = queue.try_begin_displacement_capture();
+        CHECK(second.continue_capture());
+        queue.terminate();
+        CHECK(!second.continue_capture());
+        CHECK(!queue.try_begin_displacement_capture());
+    }
+    {
+        server_queue queue;
+        auto capture = queue.try_begin_displacement_capture();
+        CHECK(capture.continue_capture());
+        capture = {};
+        auto idle = queue.try_begin_idle_capture();
+        CHECK(idle.continue_capture());
+        CHECK(queue.post(idle_capture_test_task(34)) == 34);
+        CHECK(!idle.continue_capture()); // cancellation policy resets per session
+    }
+    server_queue::idle_capture_session escaped;
+    {
+        server_queue queue;
+        escaped = queue.try_begin_displacement_capture();
+        CHECK(escaped.continue_capture());
+    }
+    CHECK(!escaped.continue_capture());
+}
+
 void test_idle_capture_refuses_active_queue_yield() {
     server_queue queue;
     std::mutex mutex;
@@ -181,6 +253,7 @@ void test_idle_capture_refuses_active_queue_yield() {
     // acquire capture authority concurrently with decode/speculative work.
     CHECK(!queue.try_begin_idle_capture());
     CHECK(!queue.try_begin_prompt_boundary_capture());
+    CHECK(!queue.try_begin_displacement_capture());
 
     CHECK(queue.post(idle_capture_test_task(20)) == 20);
     {
@@ -298,6 +371,10 @@ void test_slot_frontier_logits_companion() {
     CHECK(result.nonfinite_logits_refused);
     CHECK(result.torn_companion_refused);
     CHECK(result.missing_companion_is_cold);
+    CHECK(result.resume_ledger_round_trip);
+    CHECK(result.resume_ledger_refuses_logits);
+    CHECK(result.resume_routes_do_not_cross);
+    CHECK(result.resume_key_mutation_refused);
     CHECK(result.destination_slot_rebound);
     CHECK(result.destination_epoch_rebound);
     CHECK(result.source_process_epoch_not_reused);
@@ -1968,16 +2045,18 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     server_vbr_empty_handoff_gate accepted_handoff;
     accepted_handoff.slot_count = 1;
     accepted_handoff.incoming_prefix = 1024;
-    accepted_handoff.incumbent_lcp = 32;
+    accepted_handoff.incumbent_reusable = 32;
     accepted_handoff.durable_incumbent_prefix = 1000;
     accepted_handoff.incumbent_supported = true;
     accepted_handoff.family_matches = true;
     CHECK(server_vbr_empty_handoff_lookup_allowed(accepted_handoff));
     CHECK(server_vbr_empty_handoff_allowed(accepted_handoff));
-    CHECK(server_vbr_live_source_displacement_allowed(false, 8));
-    CHECK(server_vbr_live_source_displacement_allowed(true, 1));
-    CHECK(!server_vbr_live_source_displacement_allowed(true, 2));
-    CHECK(!server_vbr_live_source_displacement_allowed(true, 8));
+    CHECK(server_vbr_live_source_displacement_allowed(false, 8, false));
+    CHECK(server_vbr_live_source_displacement_allowed(true, 1, false));
+    CHECK(!server_vbr_live_source_displacement_allowed(true, 2, false));
+    CHECK(!server_vbr_live_source_displacement_allowed(true, 8, false));
+    CHECK(!server_vbr_live_source_displacement_allowed(false, 8, true));
+    CHECK(!server_vbr_live_source_displacement_allowed(true, 1, true));
     const auto rejects_handoff = [&](auto mutate) {
         auto gate = accepted_handoff;
         mutate(gate);
@@ -1987,13 +2066,36 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     CHECK(!server_vbr_empty_handoff_lookup_allowed(rejects_handoff(
         [](auto & gate) { gate.slot_count = 2; })));
     rejects_handoff(
-        [](auto & gate) { gate.incoming_prefix = gate.incumbent_lcp; });
+        [](auto & gate) { gate.incoming_prefix = gate.incumbent_reusable; });
     rejects_handoff(
         [](auto & gate) { gate.exact_incumbent_durable = true; });
+    auto unsupported_route = accepted_handoff;
+    unsupported_route.exact_incumbent_durable = true;
+    unsupported_route.occupied_route_refused = true;
+    CHECK(server_vbr_empty_handoff_allowed(unsupported_route));
+    // A recurrent rewind can have thousands of equal tokens but no usable
+    // live frontier. The gate consumes the reusable count, not raw overlap.
+    server_prompt rewind_live;
+    rewind_live.tokens = server_tokens(llama_tokens(8256, 7), false);
+    const server_tokens rewind_incoming(llama_tokens(8000, 7), false);
+    server_prompt_cache_reuse_context rewind_context;
+    rewind_context.live_pos_min = 8255;
+    const auto rewind_lcp = rewind_live.tokens.get_common_prefix(rewind_incoming);
+    CHECK(rewind_lcp == 8000);
+    auto rewind_handoff = unsupported_route;
+    rewind_handoff.incumbent_reusable = server_prompt_cache_reusable_prefix(
+        rewind_live, rewind_incoming, rewind_lcp,
+        rewind_context.live_pos_min, rewind_context, "");
+    CHECK(rewind_handoff.incumbent_reusable == 0);
+    rewind_handoff.incoming_prefix = 7996;
+    rewind_handoff.durable_incumbent_prefix = 8256;
+    CHECK(server_vbr_empty_handoff_allowed(rewind_handoff));
+    rewind_handoff.incumbent_reusable = rewind_lcp;
+    CHECK(!server_vbr_empty_handoff_allowed(rewind_handoff));
     rejects_handoff(
         [](auto & gate) { gate.durable_incumbent_prefix = 0; });
     rejects_handoff([](auto & gate) {
-        gate.durable_incumbent_prefix = gate.incumbent_lcp;
+        gate.durable_incumbent_prefix = gate.incumbent_reusable;
     });
     CHECK(!server_vbr_empty_handoff_lookup_allowed(rejects_handoff(
         [](auto & gate) { gate.hard_lease = true; })));
@@ -2026,6 +2128,8 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     CHECK(vbr_reclaim.successful_attempt_is_state_sealed);
     CHECK(vbr_reclaim.multi_fresh_pressure_isolated);
     CHECK(vbr_reclaim.fragmented_projection_retries_exact);
+    CHECK(vbr_reclaim.projected_capture_requires_idle_source);
+    CHECK(vbr_reclaim.stash_projection_retries_exact);
     CHECK(vbr_reclaim.isolated_capture_drains_without_backoff);
     CHECK(vbr_reclaim.unchanged_admission_refusal_is_suppressed);
     CHECK(vbr_reclaim.checkpoint_admission_refusals_are_independent);
@@ -2143,6 +2247,73 @@ void test_lifecycle_shadow_prefix_failure_does_not_change_authority() {
     CHECK(shadow.last.proposed_artifact.v == 0);
     CHECK(authority.destruction.host_trade_retention_capacity_executed == 0);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 1);
+}
+
+void test_vbr_stem_retains_source_turn_geometry(common_retention_pool pool) {
+    server_cache_authority authority;
+    const std::string execution = "vbr-stem-turn-geometry";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+    CHECK(authority.retention.enable_prefix_tracking());
+    auto entry = make_retention_entry("adapter", 100, 8, 1);
+    auto source = entry.front().prompt.clone();
+    source.sequence_epoch = 1;
+    const auto source_key = server_retention_instance_key::for_slot(0);
+    CHECK(publish_live_retention(authority.retention, source, 0, pool).v != 0);
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, source_key, source, "adapter", source.n_tokens()));
+    common_retention_lineage_record original;
+    CHECK(authority.retention.lineage_for_instance(source_key, original));
+
+    // A capture can retain an older prefix while the live token vector has
+    // grown beyond the last published turn table. That table still describes
+    // the saved prefix; rebuilding it from absent spans loses its score.
+    source.tokens = server_tokens(llama_tokens {
+        100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111 }, false);
+    for (int64_t coverage : { 4, 8 }) {
+        server_prompt_cache_vbr_publication_metadata prepared;
+        CHECK(cache.prepare_vbr_stem_publication_metadata(
+            source, coverage, execution, "adapter", 0, prepared));
+        CHECK(prepared.ready());
+        struct observation {
+            uint64_t lineage;
+            uint64_t coverage;
+            size_t hosts = 0;
+            bool valid = true;
+        } observed { original.lineage_id, uint64_t(coverage) };
+        const auto inventory = authority.retention.value_snapshots(
+            &observed, [](void * context, const server_retention_value_snapshot & value) noexcept {
+                auto & state = *static_cast<observation *>(context);
+                if (value.kind == common_retention_artifact_kind::host_entry) {
+                    state.hosts++;
+                    state.valid &= value.stamp.lineage_id == state.lineage &&
+                        value.stamp.coverage_tokens == state.coverage &&
+                        value.stamp.state == common_retention_score_state::known &&
+                        !value.stamp.mandatory_anchor;
+                }
+                return true;
+            });
+        CHECK(inventory.status == server_retention_value_snapshot_status::complete);
+        CHECK(observed.valid && observed.hosts == 1);
+    }
+    for (int64_t coverage : { 9, 12 }) {
+        server_prompt_cache_vbr_publication_metadata prepared;
+        CHECK(!cache.prepare_vbr_stem_publication_metadata(
+            source, coverage, execution, "adapter", 0, prepared));
+        CHECK(!prepared.ready());
+    }
+    size_t remaining = 0;
+    const auto inventory = authority.retention.value_snapshots(
+        &remaining, [](void * context, const server_retention_value_snapshot &) noexcept {
+            ++*static_cast<size_t *>(context);
+            return true;
+        });
+    CHECK(inventory.status == server_retention_value_snapshot_status::complete);
+    CHECK(remaining == 1);
+    common_retention_lineage_record after;
+    CHECK(authority.retention.lineage_for_instance(source_key, after));
+    CHECK(after == original);
+    CHECK(authority.retention.prefix_tracking_available());
 }
 
 void test_lifecycle_retention_capacity_executes_decayed_fallback() {
@@ -2917,6 +3088,32 @@ void test_checkpoint_lineage_ignores_retier_but_rejects_content_change() {
     CHECK(!common_prompt_checkpoint_lineage_matches(checkpoint, state));
 }
 
+void test_checkpoint_host_stem_lifecycle() {
+    common_prompt_checkpoint saved = {};
+    saved.vbr_host_stem_identity.fill(0x5a);
+    saved.vbr_host_stem_artifact = 42;
+    common_prompt_checkpoint copied = saved;
+    common_prompt_checkpoint assigned = {};
+    assigned = saved;
+    common_prompt_checkpoint moved = std::move(copied);
+    for (const auto * checkpoint : { &moved, &assigned }) {
+        CHECK(checkpoint->vbr_host_stem_identity == saved.vbr_host_stem_identity);
+        CHECK(checkpoint->vbr_host_stem_artifact == saved.vbr_host_stem_artifact);
+    }
+    const auto invalidates = [&](auto mutate) {
+        auto checkpoint = saved;
+        mutate(checkpoint);
+        CHECK((checkpoint.vbr_host_stem_identity == std::array<uint8_t, 32> {}));
+        CHECK(checkpoint.vbr_host_stem_artifact == 0);
+    };
+    invalidates([](auto & checkpoint) { checkpoint.clear(); });
+    invalidates([](auto & checkpoint) { checkpoint.update_pos(8, 0, 7); });
+    invalidates([](auto & checkpoint) { checkpoint.update_tgt(nullptr, 0, 0); });
+    invalidates([](auto & checkpoint) { checkpoint.update_dft(nullptr, 0, 0); });
+    invalidates([](auto & checkpoint) { checkpoint.clear_tgt(); });
+    invalidates([](auto & checkpoint) { checkpoint.clear_dft(); });
+}
+
 void test_checkpoint_draft_restore_refuses_without_context() {
     common_prompt_checkpoint checkpoint;
     CHECK(checkpoint.try_load_dft(
@@ -2998,6 +3195,7 @@ void test_lifecycle_full_cache_rotates() {
 void test_lifecycle_restore_retains_immutable_source() {
     server_cache_authority authority;
     configure_host_accounting(authority, true);
+    CHECK(authority.retention.enable_prefix_tracking());
     const std::string execution = "restore-retained-hard-fallback";
 
     server_prompt_cache cache(/* limit_size_mib */ 0, /* limit_tokens */ 0);
@@ -3537,6 +3735,9 @@ void test_lifecycle_off_restore_consumes() {
 void test_lifecycle_restore_batch_timing() {
     server_cache_authority authority;
     configure_host_accounting(authority, true);
+    // Production host restores have prefix tracking enabled. Checkpoint
+    // metadata must remain outside that index and keep its own frontier.
+    CHECK(authority.retention.enable_prefix_tracking());
     server_prompt_cache cache(0, 0);
     cache.acct = &authority.ledger;
     cache.publish_authority = &authority;
@@ -3552,7 +3753,7 @@ void test_lifecycle_restore_batch_timing() {
     for (int i = 0; i < 8; ++i) {
         entry.front().prompt.checkpoints.emplace_back();
         auto & checkpoint = entry.front().prompt.checkpoints.back();
-        checkpoint.n_tokens = 4096;
+        checkpoint.n_tokens = 512 * (i + 1);
         fill_checkpoint_bytes(
             checkpoint.data_tgt, 64 * 1024, uint8_t(i + 1));
         fill_checkpoint_bytes(
@@ -3573,10 +3774,14 @@ void test_lifecycle_restore_batch_timing() {
         server_retention_instance_key::for_host_entry(&cache.states.front()),
         common_retention_pool::attention, spans, true, 4096, 4096, true));
     for (const auto & checkpoint : cache.states.front().prompt.checkpoints) {
+        server_cache_lease_identity identity;
+        CHECK(server_cache_lease_build_identity(
+            "batch-restore", cache.states.front().adapter_config_key,
+            cache.states.front().prompt.tokens, checkpoint.n_tokens, identity));
         CHECK(authority.retention.publish(
             server_retention_instance_key::for_checkpoint(-1, &checkpoint),
             common_retention_pool::attention, spans, true, 4096,
-            checkpoint.n_tokens, true));
+            checkpoint.n_tokens, true, &identity));
     }
     constexpr size_t checkpoint_plane_bytes =
         64 * 1024 + 8 * 1024 + 4 * 1024 + 1024;
@@ -3649,16 +3854,33 @@ void test_lifecycle_restore_batch_timing() {
         commit_samples.push_back(uint64_t(std::chrono::duration_cast<
             std::chrono::nanoseconds>(commit_end - commit_begin).count()));
         CHECK(live.checkpoints.size() == 8);
+        CHECK(authority.retention.prefix_tracking_available());
         // The host now owns only the marginal full-snapshot allocation. Every
         // checkpoint plane remains resident through the live aliases and is
         // therefore credited with zero host-cache release bytes.
         CHECK(cache.size() == 32);
+        auto source_checkpoint = cache.states.front().prompt.checkpoints.begin();
         for (const auto & checkpoint : live.checkpoints) {
             server_retention_candidate candidate;
+            const auto key = server_retention_instance_key::for_checkpoint(
+                100 + trial, &checkpoint);
+            CHECK(authority.retention.candidate_for_instance(
+                key, candidate));
+            CHECK(candidate.release_ops.size() == 4);
+            CHECK(candidate.record.stamp.coverage_tokens ==
+                  uint64_t(checkpoint.n_tokens));
+            server_retention_checkpoint_inventory inventory;
+            CHECK(authority.retention.checkpoint_inventory(key, inventory));
+            CHECK(inventory.identity_known);
+            CHECK(inventory.release_owned);
+            server_retention_candidate source_candidate;
             CHECK(authority.retention.candidate_for_instance(
                 server_retention_instance_key::for_checkpoint(
-                    100 + trial, &checkpoint), candidate));
-            CHECK(candidate.release_ops.size() == 4);
+                    -1, &*source_checkpoint), source_candidate));
+            CHECK(candidate.artifact_id != source_candidate.artifact_id);
+            CHECK(source_candidate.record.stamp.coverage_tokens ==
+                  candidate.record.stamp.coverage_tokens);
+            ++source_checkpoint;
         }
         authority.retention.retire_slot(100 + trial);
         CHECK(cache.size() == 32 + 8 * checkpoint_plane_bytes);
@@ -3913,6 +4135,226 @@ void test_host_load_short_prefix_clone_fault() {
                     CHECK(selected->lcp_tokens.value == shape.prefix);
                     CHECK(!selected->delivered);
                 }
+            }
+        }
+    }
+}
+
+void test_recurrent_reusable_prefix() {
+    CHECK(server_prompt_checkpoint_reuse_threshold(4, 0, true) == 4);
+    CHECK(server_prompt_checkpoint_reuse_threshold(4, 0, false) == 3);
+    // a window of 2 at the final token 3 holds keys 2 and 3
+    CHECK(server_prompt_checkpoint_reuse_threshold(4, 2, false) == 3);
+    CHECK(server_prompt_checkpoint_reuse_threshold(4, 8, true) == 1);
+    CHECK(server_prompt_checkpoint_reuse_threshold(4, 8, false) == 1);
+    // the window a live cache prunes to: query 3047 keeps keys 2536..3046
+    CHECK(server_prompt_checkpoint_reuse_threshold(3047, 512, true) == 2537);
+    server_prompt prompt;
+    prompt.tokens = server_tokens(llama_tokens { 1, 2, 3, 4, 5, 6 }, false);
+    const server_tokens incoming(llama_tokens { 1, 2, 3, 4, 9 }, false);
+    server_prompt_cache_reuse_context context;
+    context.execution_identity = "execution";
+    const auto reusable = [&](size_t lcp, llama_pos pos_min) {
+        return server_prompt_cache_reusable_prefix(
+            prompt, incoming, lcp, pos_min, context, "adapter");
+    };
+    context.n_swa = 8;
+    CHECK(reusable(4, 0) == 4); // the window has not filled; all required keys exist
+    CHECK(reusable(4, 1) == 0); // key zero is missing
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, prompt.tokens, prompt.tokens.size(), 0, context, "adapter") == prompt.tokens.size());
+    context.n_swa = 0;
+    CHECK(reusable(0, 5) == 0);
+    CHECK(reusable(4, -1) == 0); // token ledger without state
+    CHECK(reusable(4, 3) == 4);  // directly appendable
+    CHECK(reusable(4, 5) == 0);  // no recurrent rewind available
+    prompt.checkpoints.emplace_back();
+    auto & checkpoint = prompt.checkpoints.back();
+    checkpoint.n_tokens = 2;
+    checkpoint.pos_min = checkpoint.pos_max = 1;
+    CHECK(reusable(4, 5) == 0); // empty payload
+    fill_checkpoint_bytes(checkpoint.data_tgt, 8, 1);
+    CHECK(reusable(4, 5) == 2);
+    checkpoint.pos_min = checkpoint.pos_max = 4;
+    checkpoint.n_tokens = 5;
+    CHECK(reusable(4, 5) == 0); // checkpoint is beyond divergence
+    checkpoint.pos_min = checkpoint.pos_max = 3;
+    checkpoint.n_tokens = 4;
+    CHECK(reusable(4, 5) == 4); // boundary is inclusive in token count
+    checkpoint.checkpoint_epoch = 1;
+    CHECK(reusable(4, 5) == 0);
+    context.vbr_state.checkpoint_epoch = 1;
+    CHECK(reusable(4, 5) == 4); // dynamic VBR uses the live lineage, not zeros
+    context.vbr_state = {};
+    checkpoint.checkpoint_epoch = 0;
+    context.frontier_required = true;
+    CHECK(reusable(4, 5) == 0); // missing sealed frontier
+    prompt.sequence_epoch = 7;
+    auto & frontier = checkpoint.computation_frontier;
+    frontier.version = common_computation_frontier::VERSION;
+    frontier.sequence_epoch = 7;
+    frontier.token_count = 4;
+    frontier.next_position = 4;
+    frontier.execution_identity = "execution";
+    frontier.adapter_config_identity = "adapter";
+    CHECK(prompt.tokens.media_content_identity(4, frontier.media_content_identity));
+    CHECK(reusable(4, 5) == 4);
+    frontier.sequence_epoch++;
+    CHECK(reusable(4, 5) == 0);
+    frontier.sequence_epoch--;
+    frontier.adapter_config_identity = "other";
+    CHECK(reusable(4, 5) == 0);
+    frontier.adapter_config_identity = "adapter";
+    frontier.media_content_identity = "other";
+    CHECK(reusable(4, 5) == 0);
+
+    context.frontier_required = false;
+    const server_tokens exact(llama_tokens { 1, 2, 3, 4 }, false);
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, exact, 4, 5, context, "adapter") == 0);
+    // Do not fall through to an older checkpoint: execution would choose the
+    // full frontier first, then fail its final-token rollback after import.
+    common_prompt_checkpoint earlier;
+    earlier.n_tokens = 2;
+    earlier.pos_min = earlier.pos_max = 1;
+    fill_checkpoint_bytes(earlier.data_tgt, 8, 1);
+    prompt.checkpoints.insert(prompt.checkpoints.begin(), std::move(earlier));
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, exact, 4, 5, context, "adapter") == 0);
+
+    server_prompt_cache cache(0, 0);
+    auto host = make_prompt_entry("adapter", { 1, 2, 3, 4, 5, 6 });
+    host.front().fixed_pos_min = 5;
+    host.front().prompt = prompt.clone();
+    cache.states.splice(cache.states.end(), host);
+    server_prompt live = prompt.clone();
+    live.checkpoints.pop_back();
+    context.live_pos_min = 5;
+    CHECK(server_prompt_cache_reusable_prefix(live, exact, 4, 5, context, "adapter") == 2);
+    CHECK(cache.select(live, exact, "adapter", &context) == cache.states.end());
+
+    // A full token match still requires final-token evaluation; no checkpoint
+    // means this exact hit is not a usable recurrent restore.
+    prompt.checkpoints.clear();
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, prompt.tokens, 6, 5, context, "adapter") == 0);
+    const server_tokens append(llama_tokens { 1, 2, 3, 4, 5, 6, 7 }, false);
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, append, 6, 5, context, "adapter") == 6);
+    context.exact_frontier_logits = true;
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, prompt.tokens, 6, 5, context, "adapter") == 6);
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, prompt.tokens, 6, -1, context, "adapter") == 0);
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, exact, 4, 5, context, "adapter") == 0); // no logits shortcut on rewind
+}
+
+void test_recurrent_selection_survives_displacement_save(bool accounted) {
+    server_cache_authority authority;
+    configure_host_accounting(authority, accounted);
+    server_prompt_cache cache(0, 0);
+    cache.acct = &authority.ledger;
+    cache.publish_authority = &authority;
+    cache.retention_obs = &authority.retention;
+    cache.destruction_obs = &authority.destruction;
+    auto short_entry = make_prompt_entry("same", { 1, 2 });
+    short_entry.front().fixed_pos_min = 1;
+    server_prompt_cache::iterator source;
+    CHECK(cache.publish(std::move(short_entry), nullptr, -1, &source));
+    if (accounted) {
+        (void) publish_host_retention(authority, source);
+    }
+
+    auto displaced = make_prompt_entry("same", { 1, 2, 3, 4, 5, 6 });
+    displaced.front().fixed_pos_min = 5;
+    const auto live = displaced.front().prompt.clone();
+    const server_tokens incoming(llama_tokens { 1, 2, 3, 4, 99 }, false);
+    server_prompt_cache_reuse_context context;
+    context.live_pos_min = 5;
+    CHECK(cache.select(live, incoming, "same", &context) == source);
+    llama_cache_acct_artifact_id artifact;
+    std::vector<llama_cache_acct_op_id> ops;
+    server_cache_recovery_pin pin;
+    CHECK(cache.acquire_durable_recovery(source, artifact, ops, pin) == accounted);
+    CHECK(cache.publish(std::move(displaced)));
+    if (!accounted) {
+        // No durability proof: the save may deduplicate the selected source.
+        // Reselect from the new inventory rather than retaining its iterator.
+        CHECK(cache.states.size() == 1);
+        CHECK(cache.select(live, incoming, "same", &context) == cache.states.end());
+        return;
+    }
+    CHECK(cache.states.size() == 2);
+    CHECK(cache.select(live, incoming, "same", &context) == source);
+    CHECK(source->recovery_pins == 1);
+    pin = {};
+    CHECK(source->recovery_pins == 0);
+}
+
+void test_host_load_recurrent_selection() {
+    // Exercise the real observed/unobserved selector, stopping at clone
+    // staging before any GPU mutation. A selected host returns false here.
+    CHECK(server_fault("load_clone_fail"));
+    if (!server_fault("load_clone_fail")) {
+        return;
+    }
+    for (const bool observed : { false, true }) {
+        for (const int live_frontier : { 0, 2, 4, 6 }) {
+            server_cache_authority authority;
+            server_prompt_cache cache(0, 0);
+            cache.publish_authority = &authority;
+            auto short_entry = make_prompt_entry("same", { 1, 2, 3, 4 });
+            short_entry.front().fixed_pos_min = 3;
+            auto * useful = &short_entry.front();
+            cache.states.splice(cache.states.end(), short_entry);
+            // Larger LCP, but the recurrent image is after the divergence.
+            auto unusable = make_prompt_entry("same", { 1, 2, 3, 4, 5, 6, 7, 8, 100 });
+            unusable.front().fixed_pos_min = 8;
+            auto * longer = &unusable.front();
+            cache.states.splice(cache.states.end(), unusable);
+            auto wrong_adapter = make_prompt_entry("other", { 1, 2, 3, 4, 5, 6, 7, 8 });
+            wrong_adapter.front().fixed_pos_min = 7;
+            cache.states.splice(cache.states.end(), wrong_adapter);
+            const server_tokens incoming(llama_tokens { 1, 2, 3, 4, 5, 6, 7, 8, 9 }, false);
+            server_prompt live;
+            live.tokens = server_tokens(llama_tokens { 1, 2, 3, 4, 5, 6, 7, 8, 50, 51 }, false);
+            if (live_frontier > 0) {
+                live.checkpoints.emplace_back();
+                auto & checkpoint = live.checkpoints.back();
+                checkpoint.n_tokens = live_frontier;
+                checkpoint.pos_min = checkpoint.pos_max = live_frontier - 1;
+                fill_checkpoint_bytes(checkpoint.data_tgt, 8, 1);
+            }
+            server_prompt_cache_reuse_context context;
+            context.live_pos_min = 9;
+            // Raw LCP ranking misses the useful shorter host in every arm.
+            CHECK(cache.select(live, incoming, "same", nullptr) == cache.states.end());
+            common_cache_plan_record rec;
+            server_prompt_cache_restore_shape shape;
+            const bool selected = live_frontier < 4;
+            CHECK(cache.load(live, incoming, nullptr, nullptr, 0, "same", shape,
+                observed ? &rec : nullptr, nullptr, &context) == !selected);
+            CHECK(shape == server_prompt_cache_restore_shape::none);
+            CHECK(live.n_tokens() == 10);
+            CHECK(cache.states.size() == 3);
+            if (observed) {
+                const auto * row = rec.selected_row(common_cache_plan_provider::host_cache_entry);
+                CHECK((row != nullptr) == selected);
+                if (row) {
+                    CHECK(row->source_id == useful->cache_plan_source_id);
+                    CHECK(row->lcp_tokens.value == 4);
+                    CHECK(!row->delivered);
+                }
+            }
+            if (live_frontier == 0) {
+                longer->prompt.checkpoints.emplace_back();
+                auto & checkpoint = longer->prompt.checkpoints.back();
+                checkpoint.n_tokens = 6;
+                checkpoint.pos_min = checkpoint.pos_max = 5;
+                fill_checkpoint_bytes(checkpoint.data_tgt, 8, 1);
+                CHECK(cache.select(live, incoming, "same", &context) ==
+                      std::next(cache.states.begin()));
             }
         }
     }
@@ -4592,6 +5034,70 @@ void test_checkpoint_capacity_floor() {
           common_cache_plan_destruction_reason::hard_lease_blocked);
 }
 
+void test_checkpoint_capacity_preserves_history() {
+    const auto geometry = [] (std::initializer_list<int64_t> frontiers) {
+        std::vector<server_cache_checkpoint_floor_input> inputs;
+        for (const auto frontier : frontiers) {
+            server_cache_checkpoint_floor_input input;
+            input.ordinal = uint32_t(inputs.size());
+            input.n_tokens = frontier;
+            inputs.push_back(input);
+        }
+        return inputs;
+    };
+    auto inputs = geometry({ 512, 1020, 4092, 4604 });
+    CHECK(server_cache_plan_checkpoint_capacity_floor(inputs).ordinal == 1);
+    inputs[1].protection = server_cache_checkpoint_protection::hard_lease;
+    CHECK(server_cache_plan_checkpoint_capacity_floor(inputs).ordinal == 2);
+    inputs[2].recovery_pinned = true;
+    CHECK(server_cache_plan_checkpoint_capacity_floor(inputs).ordinal == 3);
+    inputs[3].protection = server_cache_checkpoint_protection::seam_heuristic;
+    // An early anchor is only a preference, weaker than existing protections.
+    CHECK(server_cache_plan_checkpoint_capacity_floor(inputs).ordinal == 0);
+    inputs[0].protection = server_cache_checkpoint_protection::mandatory_anchor;
+    CHECK(server_cache_plan_checkpoint_capacity_floor(inputs).ordinal == 3);
+    inputs[3].recovery_pinned = true;
+    CHECK(!server_cache_plan_checkpoint_capacity_floor(inputs).selected);
+
+    CHECK(server_cache_plan_checkpoint_capacity_floor(geometry({ 512 })).ordinal == 0);
+    CHECK(server_cache_plan_checkpoint_capacity_floor(geometry({ 512, 1024 })).ordinal == 1);
+    CHECK(server_cache_plan_checkpoint_capacity_floor(geometry({ 0, 1024, 2048 })).ordinal == 0);
+    CHECK(server_cache_plan_checkpoint_capacity_floor(geometry({ 512, 512, 2048 })).ordinal == 0);
+    CHECK(server_cache_plan_checkpoint_capacity_floor(geometry({ 1024, 512, 2048 })).ordinal == 0);
+
+    // Repeated append-only turns used to FIFO-delete every early frontier.
+    // Keep the same count limit, an early anchor, and useful interior coverage
+    // under both a small ring and the production default size.
+    for (const size_t limit : { size_t(4), size_t(32) }) {
+        inputs.clear();
+        for (int64_t frontier = 512; frontier <= 65536; frontier += 512) {
+            if (inputs.size() == limit) {
+                const auto plan = server_cache_plan_checkpoint_capacity_floor(inputs);
+                CHECK(plan.selected);
+                CHECK(plan.ordinal > 0 && plan.ordinal < inputs.size());
+                if (!plan.selected || plan.ordinal >= inputs.size()) {
+                    break;
+                }
+                inputs.erase(inputs.begin() + plan.ordinal);
+            }
+            server_cache_checkpoint_floor_input incoming;
+            incoming.n_tokens = frontier;
+            inputs.push_back(incoming);
+            for (size_t i = 0; i < inputs.size(); ++i) {
+                inputs[i].ordinal = uint32_t(i);
+                inputs[i].protection = i + 1 == inputs.size()
+                    ? server_cache_checkpoint_protection::seam_heuristic
+                    : server_cache_checkpoint_protection::none;
+            }
+            CHECK(inputs.size() <= limit);
+            CHECK(inputs.front().n_tokens == 512);
+            CHECK(inputs.back().n_tokens == frontier);
+        }
+        CHECK(inputs.size() == limit);
+        CHECK(inputs[1].n_tokens < inputs.back().n_tokens - 1024);
+    }
+}
+
 void test_checkpoint_attempt_latch_rearms_on_ring_change() {
     server_cache_checkpoint_attempt_latch latch;
     uint64_t full_computations = 0;
@@ -5015,6 +5521,7 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::string(argv[1]) == "--clone-fault") {
         test_lifecycle_restore_clone_fault();
         test_host_load_short_prefix_clone_fault();
+        test_host_load_recurrent_selection();
         llama_backend_free();
         if (failures == 0) {
             std::puts("test-server-prompt-cache: CLONE_FAULT_PASS");
@@ -5043,6 +5550,7 @@ int main(int argc, char ** argv) {
     test_active_storage_budget();
     CHECK(server_active_prefix_retention_for_test());
     test_idle_capture_session_cancellation();
+    test_displacement_capture_session();
     test_idle_capture_refuses_active_queue_yield();
     test_queue_yield_work_exception_precedes_callback_exception();
     test_speculative_decode_terminals();
@@ -5065,6 +5573,8 @@ int main(int argc, char ** argv) {
     test_lifecycle_defaults_and_reuse_thresholds();
     test_slot_prompt_admission_boundaries();
     test_lifecycle_shadow_prefix_failure_does_not_change_authority();
+    test_vbr_stem_retains_source_turn_geometry(common_retention_pool::attention);
+    test_vbr_stem_retains_source_turn_geometry(common_retention_pool::recurrent);
     test_lifecycle_retention_capacity_executes_decayed_fallback();
     test_lifecycle_retention_capacity_accounting_fault_falls_back_to_fifo();
     test_lifecycle_retention_capacity_handles_incoming_publication();
@@ -5077,9 +5587,13 @@ int main(int argc, char ** argv) {
     test_lifecycle_retention_capacity_cold_start_prior_ages_to_recency();
     test_declared_family_round_trip();
     test_checkpoint_lineage_ignores_retier_but_rejects_content_change();
+    test_checkpoint_host_stem_lifecycle();
     test_checkpoint_draft_restore_refuses_without_context();
     test_checkpoint_suffix_trim_rebases_only_preserved_prefixes();
     test_lifecycle_restore_retains_immutable_source();
+    test_recurrent_reusable_prefix();
+    test_recurrent_selection_survives_displacement_save(false);
+    test_recurrent_selection_survives_displacement_save(true);
     test_implicit_soft_append_chain_is_bounded();
     test_durable_recovery_binds_exact_published_peer();
     test_displacement_save_order_preserves_prefix_recovery();
@@ -5100,6 +5614,7 @@ int main(int argc, char ** argv) {
     test_host_trade_partial_substrate_is_typed();
     test_checkpoint_capacity_skips_pinned_member();
     test_checkpoint_capacity_floor();
+    test_checkpoint_capacity_preserves_history();
     test_checkpoint_attempt_latch_rearms_on_ring_change();
     test_checkpoint_effect_matrix_consistency();
     test_live_checkpoint_payload_ownership();

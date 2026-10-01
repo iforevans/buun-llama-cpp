@@ -143,7 +143,7 @@ namespace cutlass {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#if (201700L <= __cplusplus)
+#if (201700L <= __cplusplus) || (defined(_MSVC_LANG) && (201700L <= _MSVC_LANG))
 #define CUTLASS_CONSTEXPR_IF_CXX17 constexpr
 #define CUTLASS_CXX17_OR_LATER 1
 #else

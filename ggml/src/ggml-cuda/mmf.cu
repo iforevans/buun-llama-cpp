@@ -120,6 +120,27 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         case GGML_TYPE_BF16: {
             const nv_bfloat162 * src0_d = (const nv_bfloat162 *) src0->data;
             constexpr int vals_per_T = 2;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            // A narrow HC projection underfills Blackwell with 32 output rows
+            // per block. Halve the row tile without changing the dot reduction.
+            if (!ids && cc == GGML_CUDA_CC_BLACKWELL && blackwell_mma_available(cc) &&
+                    ne00 == 10240 && ne01 == 320 && ne02*ne03 == 1 && ne12*ne13 == 1 &&
+                    ncols_dst >= 2 && ncols_dst <= 4 &&
+                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+                const auto narrow = [&](auto columns) {
+                    mul_mat_f_cuda<nv_bfloat162, 16, decltype(columns)::value>(
+                        src0_d, src1_d, nullptr, dst_d, ne00/2, ne01, ncols_dst, s01/2, stride_col_y/2,
+                        stride_col_dst, 0, 0, ne02, nchannels_y, nchannels_dst, s02/2,
+                        stride_channel_y, stride_channel_dst, ne03, ne3, s03/2, s13, s3, ctx.stream(), nullptr);
+                };
+                switch (ncols_dst) {
+                    case 2: narrow(std::integral_constant<int, 2>{}); break;
+                    case 3: narrow(std::integral_constant<int, 3>{}); break;
+                    case 4: narrow(std::integral_constant<int, 4>{}); break;
+                }
+                break;
+            }
+#endif
             mul_mat_f_switch_rows_per_block<nv_bfloat162>(
                 rows_per_block, src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y/vals_per_T, stride_col_dst,
                 ids_s0, ids_s1, ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,

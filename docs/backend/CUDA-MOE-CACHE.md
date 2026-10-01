@@ -41,6 +41,12 @@ The cache only sees experts assigned to host memory. Cache-aware fit uses a no-a
 
 The cache considers only CUDA backends selected for the scheduler. It does not discover or use an unselected device.
 
+Tensor-split fit can keep dense weights sharded while moving routed experts to CPU
+memory, including when an MTP sidecar is present. Required draft weights, context,
+and compute buffers are included before accepting the placement or pricing cache
+capacity. A draft pinned to one member GPU is charged against the balanced fit's
+tightest-device budget, not averaged across the GPUs.
+
 ## Eligibility and allocation
 
 With default settings, a node must satisfy all of these conditions:
@@ -48,7 +54,7 @@ With default settings, a node must satisfy all of these conditions:
 - The operation is the regular CPU `MUL_MAT_ID` path with F32 activations, optionally in an exact supported gate/up/SwiGLU subgraph.
 - The weight tensor name contains `_exps`.
 - The weight type is supported by the CUDA quantized matvec kernel.
-- One expert meets the selected devices' effective size floor. The default is 512 KiB when every selected device is compute capability 8.0 or newer and 1 MiB otherwise. An explicit threshold remains authoritative.
+- One expert meets the selected devices' effective size floor: 256 KiB on SM75 (Turing), 512 KiB on Ampere and newer or HIP, and 1 MiB on older supported CUDA devices. Mixed devices use the largest applicable floor. EXL3 uses 128 KiB; Q2_0 halves the ordinary floor to account for its compact codes. An explicit threshold remains authoritative.
 - The graph node contains no more than the configured maximum token batch and no more than 64 routed rows. The default maximum is ten tokens in every active mode.
 - The selected device can hold a pool of at least 64 experts of that shape. Entries are aggregated across same-shape tensors, so an individual tensor may contain fewer than 64 experts.
 - In `auto`, at least one selected device has 1 GiB available for aggregate cache slabs after dispatch scratch. Forced modes retain the 64-slot floor for explicit capacity experiments.
@@ -235,7 +241,7 @@ The following environment variables are implementation controls, not a stable co
 | Variable | Default | Meaning |
 | --- | ---: | --- |
 | `GGML_CUDA_MOE_CACHE_RESERVE_MB` | hardware dependent | VRAM left outside the cache on each device; automatic policy uses 6% rounded to 128 MiB, clamped to 1024--3072 MiB and at most 25% |
-| `GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB` | type/hardware dependent | Minimum bytes per expert, in KiB; EXL3 uses `128`, ordinary types use `512` when all selected devices are compute capability 8.0 or newer and `1024` otherwise |
+| `GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB` | type/hardware dependent | Minimum bytes per expert, in KiB; ordinary types use `256` on SM75, `512` on Ampere/newer or HIP, and `1024` on older supported CUDA devices. Mixed devices use the largest floor; EXL3 uses `128`, Q2_0 halves the ordinary floor. An explicit value overrides these defaults. |
 | `GGML_CUDA_MOE_CACHE_MAX_BATCH` | `10` | Maximum tokens in an eligible node |
 | `GGML_CUDA_MOE_CACHE_INSERTS` | `8` (`16` with expert parallelism) | Maximum admissions per node |
 | `GGML_CUDA_MOE_CACHE_ADMIT_AFTER` | adaptive | Override the initial miss count; by default it is `1` for complete pools and `2` for capacity-constrained pools |

@@ -1007,6 +1007,22 @@ public:
         output.state_serial = cache->vbr_representation_epoch_;
         output.policy_epoch = policy_epoch;
         output.controller_policy = source_policy;
+        const llama_pos last = package.manifest().identity.next_position - 1;
+        if (tree_child.window && last > 0) {
+            // the mask is monotone in p0 below the query position
+            llama_pos lo = 0;
+            llama_pos hi = last;
+            while (lo < hi) {
+                const llama_pos mid = lo + (hi - lo)/2;
+                if (llama_hparams::is_masked_swa(
+                        cache->n_swa, cache->swa_type, mid, last)) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            output.window_live_from = lo;
+        }
 
         for (const auto & source_unit : package.units()) {
             const auto & descriptor = source_unit.descriptor;
@@ -1388,12 +1404,14 @@ public:
             vbr_import_destination_projection & output,
             uint64_t selected_frontier,
             uint64_t incoming_cells,
+            uint64_t resident_cells,
             llama_seq_id destination) noexcept {
         output = {};
         try {
             struct child_state {
                 llama_kv_cache * cache = nullptr;
                 uint32_t restore_watermark = 0;
+                uint32_t recycle_watermark = 0;
                 vbr_import_destination_child input;
                 llama_kv_cache::vbr_import_destination_pricing pricing;
                 std::vector<llama_memory_vbr_physical_growth> physical;
@@ -1411,10 +1429,32 @@ public:
                     tree_child.child_id].wm_cells;
                 const uint64_t frontier = selected_frontier != 0
                     ? selected_frontier : parent_wm;
-                const uint64_t prefix_cells = selected_frontier != 0
-                    ? selected_frontier : package.manifest().token_block.tokens.size();
+                // Co-resident rows arrive inside the same image: they are
+                // occupancy on both sides, never suffix growth.
+                const uint64_t prefix_cells = resident_cells + (selected_frontier != 0
+                    ? selected_frontier : package.manifest().token_block.tokens.size());
+                const uint64_t occupancy = std::max(prefix_cells, incoming_cells + resident_cells);
                 if (parent_wm == 0 || parent_wm > UINT32_MAX || frontier == 0 ||
-                    frontier > parent_wm || incoming_cells > UINT32_MAX || prefix_cells > UINT32_MAX) {
+                    frontier > parent_wm || resident_cells > UINT32_MAX || incoming_cells > UINT32_MAX ||
+                    occupancy > UINT32_MAX) {
+                    return false;
+                }
+                // Whole imports preserve authenticated physical placements;
+                // prefix projections compact their selected rows. Backing can
+                // extend past the last occupied row and is not an append head.
+                uint64_t source_high_water = selected_frontier;
+                if (selected_frontier == 0) {
+                    for (const auto & placement : package.manifest().stream_placements) {
+                        if (placement.child_id != tree_child.child_id) {
+                            continue;
+                        }
+                        for (const auto & cell : placement.cells) {
+                            source_high_water = std::max(source_high_water,
+                                uint64_t(cell.physical_cell) + 1);
+                        }
+                    }
+                }
+                if (source_high_water == 0 || source_high_water > frontier) {
                     return false;
                 }
                 // Price the destination for the incoming request, not the
@@ -1423,11 +1463,13 @@ public:
                 child_state state;
                 state.cache = tree_child.attention;
                 const uint32_t wm = state.cache->vbr_import_watermark_cells(
-                    uint32_t(std::max(prefix_cells, incoming_cells)), uint32_t(prefix_cells),
-                    0, destination);
+                    uint32_t(occupancy), uint32_t(prefix_cells), 0, destination);
                 state.restore_watermark = state.cache->vbr_import_watermark_cells(
-                    uint32_t(std::max(prefix_cells, incoming_cells)), uint32_t(prefix_cells),
-                    uint32_t(frontier), destination);
+                    uint32_t(occupancy), uint32_t(prefix_cells), uint32_t(source_high_water),
+                    destination, uint32_t(frontier));
+                state.recycle_watermark = state.cache->vbr_import_watermark_cells(
+                    uint32_t(occupancy), uint32_t(prefix_cells), uint32_t(source_high_water),
+                    destination, uint32_t(frontier), true);
                 if (!state.cache->vbr_import_destination_input(
                         uint32_t(wm), state.input) ||
                     !state.cache->vbr_import_destination_pricing_begin(
@@ -1536,6 +1578,25 @@ public:
                 }
                 if (!actual.build()) { return false; }
                 if (!actual.preflight().fits) {
+                    // Logical free cells need not be affordable VBR backing.
+                    // Try the existing single-attention occupied recycle route
+                    // at the SAME selected precision, never a lower tier to pay
+                    // for temporary placement. The guard proves ownership and
+                    // recovery before it can consume this strategy.
+                    if (children.size() == 1 && children.front().recycle_watermark != 0) {
+                        auto & child = children.front();
+                        const auto recycled = child.cache->vbr_import_destination_preflight(
+                            output.final_types.front(), child.recycle_watermark, &child.physical);
+                        if (recycled.active && recycled.fits) {
+                            output.recycle_incumbent = true;
+                            output.logical_bytes_needed = recycled.bytes_needed;
+                            output.logical_bytes_available = recycled.bytes_available;
+                            output.physical_growth_needed = recycled.physical_growth_needed;
+                            output.physical_growth_available = recycled.physical_growth_available;
+                            output.max_deficit = recycled.max_deficit;
+                            return vbr_import_destination_projection_coherent(inputs, output);
+                        }
+                    }
                     output.status = vbr_import_destination_status::exhausted;
                     output.max_deficit = actual.preflight().max_deficit;
                 }
@@ -1557,9 +1618,10 @@ public:
             vbr_import_schedule_quote & quote,
             uint64_t selected_frontier,
             uint64_t incoming_cells,
+            uint64_t resident_cells,
             llama_seq_id destination) noexcept {
         return project_import_destination(tree, package, quote.destination_,
-            selected_frontier, incoming_cells, destination);
+            selected_frontier, incoming_cells, resident_cells, destination);
     }
 
     static bool capture_metadata(
@@ -1824,7 +1886,7 @@ public:
                     return false;
                 }
                 if (shard.stash_bytes != 0 && !allow_clean_stash) {
-                    status = vbr_explicit_capture_status::unsupported_layout;
+                    status = vbr_explicit_capture_status::projected_stash_requires_exact;
                     return false;
                 }
                 total_columns += shard.columns;
@@ -2011,6 +2073,37 @@ public:
     static bool stable(const child & value) {
         return value.cache != nullptr &&
                value.cache->vbr_capture_stability_matches(value.stability);
+    }
+
+    static bool same_attention(const child & saved, const child & live) {
+        if (saved.cache != live.cache || saved.child_id != live.child_id ||
+            saved.units.size() != live.units.size() || !stable(saved) || !stable(live)) {
+            return false;
+        }
+        // Stability covers the controller instance, mutation serial, tier,
+        // tensor addresses/offsets and stash ownership. Also require the new
+        // size pass to read exactly the same byte ranges in the same order.
+        for (size_t i = 0; i < saved.units.size(); ++i) {
+            const auto & a = saved.units[i];
+            const auto & b = live.units[i];
+            if (a.logical_unit != b.logical_unit || a.is_v != b.is_v ||
+                a.capture_index != b.capture_index || a.n_stream != b.n_stream ||
+                a.unified != b.unified || a.wm_cells != b.wm_cells ||
+                a.shards.size() != b.shards.size()) {
+                return false;
+            }
+            for (size_t j = 0; j < a.shards.size(); ++j) {
+                const auto & x = a.shards[j];
+                const auto & y = b.shards[j];
+                if (x.pool != y.pool || x.extent != y.extent ||
+                    x.shard_index != y.shard_index || x.payload_bytes != y.payload_bytes ||
+                    x.row_bytes != y.row_bytes || x.columns != y.columns ||
+                    x.stash_bytes != y.stash_bytes) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     static bool occupied_observation(
@@ -2225,9 +2318,32 @@ static bool import_target_snapshot_core(
     std::array<uint8_t, 32> * transform_tree_digest = nullptr,
     const std::vector<llama_memory_tree_child> * canonical_tree = nullptr,
     uint64_t selected_frontier = 0,
-    uint64_t incoming_cells = 0)
+    uint64_t incoming_cells = 0,
+    uint64_t resident_cells = 0)
     noexcept;
 
+// The one attention child of a tree an occupied guard supports: at most one
+// recurrent child beside it and nothing else.
+static llama_kv_cache * occupied_tree_attention(
+        const std::vector<llama_memory_tree_child> & tree) noexcept {
+    const auto attention = std::find_if(
+        tree.begin(), tree.end(), [](const auto & child) {
+            return child.attention != nullptr && child.recurrent == nullptr;
+        });
+    if (attention == tree.end() ||
+        std::count_if(tree.begin(), tree.end(), [](const auto & child) {
+            return child.attention != nullptr;
+        }) != 1 ||
+        std::count_if(tree.begin(), tree.end(), [](const auto & child) {
+            return child.recurrent != nullptr;
+        }) > 1 ||
+        std::any_of(tree.begin(), tree.end(), [](const auto & child) {
+            return child.attention == nullptr && child.recurrent == nullptr;
+        })) {
+        return nullptr;
+    }
+    return attention->attention;
+}
 
 vbr_occupied_replacement_guard_status
 vbr_explicit_prepare_occupied_replacement_guard(
@@ -2249,20 +2365,8 @@ vbr_explicit_prepare_occupied_replacement_guard(
         if (!llama_memory_tree_collect(&memory, tree)) {
             return vbr_occupied_replacement_guard_status::unsupported_tree;
         }
-        const auto attention = std::find_if(
-            tree.begin(), tree.end(), [](const auto & child) {
-                return child.attention != nullptr && child.recurrent == nullptr;
-            });
-        if (attention == tree.end() ||
-            std::count_if(tree.begin(), tree.end(), [](const auto & child) {
-                return child.attention != nullptr;
-            }) != 1 ||
-            std::count_if(tree.begin(), tree.end(), [](const auto & child) {
-                return child.recurrent != nullptr;
-            }) > 1 ||
-            std::any_of(tree.begin(), tree.end(), [](const auto & child) {
-                return child.attention == nullptr && child.recurrent == nullptr;
-            })) {
+        auto * attention = occupied_tree_attention(tree);
+        if (!attention) {
             return vbr_occupied_replacement_guard_status::unsupported_tree;
         }
         vbr_target_validation_snapshot target;
@@ -2287,7 +2391,7 @@ vbr_explicit_prepare_occupied_replacement_guard(
         std::vector<vbr_occupied_replacement_unit_currency> units;
         vbr_occupied_replacement_observation observation;
         if (!vbr_live_capture_adapter::occupied_observation(
-                *attention->attention, destination,
+                *attention, destination,
                 recovery.manifest().identity.sequence_epoch,
                 cells, units, observation)) {
             return vbr_occupied_replacement_guard_status::unsupported_layout;
@@ -2317,13 +2421,90 @@ vbr_explicit_prepare_occupied_replacement_guard(
         }
         std::array<uint8_t, 32> direct;
         if (!vbr_live_capture_adapter::occupied_direct_currency_digest(
-                *attention->attention, destination, accounting_serial,
+                *attention, destination, accounting_serial,
                 representation_context, representation_identity, {}, direct)) {
             output.reset();
             return vbr_occupied_replacement_guard_status::currency_changed;
         }
         output.memory_ = &memory;
-        output.cache_ = attention->attention;
+        output.cache_ = attention;
+        output.direct_currency_digest_ = direct;
+        return status;
+    } catch (...) {
+        output.reset();
+        return vbr_occupied_replacement_guard_status::internal_error;
+    }
+}
+
+vbr_occupied_replacement_guard_status
+vbr_explicit_prepare_absent_insertion_guard(
+        llama_memory_i & memory,
+        llama_seq_id destination,
+        const vbr_artifact_package_view & incoming,
+        const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+        uint64_t accounting_serial,
+        const void * representation_context,
+        vbr_explicit_representation_identity_fn representation_identity,
+        vbr_occupied_replacement_guard & output,
+        const std::vector<vbr_target_companion_snapshot> *
+            external_companions) noexcept {
+    output.reset();
+    try {
+        std::vector<llama_memory_tree_child> tree;
+        if (!incoming || !llama_memory_tree_collect(&memory, tree)) {
+            return vbr_occupied_replacement_guard_status::unsupported_tree;
+        }
+        auto * attention = occupied_tree_attention(tree);
+        if (!attention) {
+            return vbr_occupied_replacement_guard_status::unsupported_tree;
+        }
+        // One pass yields both the live target and the incoming schedule
+        // quoted against it. The projection is unused, but without it a
+        // transforming schedule fails the snapshot instead of quoting as the
+        // tier_mismatch it is.
+        vbr_target_validation_snapshot target;
+        vbr_import_schedule_quote incoming_quote;
+        vbr_downward_policy_projection projection;
+        if (!import_target_snapshot_core(
+                memory, destination, incoming, bindings, true,
+                accounting_serial, representation_context,
+                representation_identity, target,
+                &projection, nullptr, &incoming_quote, nullptr, nullptr,
+                &tree)) {
+            return vbr_occupied_replacement_guard_status::representation_mismatch;
+        }
+        if (!target.destination_sequence_absent) {
+            return vbr_occupied_replacement_guard_status::destination_present;
+        }
+        if (!incoming_quote.destination().feasible()) {
+            return vbr_occupied_replacement_guard_status::capacity_unavailable;
+        }
+        if (external_companions) {
+            target.companions = *external_companions;
+        }
+        std::vector<vbr_occupied_replacement_cell> cells;
+        std::vector<vbr_occupied_replacement_unit_currency> units;
+        vbr_occupied_replacement_observation observation;
+        if (!vbr_live_capture_adapter::occupied_observation(
+                *attention, destination,
+                incoming.manifest().identity.sequence_epoch,
+                cells, units, observation)) {
+            return vbr_occupied_replacement_guard_status::unsupported_layout;
+        }
+        const auto status = vbr_prepare_absent_insertion_guard(
+            target, incoming, observation, output, &incoming_quote);
+        if (status != vbr_occupied_replacement_guard_status::ready) {
+            return status;
+        }
+        std::array<uint8_t, 32> direct;
+        if (!vbr_live_capture_adapter::occupied_direct_currency_digest(
+                *attention, destination, accounting_serial,
+                representation_context, representation_identity, {}, direct)) {
+            output.reset();
+            return vbr_occupied_replacement_guard_status::currency_changed;
+        }
+        output.memory_ = &memory;
+        output.cache_ = attention;
         output.direct_currency_digest_ = direct;
         return status;
     } catch (...) {
@@ -2509,7 +2690,58 @@ bool recurrent_target_empty(
            provider.target_empty(provider.context);
 }
 
+// An attention child whose rows a placement can name.
+bool co_resident_child(const llama_memory_tree_child & node) noexcept {
+    return node.qsa_index_owner == nullptr &&
+           node.dependency_mode ==
+               checkpoint_child_dependency_mode::live_guarded;
+}
+
 } // namespace
+
+bool vbr_explicit_pool_single_sequence(llama_memory_i & memory) noexcept {
+    try {
+        std::vector<llama_memory_tree_child> tree;
+        if (!llama_memory_tree_collect(&memory, tree)) {
+            return false;
+        }
+        return std::any_of(tree.begin(), tree.end(), [](const auto & node) {
+            return node.attention != nullptr && !co_resident_child(node);
+        });
+    } catch (...) {
+        return false;
+    }
+}
+
+bool vbr_explicit_co_resident_placements(
+        llama_memory_i & memory,
+        llama_seq_id sequence,
+        std::vector<vbr_artifact_stream_placement> & output) noexcept {
+    output.clear();
+    try {
+        std::vector<llama_memory_tree_child> tree;
+        if (!llama_memory_tree_collect(&memory, tree)) {
+            return false;
+        }
+        for (const auto & node : tree) {
+            if (node.attention == nullptr) {
+                continue;
+            }
+            vbr_artifact_stream_placement placement;
+            if (!co_resident_child(node) ||
+                !node.attention->vbr_sequence_placement(
+                    node.child_id, sequence, placement)) {
+                output.clear();
+                return false;
+            }
+            output.push_back(std::move(placement));
+        }
+        return !output.empty();
+    } catch (...) {
+        output.clear();
+        return false;
+    }
+}
 
 bool vbr_explicit_capture_runtime_pools(
         llama_memory_i & memory,
@@ -2681,7 +2913,8 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 recurrent_children.push_back(node.recurrent);
                 continue;
             }
-            if (node.attention == nullptr ||
+            // a projection packs rows from position 0, which a window no longer holds
+            if (node.attention == nullptr || node.window ||
                 !node.attention->vbr_operation_armed() ||
                 node.dependency_mode !=
                     checkpoint_child_dependency_mode::live_guarded) {
@@ -3891,14 +4124,15 @@ bool vbr_explicit_import_destination_preflight(
         const vbr_artifact_package_view & package,
         uint64_t selected_frontier,
         uint64_t incoming_cells,
-        vbr_import_destination_projection & output) noexcept {
+        vbr_import_destination_projection & output,
+        uint64_t resident_cells) noexcept {
     output = {};
     try {
         std::vector<llama_memory_tree_child> tree;
         return destination >= 0 && package &&
             llama_memory_tree_collect(&memory, tree) &&
             vbr_live_capture_adapter::project_import_destination(
-                tree, package, output, selected_frontier, incoming_cells, destination);
+                tree, package, output, selected_frontier, incoming_cells, resident_cells, destination);
     } catch (...) {
         return false;
     }
@@ -3994,7 +4228,8 @@ static bool import_target_snapshot_core(
         std::array<uint8_t, 32> * transform_tree_digest,
         const std::vector<llama_memory_tree_child> * canonical_tree,
         uint64_t selected_frontier,
-        uint64_t incoming_cells) noexcept {
+        uint64_t incoming_cells,
+        uint64_t resident_cells) noexcept {
     output = {};
     if (transform_projection) {
         *transform_projection = {};
@@ -4140,7 +4375,7 @@ static bool import_target_snapshot_core(
                 return false;
             }
             if (!vbr_live_capture_adapter::negotiate_import_destination(
-                    tree, package, *quote, selected_frontier, incoming_cells, destination)) {
+                    tree, package, *quote, selected_frontier, incoming_cells, resident_cells, destination)) {
                 output = {};
                 *quote = {};
                 return false;
@@ -4229,7 +4464,8 @@ vbr_explicit_import_target_schedule_snapshot(
         bool & downward_required,
         vbr_import_schedule_quote & schedule_quote,
         uint64_t selected_frontier,
-        uint64_t incoming_cells) noexcept {
+        uint64_t incoming_cells,
+        uint64_t resident_cells) noexcept {
     downward_projection = {};
     vbr_downward_policy_projection transform_projection;
     if (!import_target_snapshot_core(
@@ -4237,7 +4473,7 @@ vbr_explicit_import_target_schedule_snapshot(
         accounting_serial, representation_context, representation_identity,
         output, &transform_projection,
             &downward_required, &schedule_quote, nullptr, nullptr, nullptr,
-            selected_frontier, incoming_cells)) {
+            selected_frontier, incoming_cells, resident_cells)) {
         return vbr_import_target_snapshot_status::unavailable;
     }
     if (downward_required) {
@@ -4504,6 +4740,31 @@ bool vbr_explicit_capture_pretransfer_quote_admissible(
            (max_packed_bytes == 0 || packed <= max_packed_bytes);
 }
 
+struct vbr_explicit_attention_reuse::impl {
+    vbr_unit_version_sink * sink = nullptr;
+    std::vector<vbr_live_capture_adapter::child> children;
+    vbr_artifact_package_view package;
+};
+
+struct vbr_explicit_attention_reuse_access {
+    static const vbr_artifact_package_view * match(
+            const vbr_explicit_attention_reuse & reuse,
+            vbr_unit_version_sink * sink,
+            const std::vector<vbr_live_capture_adapter::child> & children) {
+        const auto * saved = reuse.impl_.get();
+        if (!saved || saved->sink != sink || saved->children.size() != children.size() ||
+            saved->package.validate_authenticated() != vbr_artifact_status::ok) {
+            return nullptr;
+        }
+        for (size_t i = 0; i < children.size(); ++i) {
+            if (!vbr_live_capture_adapter::same_attention(saved->children[i], children[i])) {
+                return nullptr;
+            }
+        }
+        return &saved->package;
+    }
+};
+
 struct vbr_explicit_capture_operation::impl {
     struct pending_companion {
         recurrent_companion_plan recurrent;
@@ -4513,6 +4774,7 @@ struct vbr_explicit_capture_operation::impl {
     };
 
     vbr_explicit_capture_request request;
+    vbr_unit_version_sink * sink = nullptr;
     std::vector<vbr_live_capture_adapter::child> children;
     std::vector<vbr_controller_instance_id> instances;
     vbr_artifact_package package;
@@ -4541,6 +4803,32 @@ bool vbr_explicit_capture_operation::ready_for_transfer() const noexcept {
 bool vbr_explicit_capture_operation::ready_for_publication() const noexcept {
     return impl_ && impl_->build && impl_->transferred && !impl_->published &&
         impl_->result.status == vbr_explicit_capture_status::ok;
+}
+
+bool vbr_explicit_capture_operation::retain_attention(
+        const vbr_artifact_package_view & package,
+        vbr_explicit_attention_reuse & output) const noexcept {
+    output.reset();
+    if (!impl_ || !impl_->published ||
+        impl_->result.status != vbr_explicit_capture_status::ok || !package ||
+        static_cast<vbr_unit_version_sink *>(package.owner_) != impl_->sink ||
+        package.reference_artifact().v != impl_->result.sink.reference_artifact.v ||
+        package.units().size() != impl_->package.unit_blobs.size() ||
+        package.validate_authenticated() != vbr_artifact_status::ok) {
+        return false;
+    }
+    try {
+        auto saved = std::make_shared<vbr_explicit_attention_reuse::impl>();
+        saved->sink = impl_->sink;
+        saved->children = impl_->children;
+        if (package.retain(saved->package) != vbr_artifact_resolve_status::ok) {
+            return false;
+        }
+        output.impl_ = std::move(saved);
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 void vbr_explicit_capture_operation::reset() noexcept {
@@ -5024,6 +5312,7 @@ vbr_explicit_capture_result vbr_prepare_explicit_manifest(
         auto prepared = std::make_unique<
             vbr_explicit_capture_operation::impl>();
         prepared->request = std::move(request);
+        prepared->sink = &sink;
         prepared->children = std::move(children);
         prepared->instances = std::move(instances);
         prepared->package = std::move(package);
@@ -5214,6 +5503,8 @@ vbr_explicit_capture_result vbr_transfer_explicit_manifest(
             vbr_artifact_companion_kind::_count;
 
         result.phase = vbr_explicit_capture_phase::unit_transfer;
+        const auto * reused = vbr_explicit_attention_reuse_access::match(
+            request.attention_reuse, state.sink, children);
         uint32_t unit_index = 0;
         for (const auto & child : children) {
             for (const auto & plan : child.units) {
@@ -5230,7 +5521,26 @@ vbr_explicit_capture_result vbr_transfer_explicit_manifest(
                     return result;
                 }
                 vbr_capture_stream_stats stats;
-                if (!vbr_live_capture_adapter::stream(
+                if (reused) {
+                    const auto & saved = reused->units().at(unit_index);
+                    for (bool stash : { false, true }) {
+                        const auto & shards = stash ? saved.stash_shards : saved.payload_shards;
+                        for (size_t shard = 0; shard < shards.size(); ++shard) {
+                            vbr_verified_segment segment;
+                            segment.unit_index = unit_index;
+                            segment.shard_index = uint32_t(shard);
+                            segment.clean_stash = stash;
+                            segment.bytes = shards[shard];
+                            segment.streaming_digest = vbr_capture_stream_digest(*segment.bytes);
+                            const auto accepted = unit->accept_verified_segment(segment);
+                            if (accepted != vbr_capture_stream_status::ok) {
+                                result.inner_stream_status = accepted;
+                                result.status = stream_status(accepted);
+                                return result;
+                            }
+                        }
+                    }
+                } else if (!vbr_live_capture_adapter::stream(
                         child, plan, *unit, *request.ring, stats,
                         request.continue_context,
                         request.continue_transfer)) {
@@ -5264,6 +5574,9 @@ vbr_explicit_capture_result vbr_transfer_explicit_manifest(
                     }
                     result.payload_bytes += shard.payload_bytes;
                     result.stash_bytes += shard.stash_bytes;
+                    if (reused) {
+                        result.reused_attention_bytes += shard.payload_bytes + shard.stash_bytes;
+                    }
                 }
                 ++unit_index;
             }
@@ -5449,6 +5762,7 @@ const char * vbr_explicit_capture_status_name(
         case vbr_explicit_capture_status::ok: return "ok";
         case vbr_explicit_capture_status::not_armed: return "not_armed";
         case vbr_explicit_capture_status::unsupported_layout: return "unsupported_layout";
+        case vbr_explicit_capture_status::projected_stash_requires_exact: return "projected_stash_requires_exact";
         case vbr_explicit_capture_status::slot_not_idle: return "slot_not_idle";
         case vbr_explicit_capture_status::identity_unavailable: return "identity_unavailable";
         case vbr_explicit_capture_status::generation_unavailable: return "generation_unavailable";

@@ -52,6 +52,7 @@ set(LLAMA_CORE_SOURCES
             llama-model.cpp
             llama-quant.cpp
             llama-sampler.cpp
+            llama-sha256.cpp
             llama-safetensors.cpp
             llama-safetensors-loader.cpp
             llama-safetensors-metadata.cpp

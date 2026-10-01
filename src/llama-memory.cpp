@@ -1,6 +1,7 @@
 #include "llama-memory.h"
 
 #include <algorithm>
+#include <stdexcept>
 
 llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_memory_status s1) {
     bool has_update = false;
@@ -340,4 +341,12 @@ uint64_t llama_memory_vbr_preflight_tree::merge_count() const noexcept {
 
 uint64_t llama_memory_vbr_preflight_tree::domain_comparison_count() const noexcept {
     return domain_comparison_count_;
+}
+
+void llama_memory_i::state_write_range(llama_io_write_i & /*io*/, llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/) const {
+    throw std::runtime_error("this memory type has no position-range state");
+}
+
+void llama_memory_i::state_append_range(llama_io_read_i & /*io*/, llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/, llama_pos /*p_limit*/) {
+    throw std::runtime_error("this memory type has no position-range state");
 }

@@ -30,6 +30,54 @@ def test_embedding_single():
     assert abs(sum([x ** 2 for x in res.body['data'][0]['embedding']]) - 1) < EPSILON
 
 
+def test_causal_embeddings_do_not_restore_chat_or_prior_embedding():
+    global server
+    server = ServerPreset.tinyllama2()
+    server.n_slots = 1
+    server.server_embeddings = True
+    server.server_slots = True
+    server.server_metrics = True
+    server.pooling = 'last'
+    server.start()
+    prompt = "Once upon a time, there was a small house near the forest."
+    cold = server.make_request("POST", "/v1/embeddings", data={"input": prompt})
+    assert cold.status_code == 200
+
+    def prompt_counters():
+        res = server.make_request("GET", "/metrics")
+        assert res.status_code == 200
+        return {
+            name: float(value) for name, value in
+            (line.split() for line in res.body.splitlines()
+             if line.startswith(("llamacpp:prompt_tokens_total ",
+                                 "llamacpp:prompt_tokens_cached_total ")))
+        }
+
+    chat = server.make_request("POST", "/completion", data={
+        "prompt": prompt, "n_predict": 1, "cache_prompt": True,
+    })
+    assert chat.status_code == 200
+    outputs = []
+    for _ in range(2):
+        before = prompt_counters()
+        res = server.make_request("POST", "/v1/embeddings", data={
+            "input": prompt, "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        outputs.append(res.body['data'][0]['embedding'])
+        slots = server.make_request("GET", "/slots")
+        assert slots.status_code == 200
+        assert slots.body[0]['n_prompt_tokens_cache'] == 0
+        # Stateless release clears per-slot stats. Global counters still record
+        # actual decode work, so a full replay cannot pass as a one-token hit.
+        after = prompt_counters()
+        processed = after['llamacpp:prompt_tokens_total'] - before['llamacpp:prompt_tokens_total']
+        assert processed == res.body['usage']['prompt_tokens']
+        assert processed > 1
+        assert after['llamacpp:prompt_tokens_cached_total'] == before['llamacpp:prompt_tokens_cached_total']
+    assert outputs[0] == outputs[1] == cold.body['data'][0]['embedding']
+
+
 def test_embedding_multiple():
     global server
     server.pooling = 'last'
@@ -83,6 +131,10 @@ def test_embedding_multiple_with_fa():
         (["string1", [12, 34, 56]], True),
         ([[12, 34, 56], [12, 34, 56]], True),
         ([[12, 34, 56], [12, "string", 34, 56]], True),
+        # object entries
+        ({"prompt_string": "string"}, False),
+        ({"content": [{"type": "text", "text": "string"}]}, False),
+        (["string1", {"prompt_string": "string2"}, {"content": [{"type": "text", "text": "string3"}]}], True),
     ]
 )
 def test_embedding_mixed_input(input, is_multi_prompt: bool):
@@ -99,6 +151,40 @@ def test_embedding_mixed_input(input, is_multi_prompt: bool):
     else:
         assert 'embedding' in data[0]
         assert len(data[0]['embedding']) > 1
+
+
+def test_embedding_content_text_same_as_string():
+    global server
+    server.pooling = 'last'
+    server.start()
+    res = server.make_request("POST", "/v1/embeddings", data={
+        "input": [
+            "hello world",
+            {"content": [{"type": "text", "text": "hello "}, {"type": "text", "text": "world"}]},
+        ],
+    })
+    assert res.status_code == 200
+    data = res.body['data']
+    assert data[0]['embedding'] == data[1]['embedding']
+
+
+@pytest.mark.parametrize(
+    "input",
+    [
+        [],
+        {"content": "string"},
+        {"content": [{"type": "unknown"}]},
+        # model is not multimodal
+        {"content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]},
+        {"content": [{"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}]},
+        {"content": [{"type": "input_video", "input_video": {"url": "data:video/mp4;base64,AAAA"}}]},
+    ]
+)
+def test_embedding_invalid_input(input):
+    global server
+    server.start()
+    res = server.make_request("POST", "/v1/embeddings", data={"input": input})
+    assert res.status_code != 200
 
 
 def test_embedding_pooling_mean():

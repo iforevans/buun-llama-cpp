@@ -143,18 +143,18 @@ full matrix is in
 | `-s, --seed SEED` | RNG seed (default: -1, use random seed for -1) |
 | `--sampler-seq, --sampling-seq SEQUENCE` | simplified sequence for samplers that will be used (default: edskypmxt) |
 | `--ignore-eos` | ignore end of stream token and continue generating (implies --logit-bias EOS-inf) |
-| `--temp, --temperature N` | temperature (default: 0.80) |
+| `--temp, --temperature N` | temperature (default: 0.80)<br/>(env: LLAMA_ARG_TEMPERATURE) |
 | `--top-k N` | top-k sampling (default: 40, 0 = disabled)<br/>(env: LLAMA_ARG_TOP_K) |
-| `--top-p N` | top-p sampling (default: 0.95, 1.0 = disabled) |
-| `--min-p N` | min-p sampling (default: 0.05, 0.0 = disabled) |
+| `--top-p N` | top-p sampling (default: 0.95, 1.0 = disabled)<br/>(env: LLAMA_ARG_TOP_P) |
+| `--min-p N` | min-p sampling (default: 0.05, 0.0 = disabled)<br/>(env: LLAMA_ARG_MIN_P) |
 | `--top-nsigma, --top-n-sigma N` | top-n-sigma sampling (default: -1.00, -1.0 = disabled) |
 | `--xtc-probability N` | xtc probability (default: 0.00, 0.0 = disabled) |
 | `--xtc-threshold N` | xtc threshold (default: 0.10, 1.0 = disabled) |
 | `--typical, --typical-p N` | locally typical sampling, parameter p (default: 1.00, 1.0 = disabled) |
 | `--repeat-last-n N` | last n tokens to consider for penalize (default: 64, 0 = disabled) |
-| `--repeat-penalty N` | penalize repeat sequence of tokens (default: 1.00, 1.0 = disabled) |
-| `--presence-penalty N` | repeat alpha presence penalty (default: 0.00, 0.0 = disabled) |
-| `--frequency-penalty N` | repeat alpha frequency penalty (default: 0.00, 0.0 = disabled) |
+| `--repeat-penalty N` | penalize repeat sequence of tokens (default: 1.00, 1.0 = disabled)<br/>(env: LLAMA_ARG_REPEAT_PENALTY) |
+| `--presence-penalty N` | repeat alpha presence penalty (default: 0.00, 0.0 = disabled)<br/>(env: LLAMA_ARG_PRESENCE_PENALTY) |
+| `--frequency-penalty N` | repeat alpha frequency penalty (default: 0.00, 0.0 = disabled)<br/>(env: LLAMA_ARG_FREQUENCY_PENALTY) |
 | `--dry-multiplier N` | set DRY sampling multiplier (default: 0.00, 0.0 = disabled) |
 | `--dry-base N` | set DRY sampling base value (default: 1.75) |
 | `--dry-allowed-length N` | set allowed length for DRY sampling (default: 2) |
@@ -210,7 +210,7 @@ full matrix is in
 | `-a, --alias STRING` | set model name aliases, comma-separated (to be used by API)<br/>(env: LLAMA_ARG_ALIAS) |
 | `--tags STRING` | set model tags, comma-separated (informational, not used for routing)<br/>(env: LLAMA_ARG_TAGS) |
 | `--embd-normalize N` | normalisation for embeddings (default: 2) (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm) |
-| `--host HOST` | ip address to listen, or bind to an UNIX socket if the address ends with .sock (default: 127.0.0.1)<br/>(env: LLAMA_ARG_HOST) |
+| `--host HOST` | IP addresses to listen on, comma-separated, or UNIX socket paths ending in .sock; with multiple TCP addresses, :: binds IPv6 only; overlapping addresses result in undefined behavior (default: 127.0.0.1)<br/>(env: LLAMA_ARG_HOST) |
 | `--port PORT` | port to listen (default: 8080)<br/>(env: LLAMA_ARG_PORT) |
 | `--reuse-port` | allow multiple sockets to bind to the same port (default: disabled)<br/>(env: LLAMA_ARG_REUSE_PORT) |
 | `--path PATH` | path to serve static files from (default: )<br/>(env: LLAMA_ARG_STATIC_PATH) |
@@ -246,6 +246,9 @@ full matrix is in
 | `--cache-plan-preflight` | expose trusted-local `POST /cache/plan` point-in-time previews (default: disabled)<br/>(env: LLAMA_ARG_CACHE_PLAN_PREFLIGHT) |
 | `--cache-control-api` | expose the trusted-local holder/family/lease control routes and enable their required cache-lifecycle authority (default: disabled)<br/>(env: LLAMA_ARG_CACHE_CONTROL_API) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
+| `--resume` | keep the slots' conversations across restarts and sleep: their KV state is saved at shutdown and restored at startup (default: disabled)<br/>(env: LLAMA_ARG_RESUME) |
+| `--resume-path PATH` | directory of the --resume store (default: the llama.cpp cache directory)<br/>(env: LLAMA_ARG_RESUME_PATH) |
+| `--resume-no-host-cache` | --resume for the slots only: the conversations held in the host prompt cache are neither saved nor restored, which keeps shutdown fast. Implies --resume (default: disabled)<br/>(env: LLAMA_ARG_RESUME_NO_HOST_CACHE) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
@@ -1263,6 +1266,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
 
+The file is one entry in the `--resume` format: the slot's KV state with its context checkpoints (hybrid and SWA models continue without reprocessing), checksummed per object. It works with the dynamic VBR cache (`-ctk vbr`) as well. The host prompt cache is not included; use `--resume` for that.
+
 **Response format**
 
 ```json
@@ -1282,6 +1287,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 *Options:*
 
 `filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter.
+
+Files written by earlier versions still restore on fixed cache types. Under the dynamic VBR cache only resume-format files restore. Beside other slots the restore needs the file's tiers to match the cache's and free cells to hold it, and the cache must not have sliding-window or indexed attention (otherwise `400`, the other slots untouched).
 
 **Response format**
 
@@ -1621,6 +1628,13 @@ This endpoint requires that the model uses a pooling different than type `none`.
 
 See [OpenAI Embeddings API documentation](https://platform.openai.com/docs/api-reference/embeddings).
 
+For multimodal models (loaded with `--mmproj`), each element of `input` can also be an object with a `content` array, using the same parts as `/v1/chat/completions`:
+- `{ "type": "text", "text": "..." }`: text is added to the prompt as-is
+- `{ "type": "image_url", "image_url": { "url": "..." } }`: remote URL, base64 data URI, or local file (`file://`, requires `--media-path`)
+- `{ "type": "input_audio", "input_audio": { "data": "..." } }` and `{ "type": "input_video", "input_video": { "url": "..." } }`: same as `/v1/chat/completions`, requires a model with audio or video support
+
+Each object gives one embedding. This input shape is not part of the OpenAI Embeddings API; it follows the shape used by providers like OpenRouter for vision embedding models.
+
 *Examples:*
 
 - input as string
@@ -1645,6 +1659,26 @@ See [OpenAI Embeddings API documentation](https://platform.openai.com/docs/api-r
   -d '{
           "input": ["hello", "world"],
           "model":"GPT-4",
+          "encoding_format": "float"
+  }'
+  ```
+
+- `input` as multimodal content
+
+  ```shell
+  curl http://localhost:8080/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer no-key" \
+  -d '{
+          "input": [
+              { "content": [
+                  { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/4AAQSkZJRg..." } },
+                  { "type": "text", "text": "Describe this image" }
+              ] },
+              { "content": [
+                  { "type": "text", "text": "hello" }
+              ] }
+          ],
           "encoding_format": "float"
   }'
   ```

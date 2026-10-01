@@ -326,6 +326,108 @@ static void test_bonsai_codecs() {
     assert(pq == ptq);
 }
 
+// Raw blocks cover every packed code byte and the entire signed activation
+// range, including -128 (not normally emitted by the float quantizer).
+static void test_q2_0_packed_dot() {
+    const auto * traits = ggml_get_type_traits_cpu(GGML_TYPE_Q2_0);
+    assert(ggml_blck_size(GGML_TYPE_Q2_0) == 64);
+    assert(ggml_type_size(GGML_TYPE_Q2_0) == 18);
+    assert(ggml_type_size(GGML_TYPE_Q8_0) == 34);
+    for (const int n : {64, 128, 192, 256, 320, 640, 2560, 32768}) {
+        std::vector<uint8_t> x(ggml_row_size(GGML_TYPE_Q2_0, n));
+        std::vector<uint8_t> y(ggml_row_size(GGML_TYPE_Q8_0, n));
+        for (int pattern = 0; pattern < 256; ++pattern) {
+            float expected = 0.0f;
+            for (int block = 0; block < n / 64; ++block) {
+                const float dx = (block % 5 == 4) ? 0.0f : 0.25f;
+                const ggml_fp16_t dxh = ggml_fp32_to_fp16(dx);
+                memcpy(x.data() + block * 18, &dxh, 2);
+                float partial = 0.0f;
+                for (int chunk = 0; chunk < 2; ++chunk) {
+                    const float dy = chunk == 0 ? 0.5f : -2.0f;
+                    const ggml_fp16_t dyh = ggml_fp32_to_fp16(dy);
+                    uint8_t * qy = y.data() + (block * 2 + chunk) * 34;
+                    memcpy(qy, &dyh, 2);
+                    int dot = 0;
+                    for (int b = 0; b < 8; ++b) {
+                        const uint8_t packed = uint8_t(pattern + block * 13 + b * 17);
+                        x[block * 18 + 2 + chunk * 8 + b] = packed;
+                        for (int j = 0; j < 4; ++j) {
+                            const int value = ((pattern + block * 31 + chunk * 97 + b * 4 + j) & 255) - 128;
+                            qy[2 + b * 4 + j] = uint8_t(value);
+                            dot += (((packed >> (2 * j)) & 3) - 1) * value;
+                        }
+                    }
+                    partial += dy * dot;
+                }
+                expected += dx * partial;
+            }
+            float actual = NAN;
+            traits->vec_dot(n, &actual, 0, x.data(), 0, y.data(), 0, 1);
+            assert(actual == expected);
+        }
+    }
+}
+
+// Repeated expert routes exercise multi-row reuse, including incomplete groups.
+// Compare with ordinary dots on the same packed bytes, not a second graph that
+// could take the same optimized route and hide an indexing or rounding error.
+static void test_q2_0_repeated_experts() {
+    const auto * traits = ggml_get_type_traits_cpu(GGML_TYPE_Q2_0);
+    for (int n : {64, 320, 640, 2560, 16384, 16448}) {
+        for (int columns : {7, 33, 257}) for (int rows : {1, 2, 3, 4, 5, 8, 9}) for (int lanes : {1, 2}) for (bool from_f32 : {false, true}) {
+            // Span several output-column work chunks and leave a partial tail.
+            if (columns == 257 && n != 640 && n != 2560) continue;
+            ggml_context * ctx = ggml_init({4*1024*1024, nullptr, false});
+            assert(ctx);
+            ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, n, columns, 2);
+            ggml_tensor * quantized_acts = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, n, lanes, rows);
+            ggml_tensor * acts = quantized_acts;
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, rows);
+            auto * x = static_cast<uint8_t *>(weights->data);
+            auto * y = static_cast<uint8_t *>(acts->data);
+            for (size_t i = 0; i < ggml_nbytes(weights); i += 18) {
+                const ggml_fp16_t scale = ggml_fp32_to_fp16(float(int(i % 97) - 48)*0.00317f);
+                memcpy(x + i, &scale, 2);
+                for (int j = 2; j < 18; ++j) x[i + j] = uint8_t(i*17 + j*29);
+            }
+            for (size_t i = 0; i < ggml_nbytes(acts); i += 34) {
+                const ggml_fp16_t scale = ggml_fp32_to_fp16(float(int(i % 43) - 21)*0.00291f);
+                memcpy(y + i, &scale, 2);
+                for (int j = 2; j < 34; ++j) y[i + j] = uint8_t(i*13 + j*19);
+            }
+            if (from_f32) {
+                acts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, lanes, rows);
+                ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(y, static_cast<float *>(acts->data), ggml_nelements(acts));
+                // The reference uses the same quantized bytes as the worker
+                // conversion, independently of how its blocks are partitioned.
+                ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float(static_cast<float *>(acts->data), y, ggml_nelements(acts));
+            }
+            auto * routes = static_cast<int32_t *>(ids->data);
+            for (int i = 0; i < 2*rows; ++i) routes[i] = (i + i/2) % 2;
+            ggml_tensor * out = ggml_mul_mat_id(ctx, weights, acts, ids);
+            ggml_cgraph * graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, out);
+            for (int threads : {1, 3, 6}) {
+                assert(ggml_graph_compute_with_ctx(ctx, graph, threads) == GGML_STATUS_SUCCESS);
+                for (int token = 0; token < rows; ++token) {
+                    for (int route = 0; route < 2; ++route) {
+                        for (int row = 0; row < columns; ++row) {
+                            float expected = NAN;
+                            traits->vec_dot(n, &expected, 0,
+                                x + routes[2*token + route]*weights->nb[2] + row*weights->nb[1], 0,
+                                y + (route % lanes)*quantized_acts->nb[1] + token*quantized_acts->nb[2], 0, 1);
+                            const float actual = static_cast<float *>(out->data)[(2*token + route)*columns + row];
+                            assert(std::isfinite(actual) && actual == expected);
+                        }
+                    }
+                }
+            }
+            ggml_free(ctx);
+        }
+    }
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -343,6 +445,8 @@ int main(int argc, char * argv[]) {
 
     ggml_cpu_init();
     test_bonsai_codecs();
+    test_q2_0_packed_dot();
+    test_q2_0_repeated_experts();
 
     int num_failed = 0;
 

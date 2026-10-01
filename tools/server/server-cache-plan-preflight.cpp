@@ -202,6 +202,15 @@ bool server_cache_plan_preflight_exposure_allowed(
     return local && api_key_count <= 1;
 }
 
+bool server_cache_plan_preflight_exposure_allowed(
+        const std::vector<std::string> & hostnames,
+        size_t api_key_count) noexcept {
+    return !hostnames.empty() && std::all_of(hostnames.begin(), hostnames.end(),
+        [&](const std::string & host) {
+            return server_cache_plan_preflight_exposure_allowed(host, api_key_count);
+        });
+}
+
 bool server_cache_plan_preflight_request_field_allowed(
         std::string_view field) noexcept {
     static constexpr std::array<std::string_view, 5> accepted = {

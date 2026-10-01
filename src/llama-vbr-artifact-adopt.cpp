@@ -142,7 +142,8 @@ vbr_adopt_status vbr_adopt_check_complete_tree(
         const std::vector<vbr_adopt_expected_attention> & expected,
         const std::vector<llama_memory_tree_child> & live,
         const std::vector<vbr_companion_adoption_provider> & companions,
-        bool occupied_replacement) noexcept {
+        bool occupied_replacement,
+        bool absent_insertion) noexcept {
     const size_t live_attention = std::count_if(
         live.begin(), live.end(),
         [](const llama_memory_tree_child & child) {
@@ -182,9 +183,11 @@ vbr_adopt_status vbr_adopt_check_complete_tree(
             if (duplicate != companions.end()) {
                 return vbr_adopt_status::required_companion_unavailable;
             }
-            if (!prepared->target_empty(prepared->context) &&
-                (!occupied_replacement ||
-                 prepared->prepare_replacement == nullptr)) {
+            const bool shared_target = occupied_replacement &&
+                (absent_insertion
+                    ? prepared->prepare_insertion != nullptr
+                    : prepared->prepare_replacement != nullptr);
+            if (!prepared->target_empty(prepared->context) && !shared_target) {
                 return vbr_adopt_status::target_drift;
             }
         }
@@ -498,9 +501,16 @@ class vbr_kv_import_session {
                         return false;
                     }
                     const auto & unit = units[shard.shard_index];
+                    // The side stream is created by the first tier change or
+                    // capture. A cache restored right after a restart has seen
+                    // neither, so this import is its first user.
+                    if (pool->backend == nullptr && pool->be != nullptr &&
+                        pool->device >= 0) {
+                        pool->backend = pool->be->backend_init(pool->device);
+                    }
                     if (unit.first != pool || !unit.second ||
                         unit.second->t == nullptr || pool->vmm == nullptr ||
-                        pool->be == nullptr || pool->backend == nullptr ||
+                        pool->be == nullptr ||
                         uint64_t(ggml_row_size(
                             source_type,
                             unit.second->t->ne[0])) != shard.row_bytes ||
@@ -509,6 +519,19 @@ class vbr_kv_import_session {
                             unit.second->t->ne[0])) !=
                             shard.target_row_bytes) {
                         return false;
+                    }
+                    // Exact import may be the first side-stream consumer of
+                    // a fresh cache: neither capture nor retiering has run.
+                    // Keep this backend pool-owned, just as those paths do;
+                    // creating it changes no KV bytes or representation state.
+                    if (pool->backend == nullptr) {
+                        if (pool->device < 0 || pool->be->backend_init == nullptr) {
+                            return false;
+                        }
+                        pool->backend = pool->be->backend_init(pool->device);
+                        if (pool->backend == nullptr) {
+                            return false;
+                        }
                     }
                     if (plan->transform_kind !=
                             vbr_import_transform_kind::none &&
@@ -554,6 +577,11 @@ class vbr_kv_import_session {
                             final_watermarks_[pool_index->second],
                             descriptor_watermark);
                     }
+                    // Relocation runs address rows of the staged source: a
+                    // prefix projection reads them out of its parent image,
+                    // which is larger than the projected payload.
+                    const uint64_t source_bytes = shard.source
+                        ? shard.source->size() : shard.payload_bytes;
                     const auto validate_run = [&](uint64_t source_first,
                                                   uint32_t destination_first,
                                                   uint32_t cell_count) {
@@ -566,8 +594,8 @@ class vbr_kv_import_session {
                         const uint64_t relative =
                             uint64_t(source_first)*shard.row_bytes;
                         const uint64_t bytes = uint64_t(cell_count)*shard.row_bytes;
-                        if (relative > shard.payload_bytes ||
-                            bytes > shard.payload_bytes-relative ||
+                        if (relative > source_bytes ||
+                            bytes > source_bytes-relative ||
                             unit.second->byte_off > pool->size ||
                             uint64_t(destination_first)*shard.target_row_bytes >
                                 pool->size-unit.second->byte_off ||
@@ -594,17 +622,20 @@ class vbr_kv_import_session {
                         if (run.cell_count == 0 ||
                             run.first_physical_cell >
                                 UINT32_MAX-run.cell_count ||
+                            run.first_source_row > UINT64_MAX/shard.row_bytes ||
                             uint64_t(run.first_physical_cell) >
                                 UINT64_MAX/shard.row_bytes ||
                             uint64_t(run.cell_count) > UINT64_MAX/shard.row_bytes) {
                             return false;
                         }
+                        const uint64_t source =
+                            run.first_source_row*shard.row_bytes;
                         const uint64_t relative =
                             uint64_t(run.first_physical_cell)*shard.row_bytes;
                         const uint64_t bytes =
                             uint64_t(run.cell_count)*shard.row_bytes;
-                        if (relative > shard.payload_bytes ||
-                            bytes > shard.payload_bytes-relative ||
+                        if (source > shard.payload_bytes ||
+                            bytes > shard.payload_bytes-source ||
                             unit.second->byte_off > pool->size ||
                             relative > pool->size-unit.second->byte_off ||
                             bytes > pool->size-unit.second->byte_off-relative) {
@@ -756,8 +787,12 @@ class vbr_kv_import_session {
                 return static_cast<const artifact_segment_chain *>(context)->read(
                     offset, out, size);
             } };
-        if (!read.projection_ranges.empty()) {
-            if (!ring_operation || !*ring_operation ||
+        // While the packed operation holds the ring, a plain read travels
+        // through it as a single range.
+        const vbr_h2d_source_range whole = { read.source_offset, read.size };
+        const bool held = ring_operation && *ring_operation;
+        if (!read.projection_ranges.empty() || held) {
+            if (!held ||
                 (read.kind != vbr_staged_read_kind::unit_payload &&
                  read.kind !=
                      vbr_staged_read_kind::recovery_unit_payload)) {
@@ -766,8 +801,10 @@ class vbr_kv_import_session {
             vbr_h2d_packed_transfer transfer;
             transfer.lane = read.lane;
             transfer.source = source;
-            transfer.ranges = read.projection_ranges.data();
-            transfer.range_count = read.projection_ranges.size();
+            transfer.ranges = read.projection_ranges.empty()
+                ? &whole : read.projection_ranges.data();
+            transfer.range_count = read.projection_ranges.empty()
+                ? 1 : read.projection_ranges.size();
             transfer.size = read.size;
             transfer.backend = pool->backend;
             transfer.device = ggml_backend_get_device(pool->backend);
@@ -1033,8 +1070,12 @@ class vbr_kv_import_session {
             const std::vector<const vbr_validated_child_plan *> & plans,
             const vbr_tracker_install_child & tracker_plan,
             const vbr_checkpoint_generation_controller & source,
+            const std::vector<vbr_import_co_resident> & co_residents,
             const vbr_occupied_replacement_guard * replacement = nullptr) noexcept {
         if (test_seam_) {
+            if (!co_residents.empty()) {
+                return false;
+            }
             return replacement
                 ? test_seam_->session_build_relocated_live_image(
                     child_id_, plans, tracker_plan, source, *replacement)
@@ -1143,6 +1184,42 @@ class vbr_kv_import_session {
                         }
                     }
                 }
+                // Co-resident rows arrived with the authorized runs; each
+                // publishes under its own sequence, never the destination's.
+                for (const auto & co : co_residents) {
+                    if (co.destination < 0 ||
+                        uint32_t(co.destination) >= cache_->n_seq_max ||
+                        co.destination == destination_) {
+                        return false;
+                    }
+                    for (const auto & placement : co.placements) {
+                        if (placement.child_id != child_id_) {
+                            continue;
+                        }
+                        if (placement.stream_index >= final_cells_.size()) {
+                            return false;
+                        }
+                        auto & cells = final_cells_[placement.stream_index];
+                        for (const auto & cell : placement.cells) {
+                            if (cell.physical_cell >= cells.size() ||
+                                cell.logical_position < 0 ||
+                                !cells.is_empty(cell.physical_cell)) {
+                                return false;
+                            }
+                            cells.pos_set(cell.physical_cell,
+                                          cell.logical_position);
+                            cells.ext_set(cell.physical_cell,
+                                { cell.ext_x, cell.ext_y });
+                            cells.seq_add(cell.physical_cell, co.destination);
+                            if (!final_ownership_->add_cell(
+                                    placement.stream_index, co.destination,
+                                    cell.physical_cell,
+                                    cell.logical_position)) {
+                                return false;
+                            }
+                        }
+                    }
+                }
             }
             // The allocation cursor is live metadata, not a mere search
             // optimization: unified/SWA placement may legally recycle a
@@ -1161,7 +1238,7 @@ class vbr_kv_import_session {
                         tracker_image_)
                     : !tracker->prepare_import_image(
                         tracker_plan, source, destination_, placements,
-                        tracker_image_))) {
+                        tracker_image_, &co_residents))) {
                 return false;
             }
             // Validation writes the target cursor on every unit plan, even
@@ -2013,6 +2090,8 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         out.decision = manifest->decision();
         const bool occupied_replacement =
             manifest->is_occupied_replacement();
+        const bool absent_insertion = occupied_replacement &&
+            manifest->occupied_replacement()->absent_destination();
         recycle = occupied_replacement &&
             manifest->occupied_replacement()->strategy() ==
                 vbr_occupied_replacement_strategy::recycle_incumbent_cells;
@@ -2037,6 +2116,7 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         if (fault_after(server_hooks, out.phase)) {
             return fail(vbr_adopt_status::internal_error);
         }
+        out.phase = vbr_adopt_phase::operation_open;
         if (accounting.snapshot().serial !=
                 staged->accounting_serial_after_prepare() ||
             staged->accounting_serial_after_prepare() == 0 ||
@@ -2049,7 +2129,6 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         if (!collect_adopt_tree(target, server_hooks, tree)) {
             return fail(vbr_adopt_status::target_drift);
         }
-        out.phase = vbr_adopt_phase::operation_open;
         const auto open_status = operation.open(*manifest, destination, tree);
         if (open_status != import_operation_scope::open_status::ok) {
             return fail(open_status ==
@@ -2180,6 +2259,7 @@ vbr_adopt_result vbr_adopt_empty_manifest(
                 if (!install || !source ||
                     !entry.second.session->build_live_image(
                         entry.second.plans, *install, *source,
+                        manifest->co_residents(),
                         manifest->occupied_replacement())) {
                     return fail(vbr_adopt_status::tracker_failed);
                 }
@@ -2200,7 +2280,12 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         }
         const bool prefix_projection = manifest->is_prefix_projection();
         const bool packed_transfer =
-            prefix_projection || occupied_replacement;
+            prefix_projection || occupied_replacement ||
+            std::any_of(
+                staged->reads().begin(), staged->reads().end(),
+                [](const vbr_staged_read_descriptor & read) {
+                    return !read.projection_ranges.empty();
+                });
         if (prefix_projection && !manifest->projection_transfer_ready()) {
             return fail(vbr_adopt_status::source_changed);
         }
@@ -2298,11 +2383,9 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             return fail(vbr_adopt_status::transfer_failed);
         }
         for (const auto & plan : manifest->children()) {
-            const uint64_t expected = packed_transfer
-                ? uint64_t(plan.shards.size())*
-                    (occupied_replacement
-                        ? manifest->relocation_runs().size() : 1)
-                : uint64_t(plan.shards.size())*plan.authorized_runs.size();
+            const uint64_t expected = uint64_t(plan.shards.size())*
+                (occupied_replacement ? vbr_occupied_relocation_read_count(manifest->relocation_runs())
+                 : prefix_projection ? 1 : plan.authorized_runs.size());
             if (expected == 0 || expected > UINT32_MAX ||
                 transferred_units[{ plan.child_id, plan.logical_unit_id }] !=
                     expected) {
@@ -2352,7 +2435,8 @@ vbr_adopt_result vbr_adopt_empty_manifest(
                 const auto * source = source_controller(*manifest, entry.first);
                 if (!install || !source ||
                     !entry.second.session->build_live_image(
-                        entry.second.plans, *install, *source)) {
+                        entry.second.plans, *install, *source,
+                        manifest->co_residents())) {
                     return fail(vbr_adopt_status::tracker_failed);
                 }
             }
@@ -2367,6 +2451,11 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             const bool replacement = plan.recovery_parsed != nullptr;
             const bool layout_aware = provider != server_hooks.companions.end() &&
                 provider->attention_child_id != UINT32_MAX;
+            // Only providers whose target is shared across sequences declare
+            // an insertion path; per-destination companions stay on prepare.
+            const bool insertion = absent_insertion &&
+                provider != server_hooks.companions.end() &&
+                provider->prepare_insertion != nullptr;
             vbr_companion_attention_layout companion_layout;
             if (layout_aware) {
                 const auto child = children.find(provider->attention_child_id);
@@ -2387,13 +2476,17 @@ vbr_adopt_result vbr_adopt_empty_manifest(
                 provider->publish_swap == nullptr ||
                 provider->target_empty == nullptr ||
                 !plan.parsed ||
-                (!replacement &&
+                (!replacement && !insertion &&
                  !provider->target_empty(provider->context))) {
                 return fail(vbr_adopt_status::companion_failed);
             }
             std::unique_ptr<vbr_prepared_companion_image> image;
             const size_t prepared_before = companions.size();
-            const bool prepared = replacement
+            const bool prepared = insertion
+                ? provider->prepare_insertion(
+                    provider->context, std::move(plan.parsed), destination,
+                    image)
+                : replacement
                 ? layout_aware
                     ? provider->prepare_replacement_with_layout(
                         provider->context, std::move(plan.parsed),
@@ -2510,7 +2603,7 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         }
         const auto tree_status = vbr_adopt_check_complete_tree(
             expected_attention, barrier_tree, prepared_providers,
-            occupied_replacement);
+            occupied_replacement, absent_insertion);
         if (tree_status != vbr_adopt_status::adopted) {
             return fail(tree_status);
         }

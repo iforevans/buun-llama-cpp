@@ -6,15 +6,17 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    6
+// Fork wire namespace: upstream 7 has different op/type IDs. The high bit
+// prevents either peer from treating the other's tensors as compatible.
+#define RPC_PROTO_MAJOR_VERSION    (0x80 | 7)
 #define RPC_PROTO_MINOR_VERSION    0
-// 6: the fork op enum (tree ops + TURBO_WHT + DSV4_HC_PARAMS) has a different wire
-//    ordering from protocol 5. The HELLO handshake checks major/minor only, so an enum
-//    change must bump the major version rather than just the informational patch field.
+// HELLO checks major/minor only. An enum/layout change must bump a checked
+// version, not merely this informational patch field.
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT changed - review fork RPC wire version");
+static_assert(GGML_TYPE_COUNT == 92, "GGML_TYPE_COUNT changed - review fork RPC wire version");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

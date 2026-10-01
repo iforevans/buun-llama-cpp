@@ -6,8 +6,9 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cctype>
 
-static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_q_case<GGML_TYPE_Q1_0>(ctx, args, stream);
@@ -87,15 +88,49 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_MXFP4:
+            // src1 at Q4 uses the native FP4 instructions, which are Blackwell-only
+            if (prec_src1 == GGML_PREC_Q4) {
+                mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q4>(ctx, args, stream);
+                break;
+            }
             mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
             break;
         case GGML_TYPE_NVFP4:
+            if (prec_src1 == GGML_PREC_Q4) {
+                mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_Q4>(ctx, args, stream);
+                break;
+            }
             mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
             break;
         default:
             GGML_ABORT("fatal error");
             break;
     }
+}
+
+static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, int cc) {
+    static const ggml_prec override_prec = [] {
+        const char * env = std::getenv("GGML_CUDA_MMQ_PREC");
+        if (!env) {
+            return GGML_PREC_UNDEFINED;
+        }
+        std::string value(env);
+        for (char & c : value) {
+            c = std::tolower(static_cast<unsigned char>(c));
+        }
+        if (value == "q4") { return GGML_PREC_Q4; }
+        if (value == "q8") { return GGML_PREC_Q8; }
+        if (value != "auto") {
+            GGML_LOG_WARN("GGML_CUDA_MMQ_PREC: unknown value '%s'; using graph precision\n", env);
+        }
+        return GGML_PREC_UNDEFINED;
+    }();
+    const ggml_prec prec = override_prec != GGML_PREC_UNDEFINED ? override_prec :
+        static_cast<ggml_prec>(ggml_get_op_params_i32(dst, 3));
+    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
+    const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) &&
+        blackwell_mma_available(cc);
+    return prec == GGML_PREC_Q8 || !can_use_q4 ? GGML_PREC_Q8 : GGML_PREC_Q4;
 }
 
 static void ggml_cuda_mul_mat_q_impl(
@@ -151,7 +186,9 @@ static void ggml_cuda_mul_mat_q_impl(
 
     const bool fallback = ne01 % 128 != 0;
 
-    const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
+    const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
+
+    const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
@@ -202,8 +239,10 @@ static void ggml_cuda_mul_mat_q_impl(
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded,
-                                       ne11, ne12, ne13, stream);
+                const auto quantize = ggml_cuda_use_wide_q5_mmq(cc, src0, dst) ?
+                    quantize_mmq_q8_1_quantized_sum_cuda : quantize_mmq_q8_1_cuda;
+                quantize(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded,
+                         ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
         }
@@ -221,12 +260,12 @@ static void ggml_cuda_mul_mat_q_impl(
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             ne1, ne1};
-        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         if (src0_pair) {
             mmq_args pair_args = args;
             pair_args.x   = static_cast<const char *>(src0_pair->data);
             pair_args.dst = static_cast<float *>(dst_pair->data);
-            ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
+            ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream, prec_src1);
         }
         return;
     }
@@ -303,7 +342,7 @@ static void ggml_cuda_mul_mat_q_impl(
     // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
     // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
     int64_t ncols_opt = ne12;
-    if (GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
         ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
     }
 
@@ -316,13 +355,13 @@ static void ggml_cuda_mul_mat_q_impl(
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
 
-    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 
     if (src0_pair) {
         mmq_args pair_args = args;
         pair_args.x   = (const char *) src0_pair->data;
         pair_args.dst = (float *) dst_pair->data;
-        ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
+        ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream, prec_src1);
     }
 }
 
@@ -335,6 +374,13 @@ void ggml_cuda_mul_mat_q(
 void ggml_cuda_mul_mat_q_pair(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src0_pair,
         const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, ggml_tensor * dst_pair) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (ggml_cuda_mmq_get_prec_src1(src0, dst, cc) != ggml_cuda_mmq_get_prec_src1(src0_pair, dst_pair, cc)) {
+        // Shared activation preparation cannot represent two different policies.
+        ggml_cuda_mul_mat_q_impl(ctx, src0, nullptr, src1, ids, dst, nullptr);
+        ggml_cuda_mul_mat_q_impl(ctx, src0_pair, nullptr, src1, ids, dst_pair, nullptr);
+        return;
+    }
     ggml_cuda_mul_mat_q_impl(ctx, src0, src0_pair, src1, ids, dst, dst_pair);
 }
 
@@ -482,6 +528,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     // hipBLAS path is much slower.
     if (cc == GGML_CUDA_CC_VEGA || GGML_CUDA_CC_IS_GCN_APU(cc)) {
         return n_experts > 0;
+    }
+
+    // MUSA: the MMQ kernels compute wrong values on PH1 (MTT S5000).
+    if (cc == GGML_CUDA_CC_PH1) {
+        return false;
     }
 
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;

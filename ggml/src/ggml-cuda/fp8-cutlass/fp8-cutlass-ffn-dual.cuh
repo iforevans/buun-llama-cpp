@@ -258,7 +258,7 @@ struct DualMain : SeparateMain {
 };
 
 using DualKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, DualMain, PairedEpilogue, void>;
-using DualOp     = cutlass::gemm::device::GemmUniversalAdapter<DualKernel>;
+using DualOp     = ggml_cuda_cutlass_adapter<DualKernel>;
 
 // x/xu and xs/xsu must be quantizations of the same original F32 activation
 // matrix using the respective marker bounds. Equal marker bits permit the

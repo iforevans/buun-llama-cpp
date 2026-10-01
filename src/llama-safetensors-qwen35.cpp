@@ -139,7 +139,9 @@ source_spec quantized_or_plain(
                     std::vector<transform_kind> transforms,
                     const std::string & plain_name) {
     if (auto binding = quant.bind(module, role)) {
-        return { binding->primary, std::move(transforms), std::move(binding) };
+        // MSVC can move the binding before copying its primary into the constructor argument.
+        std::string name = binding->primary;
+        return { std::move(name), std::move(transforms), std::move(binding) };
     }
     if (quant.applies(module)) {
         return { {}, std::move(transforms), std::nullopt };
