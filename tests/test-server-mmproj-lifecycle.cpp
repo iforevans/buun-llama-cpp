@@ -12,6 +12,13 @@ int main() {
         result.thrown_media_restore_once &&
         result.thrown_callback_restore_once &&
         result.throwing_restore_not_retried &&
+        result.media_lookahead_boundaries &&
+        result.single_slot_coalesces &&
+        result.multi_slot_unchanged &&
+        result.cpu_fallback_restores &&
+        result.deferred_cancel_restores &&
+        result.deferred_media_error_restores &&
+        result.deferred_text_error_restores &&
         result.incompatible_draft_disables_shift &&
         result.incompatible_draft_not_shifted &&
         result.compatible_draft_enables_shift &&
@@ -20,6 +27,7 @@ int main() {
         std::fprintf(stderr,
             "mmproj lifecycle regression failed: "
             "null=%d restored=%d failed=%d normal=%d media=%d callback=%d throwing=%d "
+            "lookahead=%d coalesced=%d multi=%d cpu=%d cancel=%d media_error=%d text_error=%d "
             "draft_off=%d draft_not_shifted=%d draft_on=%d draft_shifted=%d\n",
             result.null_binding_clears_views,
             result.restored_binding_updates_views,
@@ -28,6 +36,13 @@ int main() {
             result.thrown_media_restore_once,
             result.thrown_callback_restore_once,
             result.throwing_restore_not_retried,
+            result.media_lookahead_boundaries,
+            result.single_slot_coalesces,
+            result.multi_slot_unchanged,
+            result.cpu_fallback_restores,
+            result.deferred_cancel_restores,
+            result.deferred_media_error_restores,
+            result.deferred_text_error_restores,
             result.incompatible_draft_disables_shift,
             result.incompatible_draft_not_shifted,
             result.compatible_draft_enables_shift,

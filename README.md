@@ -182,6 +182,8 @@ On VRAM-constrained GPUs, a speculative context and the vision encoder (mmproj) 
 
 `--mmproj-gpu-swap` solves this by keeping mmproj on CPU at startup, then temporarily unloading MTP or an external `draft-dflash` sidecar when an image arrives, loading mmproj to GPU for fast encoding (~1-2s instead of 30-60s on CPU), and restoring speculation afterward. MTP is recreated from the target model; an external DFlash sidecar is reloaded from its GGUF.
 
+With `-np 1`, the projector stays on GPU across intervening text until the last uncached media chunk in the prompt. The drafter is then restored before the trailing text is processed, avoiding repeated reloads for historical images without reordering the prompt. Multiple slots retain per-media-group swapping; cancellation and errors also restore the drafter.
+
 ```sh
 ./build/bin/llama-server -m Qwen3.6-27B-Q6_K.gguf \
   --mmproj mmproj.gguf --spec-type draft-mtp \

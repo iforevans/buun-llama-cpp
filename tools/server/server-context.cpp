@@ -920,8 +920,9 @@ server_slot_exact_prompt_action server_slot_exact_prompt_action_resolve(
 } // namespace
 
 // A projector swap is a destructive two-phase transition: once armed, every
-// exit from the media interval must restore (or fail-closed disable) the draft
-// owner exactly once.  In particular, server_queue::yield_to_queue() may
+// exceptional exit must restore (or fail-closed disable) the draft owner exactly
+// once. Normal single-slot ingestion may defer that terminal to the server
+// across text batches until its last media group. server_queue::yield_to_queue() may
 // rethrow either the media work exception or an exception from a concurrently
 // serviced callback.
 class server_mmproj_restore_guard {
@@ -949,6 +950,12 @@ public:
         armed_ = true;
     }
 
+    // The server retains ownership between prompt batches. Slot release and
+    // context teardown must still finish the outstanding swap.
+    void defer() noexcept {
+        armed_ = false;
+    }
+
     void restore_now() {
         if (!armed_) {
             return;
@@ -963,6 +970,14 @@ private:
     std::function<void()> restore_;
     bool armed_ = false;
 };
+
+static bool server_mmproj_defer_restore(
+        size_t n_slots, bool projector_on_gpu, const server_tokens & tokens, size_t processed) {
+    // Called at a completed media/text boundary, never inside a chunk. Use
+    // the media index rather than walking potentially very long token suffixes.
+    return n_slots == 1 && projector_on_gpu && processed > 0 &&
+        tokens.find_next_media_chunk(processed - 1).first != nullptr;
+}
 
 // The dynamic VBR runtime controller flips KV tensor types in place as the context fills; state
 // save/restore, context checkpoints and cache reuse all assume a fixed cache layout and would
@@ -8329,6 +8344,7 @@ private:
     // speculative-context ↔ mmproj GPU swap state
     bool mmproj_gpu_swap = false;
     bool mmproj_is_on_gpu = false;
+    bool mmproj_swap_active = false;
     bool mtp_was_active_before_swap = false;
     bool external_draft_was_active_before_swap = false;
     bool external_draft_reload_configured = false;
@@ -8339,6 +8355,7 @@ private:
     void destroy() {
         slot_file_exports.drain();
         drain_idle_capture();
+        swap_mmproj_to_spec();
         if (ctx_tgt) {
             llama_get_memory(ctx_tgt)->vbr_hard_seal_guard_set({});
         }
@@ -8563,6 +8580,8 @@ private:
     }
 
     bool swap_spec_to_mmproj_gpu() noexcept {
+        GGML_ASSERT(!mmproj_swap_active);
+        mmproj_swap_active = true;
         SRV_INF("swapping %s out, loading mmproj to GPU...\n",
                 model_dft ? "DFlash" : "MTP");
         int64_t t0 = ggml_time_us();
@@ -8603,6 +8622,12 @@ private:
     }
 
     void swap_mmproj_to_spec() noexcept {
+        // A deferred interval can finish through its guard, cancellation, or
+        // teardown. Claim the terminal before rebuilding any owners.
+        if (!mmproj_swap_active) {
+            return;
+        }
+        mmproj_swap_active = false;
         SRV_INF("%s", "unloading mmproj from GPU, restoring speculative state...\n");
         int64_t t0 = ggml_time_us();
 
@@ -10677,6 +10702,10 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                // Only single-slot requests can carry a swap across batches.
+                if (slots.size() == 1) {
+                    swap_mmproj_to_spec();
+                }
                 queue_tasks.pop_deferred_task(id_slot);
                 if (params_base.vbr_prompt_cache) {
                     // The request has already received its terminal response
@@ -21270,7 +21299,7 @@ private:
                     bool has_mtmd = false;
 
                     // Swap the speculative context out so mmproj can use its GPU budget.
-                    const bool needs_mmproj_swap = mmproj_gpu_swap && !mmproj_is_on_gpu
+                    const bool needs_mmproj_swap = mmproj_gpu_swap && !mmproj_swap_active
                         && slot.prompt.n_tokens() < slot.task->n_tokens()
                         && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL;
 
@@ -21278,12 +21307,12 @@ private:
                     // Construct its callable guard only for the media swap,
                     // keeping ordinary prompt scheduling allocation-free.
                     std::optional<server_mmproj_restore_guard> mmproj_restore;
-                    if (needs_mmproj_swap) {
+                    if (needs_mmproj_swap || mmproj_swap_active) {
                         mmproj_restore.emplace([&]() {
                             swap_mmproj_to_spec();
                         });
                         mmproj_restore->arm();
-                        if (!swap_spec_to_mmproj_gpu()) {
+                        if (needs_mmproj_swap && !swap_spec_to_mmproj_gpu()) {
                             mmproj_restore->restore_now();
                             SLT_ERR(slot, "%s", "failed to load multimodal projector during GPU swap\n");
                             send_error(slot, "failed to load multimodal projector", ERROR_TYPE_SERVER);
@@ -21338,11 +21367,17 @@ private:
                         has_mtmd = true;
                     }
 
-                    // Even when the GPU projector reload failed and fell back to CPU,
-                    // the speculative context was already destroyed above and must be
-                    // restored after the media chunk.
+                    // Keep the projector through intervening text only when no
+                    // other slot can need the shared drafter. Restore after the
+                    // final media group, before trailing text primes speculation.
+                    // A CPU fallback never retains the exchange unnecessarily.
                     if (mmproj_restore) {
-                        mmproj_restore->restore_now();
+                        if (server_mmproj_defer_restore(
+                                slots.size(), mmproj_is_on_gpu, input_tokens, slot.prompt.n_tokens())) {
+                            mmproj_restore->defer();
+                        } else {
+                            mmproj_restore->restore_now();
+                        }
                     }
 
                     const auto & spans = slot.task->params.message_spans;
@@ -24051,6 +24086,80 @@ server_mmproj_lifecycle_for_test() {
         restore_count(false, true, false) == 1;
     result.throwing_restore_not_retried =
         restore_count(false, false, true) == 1;
+
+    server_tokens media(llama_tokens { 1, 2 }, true);
+    for (int n : {3, 2}) {
+        auto * chunk = mtmd_test_create_image_chunk("coalescing-test", n);
+        media.push_back(chunk);
+        mtmd_input_chunk_free(chunk);
+        media.push_back(3);
+        media.push_back(4);
+        media.push_back(5);
+    }
+    // Media covers [2,5) and [8,10); use token indices, not M-RoPE positions.
+    result.media_lookahead_boundaries =
+        server_mmproj_defer_restore(1, true, media, 5) &&
+        server_mmproj_defer_restore(1, true, media, 8) &&
+        !server_mmproj_defer_restore(1, true, media, 10) &&
+        !server_mmproj_defer_restore(1, true, media, media.size()) &&
+        !server_mmproj_defer_restore(1, true, server_tokens(llama_tokens {1, 2}, true), 2);
+
+    // This tests the lookahead/guard protocol, not the server's release or
+    // teardown wiring (those need serving-level cancellation/shutdown tests).
+    enum class stop_at { none, cancel, media_error, text_error };
+    const auto coalesced_counts = [&](size_t n_slots, bool gpu, stop_at stop) {
+        bool active = false;
+        int swaps = 0, restores = 0;
+        bool restored_before_trailing_text = true;
+        const auto finish = [&]() {
+            if (active) {
+                active = false;
+                ++restores;
+            }
+        };
+        try {
+            for (size_t processed : {5, 7, 10}) {
+                if (processed != 7 && !active) {
+                    active = true;
+                    ++swaps;
+                }
+                if (active) {
+                    server_mmproj_restore_guard guard(finish);
+                    guard.arm();
+                    if (stop == stop_at::media_error && processed == 10) {
+                        throw std::runtime_error("injected media exception");
+                    }
+                    if (server_mmproj_defer_restore(n_slots, gpu, media, processed)) {
+                        guard.defer();
+                    } else {
+                        guard.restore_now();
+                    }
+                }
+                if (processed == 10) {
+                    restored_before_trailing_text = !active;
+                }
+                if (stop == stop_at::text_error) {
+                    throw std::runtime_error("injected intervening text exception");
+                }
+                if (stop == stop_at::cancel) {
+                    break;
+                }
+            }
+        } catch (...) {
+        }
+        // Release/teardown owns deferred intervals, but must not restore twice
+        // when the media guard already finished the exchange on an exception.
+        finish();
+        finish();
+        return restored_before_trailing_text
+            ? std::make_pair(swaps, restores) : std::make_pair(-1, -1);
+    };
+    result.single_slot_coalesces = coalesced_counts(1, true, stop_at::none) == std::make_pair(1, 1);
+    result.multi_slot_unchanged = coalesced_counts(2, true, stop_at::none) == std::make_pair(2, 2);
+    result.cpu_fallback_restores = coalesced_counts(1, false, stop_at::none) == std::make_pair(2, 2);
+    result.deferred_cancel_restores = coalesced_counts(1, true, stop_at::cancel) == std::make_pair(1, 1);
+    result.deferred_media_error_restores = coalesced_counts(1, true, stop_at::media_error) == std::make_pair(1, 1);
+    result.deferred_text_error_restores = coalesced_counts(1, true, stop_at::text_error) == std::make_pair(1, 1);
 
     const auto simulate_shift = [](
             const server_context_shift_capability & capability) {
