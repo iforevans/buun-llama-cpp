@@ -316,7 +316,7 @@ struct llama_context {
     float * get_logits_ith(int32_t i);
 
     int32_t * get_logits_argmax();
-    llama_token get_logits_argmax_ith(int32_t i);
+    const int32_t * get_logits_argmax_ith(int32_t i); // the row's K candidate ids
     int32_t   get_logits_argmax_n();
     int32_t   get_logits_argmax_k();
     float   * get_logits_argmax_probs();
@@ -370,6 +370,10 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    bool set_mtp_draft_chain(bool enable);
+    void mtp_draft_chain_seed(llama_token token, const float * h);
+    void mtp_draft_chain_record(int32_t i);
+    const llama_token * mtp_draft_chain_tokens(const float ** probs);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -398,8 +402,8 @@ struct llama_context {
     int decode(const llama_batch_ext & batch_inp);
 
     // compat version
-    int encode(const llama_batch & batch_inp);
-    int decode(const llama_batch & batch_inp);
+    int encode(const llama_batch & batch_inp, const llama_batch_ext * extended = nullptr);
+    int decode(const llama_batch & batch_inp, const llama_batch_ext * extended = nullptr);
 
     //
     // state save/load
@@ -518,7 +522,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
     //
     // graph
@@ -543,7 +547,8 @@ private:
     // Choose a synthetic reserve shape that both the configured context and the
     // current physical memory context can represent. Returns zero when unavailable.
     uint32_t effective_reserve_n_seqs(const llama_memory_context_i * mctx) const;
-    llm_graph_result * get_gf_res_prev();
+    int graph_slot(const llama_ubatch & ubatch) const;
+    llm_graph_result * get_gf_res_prev(int slot);
     void invalidate_graph_results();
 
     llm_graph_params graph_params(
@@ -596,6 +601,7 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+    std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
@@ -671,13 +677,14 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // One graph per sched graph slot (see graph_slot()), so alternating batch shapes each stay built
+    // and allocated. gf_res_prev_alloc marks the slots whose graph the sched allocated.
+    std::array<llm_graph_result_ptr, GGML_SCHED_MAX_GRAPH_SLOTS> gf_res_prev;
+    std::array<bool, GGML_SCHED_MAX_GRAPH_SLOTS> gf_res_prev_alloc = {};
     llm_graph_result_ptr gf_res_reserve;
 
     // one-time Hadamard transform-coverage check on the first built graph
     bool hadamard_verified = false;
-    llm_graph_result * gf_res_prev_active = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
@@ -726,7 +733,7 @@ public:
     void set_dflash_topk(int k);
     void set_dflash_block_size(int n);
     void set_dflash_argmax(bool enable);
-    void set_dflash_target_argmax(bool enable);
+    void set_dflash_target_argmax(int32_t k);
     void set_dflash_target_mmq_batch(int32_t n_tokens);
     void set_dflash_fused_inject(bool enable);
 
@@ -827,6 +834,18 @@ public:
 
     // phase-C carry: deferred-inject row storage
     ggml_tensor *              dflash_stage_carry   = nullptr;
+
+    // greedy MTP draft chain stages + pinned token history
+    ggml_context_ptr           mtp_chain_ctx;
+    ggml_backend_buffer_ptr    mtp_chain_buf;
+    ggml_backend_buffer_ptr    mtp_chain_hist_buf;
+    ggml_backend_t             mtp_chain_backend = nullptr;
+    ggml_tensor *              mtp_chain_tok     = nullptr; // owned stages, bound to cparams while enabled
+    ggml_tensor *              mtp_chain_h       = nullptr;
+    ggml_tensor *              mtp_chain_p       = nullptr;
+    ggml_tensor *              mtp_chain_e       = nullptr;
+    ggml_tensor *              mtp_chain_embd    = nullptr;
+    static constexpr int32_t   mtp_chain_hist_max = 64; // history: tokens, then as many probs
 
     std::vector<std::vector<dflash_layer_hidden_buf>> layer_hiddens;
     std::unique_ptr<dflash_capture_data> dflash_capture;

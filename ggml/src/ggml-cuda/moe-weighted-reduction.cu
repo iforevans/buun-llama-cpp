@@ -1,27 +1,70 @@
 #include "moe-weighted-reduction.cuh"
+#include "moe-cpu-share.cuh"
+
+// Cycles to wait on the host share before giving up (~10 s at 2 GHz).
+static constexpr long long share_done_timeout_cycles = 20000000000ll;
 
 static __global__ void moe_weighted_reduction_f32(const float * __restrict__ experts,
                                                   const float * __restrict__ expert_scale,
                                                   const float * __restrict__ weights,
                                                   float * __restrict__ dst,
                                                   const int64_t n_embd,
-                                                  const int     n_expert_used) {
+                                                  const int     n_expert_used,
+                                                  const ggml_moe_cpu_share_args share) {
     const int64_t token = blockIdx.x;
     const int64_t col   = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+
+    // Rows the host computed (moe-cpu-share) come from mapped memory once the host is done.
+    const uint8_t * skip = share.skip ? share.skip + token * share.ids_stride : nullptr;
+    if (skip) {
+        bool any = false;
+        for (int expert = 0; expert < n_expert_used; ++expert) {
+            any |= skip[expert] != 0;
+        }
+        if (!any) {
+            skip = nullptr;
+        } else {
+            if (threadIdx.x == 0) {
+                const uint32_t ticket = *share.ticket;
+                const long long t0 = clock64();
+                while (*(const volatile uint32_t *) share.done != ticket) {
+                    if (clock64() - t0 > share_done_timeout_cycles) {
+                        __trap(); // host workers stopped answering
+                    }
+                }
+                __threadfence_system();
+            }
+            __syncthreads();
+        }
+    }
     if (col >= n_embd) {
         return;
     }
+    const uint64_t first_row = (uint64_t) token * n_expert_used;
+    const auto value = [&](int expert) {
+        const int entry = skip ? skip[expert] : 0;
+        if (!entry) {
+            return experts[(first_row + expert) * n_embd + col];
+        }
+        const float * host_value = share.y + (entry - 1) * n_embd + col;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        // HIP mapped host allocations are coherent. Keep this read after the
+        // completion-ticket wait without relying on NVIDIA's cache intrinsic.
+        return *reinterpret_cast<const volatile float *>(host_value);
+#else
+        return __ldcv(host_value);
+#endif
+    };
 
-    const uint64_t first_row   = (uint64_t) token * n_expert_used;
     const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
     // Preserve the separate MUL/ADD store boundaries. Contracting the sum into
     // FMA can perturb downstream routing even though the expert order is unchanged.
-    float          sum         = __fmul_rn(__fmul_rn(experts[first_row * n_embd + col], first_scale), weights[first_row]);
+    float          sum         = __fmul_rn(__fmul_rn(value(0), first_scale), weights[first_row]);
 
     for (int expert = 1; expert < n_expert_used; ++expert) {
         const uint64_t row   = first_row + expert;
         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
-        sum = __fadd_rn(sum, __fmul_rn(__fmul_rn(experts[row * n_embd + col], scale), weights[row]));
+        sum = __fadd_rn(sum, __fmul_rn(__fmul_rn(value(expert), scale), weights[row]));
     }
     dst[token * n_embd + col] = sum;
 }
@@ -33,11 +76,12 @@ static void launch_moe_weighted_reduction(const float * experts,
                                           int64_t       n_embd,
                                           int64_t       n_tokens,
                                           int           n_expert_used,
+                                          const ggml_moe_cpu_share_args & share,
                                           cudaStream_t  stream) {
     constexpr int threads = 256;
     const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
     moe_weighted_reduction_f32
-        <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+        <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used, share);
 }
 
 void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
@@ -62,6 +106,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
     launch_moe_weighted_reduction((const float *) experts->data,
                                   expert_scale ? (const float *) expert_scale->data : nullptr,
                                   (const float *) weights->data,
-                                  (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
+                                  (float *) dst->data, n_embd, n_tokens, (int) n_expert_used,
+                                  ggml_moe_cpu_share_merge(experts), stream);
     CUDA_CHECK(cudaGetLastError());
 }

@@ -498,6 +498,13 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     spitch = src0->nb[d];
     dpitch = src1->nb[d];
 
+    // the copy engine pays per row: thousands of narrow rows (a 3-column conv state
+    // tail is 10240 rows of 12 bytes) take ~8 us vs ~2 us in the scalar kernel
+    const bool has_kernel = src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16;
+    if (has_kernel && width < 256) {
+        return false;
+    }
+
     return spitch >= width && dpitch >= width;
 }
 
@@ -534,7 +541,8 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
 
     const bool contiguous_srcs = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
     const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&
-        src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
+        src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0) &&
+        ggml_is_contiguous(src1);
 
     size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
 

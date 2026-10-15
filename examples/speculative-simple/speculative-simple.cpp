@@ -238,7 +238,7 @@ int main(int argc, char ** argv) {
 
         // always have a token to evaluate from before - id_last
         common_batch_clear(batch_tgt);
-        common_batch_add  (batch_tgt, id_last, n_past++, { seq_id }, true);
+        common_batch_add(batch_tgt, id_last, n_past++, { seq_id }, true);
 
         // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
         {
@@ -389,7 +389,6 @@ int main(int argc, char ** argv) {
     LOG_INF("target:\n\n");
     common_perf_print(ctx_tgt, smpl.get());
 
-    llama_batch_free(batch_tgt);
 
     common_speculative_free(spec);
 

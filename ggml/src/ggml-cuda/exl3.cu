@@ -32,6 +32,7 @@
 #include "exl3-gemv.cuh"
 #include "exl3-gemv-int8.cuh"
 #include "exl3-int8-warpk.cuh"
+#include "moe-cache.cuh"
 #if !defined(GGML_USE_HIP)
 #include "exl3-gemm.cuh"
 #include "exl3-head.cuh"
@@ -725,10 +726,20 @@ void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     ga.x_nb1         = x->nb[1] / sizeof(float);
     ga.x_nb2         = x->nb[2] / sizeof(float);
     ga.expert_stride = w->nb[2];
+    const void * svh_data = svh->data, * suh_data = suh->data;
+    ggml_moe_cache_route_table route;
+    if (ggml_moe_cache_route_find(w->data, route)) {
+        ga.table     = route.table;
+        ga.route_log = route.log;
+        if (route.scales[0]) {
+            svh_data = route.scales[0];
+            suh_data = route.scales[1];
+        }
+    }
     const int pairs = int(ids->ne[0] * ids->ne[1]);
     cudaStream_t stream = ctx.stream();
-    EXL3_DISPATCH(exl3_moe_run, bits, cb, ctx, static_cast<const float *>(x->data), static_cast<const half *>(suh->data),
-        static_cast<const uint8_t *>(w->data), static_cast<const half *>(svh->data), static_cast<float *>(dst->data), k, n, pairs, ga, stream);
+    EXL3_DISPATCH(exl3_moe_run, bits, cb, ctx, static_cast<const float *>(x->data), static_cast<const half *>(suh_data),
+        static_cast<const uint8_t *>(w->data), static_cast<const half *>(svh_data), static_cast<float *>(dst->data), k, n, pairs, ga, stream);
 }
 
 // The cache receives CPU-transformed activations and returns untransformed

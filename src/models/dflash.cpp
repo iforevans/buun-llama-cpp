@@ -287,6 +287,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     // Missing tensors alone must not change old drafts' target-sharing contract.
     ml.get_key("dflash.attention.k_eq_v", hparams.dflash_shared_kv, false);
     ml.get_key("dflash.tie_word_embeddings", hparams.dflash_tied_output, false);
+    ml.get_key(LLM_KV_ATTENTION_VALUE_SCALE, hparams.f_attn_value_scale, false);
 
     hparams.llm_ffn_op = LLM_FFN_SILU;
     std::string hidden_act;
@@ -928,7 +929,6 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
 template <>
 llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
-    const int64_t n_embd_inp = hparams.n_embd_inp_enc();
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -963,6 +963,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     };
 
     // KV cache injection
+    ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.embd) {
         ggml_tensor * inp_g = build_dflash_inject_input(*this, model, n_embd);
 
@@ -1132,6 +1133,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             cur = build_lora_mm(layer.wo, cur, layer.wo_s, layer.wo_in_s);
         }
 
+        if (hparams.f_attn_value_scale != 0.0f) {
+            cur = ggml_scale(ctx0, cur, hparams.f_attn_value_scale);
+            cb(cur, "attn_out_scaled", il);
+        }
+
         if (attn_coeff) {
             cur = llm_build_dflash2_conv_finish(*this, cur,
                     attn_coeff, layer.dflash2_attn_conv_base);
@@ -1257,7 +1263,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 //   * token batch -> noise block through 3 full DSV4 stages (hc + MLA + MoE), markov + confidence heads
 llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_graph_params & params) :
     llama_model_deepseek4::graph(params) {
-    const int64_t n_embd_inp       = hparams.n_embd_inp_enc();
     const int64_t n_embd_head      = hparams.n_embd_head_k();
     const int64_t n_embd_head_rope = hparams.n_rot();
     const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;
@@ -1267,6 +1272,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     llm_graph_input_attn_k_iswa * inp_attn = build_attn_inp_k_iswa();
 
     // KV cache injection: fused target features from the encoder
+    ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.embd) {
         ggml_tensor * inp_g = build_dflash_inject_input(*this, model, n_embd);
 

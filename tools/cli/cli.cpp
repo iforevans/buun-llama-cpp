@@ -41,6 +41,9 @@ int llama_cli(int argc, char ** argv) {
         return 1;
     }
 
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
     // -no-cnv/--no-conversation: run the -p prompt as ONE templated turn and exit.
     // (Raw un-templated completion = llama-completion.) Previously this printed
     // "not supported" and then ran conversation mode anyway — combined with the

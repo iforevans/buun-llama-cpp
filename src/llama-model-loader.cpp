@@ -1749,7 +1749,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID;
         // embedded-adapter ".lora_a"/".lora_b" tensors are always used with GGML_OP_MUL_MAT_ID
         ggml_op op;
-        if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
+        const bool expert_map = tn.suffix != nullptr && strstr(tn.suffix, ".expert_map") != nullptr;
+        if (expert_map) {
+            op = GGML_OP_GET_ROWS;
+        } else if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
             op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
         } else if (tn.suffix != nullptr && strcmp(tn.suffix, "input_scale") == 0 &&
                 t_meta->type == GGML_TYPE_I32 && ggml_nelements(t_meta) == 1) {
@@ -1799,8 +1802,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_backend_buffer_type_t buft = nullptr;
         bool explicit_buft = false;
 
-        // check overrides
-        if (tensor_buft_overrides) {
+        // check overrides; mixed-bank expert maps are routing tables, not expert weights: a CPU
+        // copy would pull each bank's id remap off the GPU and split the graph per projection
+        if (tensor_buft_overrides && !expert_map) {
             std::string tensor_name = tn.str();
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
@@ -1838,9 +1842,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // avoid using a host buffer when using mmap. Native safetensors sources cannot mmap (the
         // tensors are repacked on load) but follow the same rule: page-locking a 170 GB expert set
         // costs ~120 s per start. An explicit host-buffer override opts into that cost
-        // and resident RAM use; ordinary CPU overrides retain the mmap policy.
+        // and resident RAM use; ordinary CPU overrides retain the mmap policy. EXL3 expert banks and
+        // the small expert scales stay pinned: the MoE cache routes the op to the GPU kernel, which
+        // reads both in place, where pageable copies would be re-uploaded every graph.
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (!explicit_buft && (use_mmap || tensor_source != nullptr) && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        const bool pinned_experts = !use_mmap && info.op == GGML_OP_MUL_MAT_ID &&
+            (ggml_type_is_exl3(t_meta->type) || (tn.suffix != nullptr && strstr(tn.suffix, "scale") != nullptr));
+        if (!explicit_buft && !pinned_experts && (use_mmap || tensor_source != nullptr) && buft_dev &&
+            buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");
@@ -2267,8 +2276,7 @@ bool llama_model_loader::load_all_data(
     }
 
     // Buffer size: balance between memory usage and I/O efficiency
-    // 64MB works well for NVMe drives
-    const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
+    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;

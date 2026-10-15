@@ -377,6 +377,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
+    llama_build_and_test(test-common-sync-contracts.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-spm.gguf)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -492,7 +493,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-kimi-k3 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
-    set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
+    # abort on graph reallocations that the initial reserve should have covered
+    set_tests_properties(test-recurrent-state-rollback PROPERTIES
+        FIXTURES_REQUIRED generate-models
+        ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+    )
 
     llama_test(
         test-recurrent-state-rollback
@@ -612,6 +617,12 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
+if (GGML_METAL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-metal-graph-optimize.cpp)
+    target_include_directories(test-metal-graph-optimize PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+    target_link_libraries(test-metal-graph-optimize PRIVATE ggml-metal)
+endif()
+
 # The full suite runs explicitly in ci/run.sh. Keep focused fork CTest cases below.
 # TODO: decouple the operator tool from libllama [TAG_TESTS_LLAMA_LINK].
 llama_build(test-backend-ops.cpp)
@@ -639,6 +650,25 @@ llama_build_and_test(test-cuda-q8-mmv-selector.cpp)
 llama_build_and_test(test-backend-expert-transfer.cpp)
 target_include_directories(test-backend-expert-transfer PRIVATE ../ggml/src)
 llama_build_and_test(test-exl3-cpu.cpp)
+if ((TARGET ggml-cuda OR TARGET ggml-hip) AND NOT GGML_BACKEND_DL)
+    llama_build(test-cuda-fa-combine.cpp)
+    if (TARGET ggml-hip)
+        target_compile_definitions(test-cuda-fa-combine PRIVATE GGML_USE_HIP)
+        target_link_libraries(test-cuda-fa-combine PRIVATE ggml-hip)
+    else()
+        target_link_libraries(test-cuda-fa-combine PRIVATE ggml-cuda)
+    endif()
+    llama_test(test-cuda-fa-combine LABEL "main;backend")
+    set_tests_properties(test-cuda-fa-combine PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+endif()
+
+if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+    llama_build(test-cuda-convert-chunks.cpp)
+    target_link_libraries(test-cuda-convert-chunks PRIVATE ggml-cuda)
+    llama_test(test-cuda-convert-chunks LABEL "main;backend;large-memory")
+    set_tests_properties(test-cuda-convert-chunks PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
+endif()
+
 llama_build_and_test(test-cuda-graph-key.cpp)
 llama_build_and_test(test-cuda-rdna2-vmm-policy.cpp)
 if (TARGET ggml-cuda)
@@ -898,6 +928,17 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-cuda-moe-cache-flat-hits-selector.cpp)
     if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
         find_package(CUDAToolkit REQUIRED)
+        # The share and weighted-reduction helpers are private CUDA symbols.
+        if (TARGET ggml-cpu AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
+            llama_build(test-cuda-moe-cpu-share.cu)
+            target_include_directories(test-cuda-moe-cpu-share PRIVATE ../ggml/src)
+            target_link_libraries(test-cuda-moe-cpu-share PRIVATE ggml-cuda ggml-cpu CUDA::cudart CUDA::cublas)
+            get_target_property(MOE_SHARE_CUDA_ARCHITECTURES ggml-cuda CUDA_ARCHITECTURES)
+            set_target_properties(test-cuda-moe-cpu-share PROPERTIES
+                CUDA_STANDARD 17 CUDA_ARCHITECTURES "${MOE_SHARE_CUDA_ARCHITECTURES}")
+            llama_test(test-cuda-moe-cpu-share LABEL "main;backend")
+            set_tests_properties(test-cuda-moe-cpu-share PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+        endif()
         llama_build(test-cuda-moe-cache-flat-hits.cpp)
         target_link_libraries(test-cuda-moe-cache-flat-hits PRIVATE ggml-cuda CUDA::cudart)
         llama_test(test-cuda-moe-cache-flat-hits LABEL "main;backend")
@@ -923,6 +964,10 @@ target_include_directories(test-moe-routing PRIVATE ../src ../ggml/src)
 llama_build_and_test(test-qsa-bias.cpp)
 target_include_directories(test-qsa-bias PRIVATE ../src)
 llama_build_and_test(test-meta-step-cache.cpp)
+if (TARGET ggml-rpc)
+    add_executable(test-rpc-allreduce test-rpc-allreduce.cpp)
+    target_link_libraries(test-rpc-allreduce PRIVATE ggml ggml-rpc)
+endif()
 llama_build_and_test(test-auto-memory-policy.cpp)
 llama_build_and_test(test-kv-cell-position-index.cpp)
 

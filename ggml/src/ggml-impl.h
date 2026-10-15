@@ -248,10 +248,6 @@ static inline void ggml_bitset_set(ggml_bitset_t * bitset, size_t i) {
     bitset[i >> BITSET_SHR] |= (1u << (i & BITSET_MASK));
 }
 
-static inline void ggml_bitset_clear(ggml_bitset_t * bitset, size_t i) {
-    bitset[i >> BITSET_SHR] &= ~(1u << (i & BITSET_MASK));
-}
-
 // hash set
 
 #define GGML_HASHSET_FULL ((size_t)-1)

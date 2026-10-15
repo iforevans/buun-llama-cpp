@@ -3,9 +3,10 @@
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // Closed gather fusion: selected order and dense stream-K partition stay fixed.
+// live_bias (F32, one per id, 0 or -inf) drops dead slots; it may be null.
 bool ggml_cuda_flash_attn_ext_ordered(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         const ggml_tensor * keys, const ggml_tensor * values,
-        const ggml_tensor * ids, const ggml_tensor * mask_cells);
+        const ggml_tensor * ids, const ggml_tensor * mask_cells, const ggml_tensor * live_bias);
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst);
 

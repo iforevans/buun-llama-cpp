@@ -72,11 +72,19 @@ int main() {
     ggml_backend_t backends[] = {device.backend.get(), cpu.get()};
     ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, nullptr, 2, 128, false, true));
 
-    for (const std::vector<int32_t> selected :
-         {std::vector<int32_t>{}, {0, 1, 1, 7}, {2, 3, 4, 5}, {7, 7, 7, 7}, {}}) {
+    for (const int window_lo : {-1, 0, 2}) for (const int batch : {1, 33}) {
+    for (const std::vector<int32_t> pattern :
+         {std::vector<int32_t>{}, {0, 1, 1, 7}, {2, 3, 4, 5}, {7, 7, 7, 7}, {-1, 0, 4, 9}, {-1, -1, -1, -1}}) {
+        if (window_lo < 0 && std::find(pattern.begin(), pattern.end(), -1) != pattern.end()) continue;
+        std::vector<int32_t> selected;
+        for (int t = 0; t < batch; ++t) selected.insert(selected.end(), pattern.begin(), pattern.end());
+        const auto local_id = [&](int32_t id) {
+            if (window_lo < 0) return id;
+            return id >= window_lo && id < window_lo + 8 ? id - window_lo : -1;
+        };
         ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead() * 8 + ggml_graph_overhead_custom(128, false),
                                        nullptr, true}));
-        const int tokens = selected.empty() ? 0 : 1;
+        const int tokens = selected.empty() ? 0 : batch;
         auto * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 128, 1, tokens);
         auto * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 4, tokens);
         auto * probe = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
@@ -84,6 +92,7 @@ int main() {
         ggml_set_input(ids);
         ggml_set_input(probe);
         auto * y = ggml_mul_mat_id(ctx.get(), w, x, ids);
+        if (window_lo >= 0) ggml_mul_mat_id_set_expert_window(y, window_lo, 8);
         auto * tail = ggml_scale(ctx.get(), probe, 2.f);
         ggml_set_output(y);
         ggml_set_output(tail);
@@ -95,7 +104,7 @@ int main() {
         GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
         GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), y) == device.backend.get());
         if (tokens) {
-            std::vector<float> input(128, 1.f);
+            std::vector<float> input(128 * tokens, 1.f);
             ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
             ggml_backend_tensor_set(ids, selected.data(), 0, selected.size() * sizeof(int32_t));
         }
@@ -104,6 +113,8 @@ int main() {
 
         std::vector<std::pair<size_t, size_t>> expected;
         auto unique = selected;
+        for (auto & id : unique) id = local_id(id);
+        unique.erase(std::remove(unique.begin(), unique.end(), -1), unique.end());
         std::sort(unique.begin(), unique.end());
         unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
         for (size_t i = 0; i < unique.size();) {
@@ -122,14 +133,16 @@ int main() {
             if (!output.empty()) {
                 ggml_backend_tensor_get(y, output.data(), 0, output.size() * sizeof(float));
                 for (size_t i = 0; i < output.size(); ++i) {
-                    GGML_ASSERT(output[i] == 128.f * (selected[i / 32] + 1));
+                    GGML_ASSERT(output[i] == 128.f * (local_id(selected[i / 32]) + 1));
                 }
             }
             float probe_output = 0;
             ggml_backend_tensor_get(tail, &probe_output, 0, sizeof(probe_output));
             GGML_ASSERT(probe_output == 6.f);
         }
-        printf("PASS: selected=%zu transfer_ranges=%zu (two executions)\n", selected.size(), expected.size());
+        printf("PASS: window_lo=%d selected=%zu transfer_ranges=%zu (two executions)\n",
+               window_lo, selected.size(), expected.size());
         ggml_backend_sched_reset(sched.get());
+    }
     }
 }

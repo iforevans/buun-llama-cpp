@@ -283,6 +283,8 @@ struct grouped_args {
     int    ne11;                // activation rows per token (1 = broadcast, or n_expert_used)
     size_t x_nb1, x_nb2;        // activation strides (elements)
     size_t expert_stride;       // bytes between expert weight blocks
+    const void * const * table = nullptr; // moe-cache route: per-expert weight base (VRAM slot or mapped host)
+    int32_t * route_log = nullptr;        // moe-cache route log: [0] = pairs, [1 + pair] = expert
 };
 
 // cb == 2 (mul1): int8 activations, dp4a; other codebooks: F16 activations, decoded weights, fp32 FMA.
@@ -355,10 +357,14 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         const int pair = blockIdx.z;
         const int t = pair / ga.n_expert_used, e = pair - t * ga.n_expert_used;
         const int expert = ga.ids[size_t(t) * ga.ids_nb1 + e];
+        if (ga.route_log && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
+            ga.route_log[1 + pair] = expert;
+            if (pair == 0) ga.route_log[0] = gridDim.z;
+        }
         // Expert windows use -1 for pairs owned by another device. The whole
         // block skips them; the window dispatcher zeroes their output rows.
         if (expert < 0) return;
-        B   += size_t(expert) * ga.expert_stride;
+        B = ga.table ? static_cast<const uint8_t *>(ga.table[expert]) : B + size_t(expert) * ga.expert_stride;
         svh += size_t(expert) * n;
         suh += size_t(expert) * k;
         x   += size_t(t) * ga.x_nb2 + (ga.ne11 == 1 ? 0 : size_t(e) * ga.x_nb1);

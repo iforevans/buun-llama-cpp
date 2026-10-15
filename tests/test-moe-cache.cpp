@@ -437,6 +437,7 @@ static void configure_cache(
     set_env("GGML_CUDA_MOE_CACHE_DOWN_DEDICATED_MMV", dedicated_down_mmv);
     set_env("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", "0");
     set_env("GGML_CUDA_MOE_CACHE_FAIL", fail_stage);
+    set_env("GGML_CUDA_MOE_CACHE_LFU", nullptr);
 }
 
 static bool run_capability_queries(
@@ -3680,6 +3681,7 @@ static bool run_exact_shape_inventory(
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "16");
     set_env("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", nullptr);
     set_env("GGML_CUDA_MOE_CACHE_THROTTLE", "8");
+    set_env("GGML_CUDA_MOE_CACHE_LFU", "0");
     set_env("GGML_CUDA_MOE_CACHE_STATS", "0");
     capture.clear();
 
@@ -4027,6 +4029,7 @@ static bool run_admission_policy_once(
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
     set_env("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", "2");
     set_env("GGML_CUDA_MOE_CACHE_THROTTLE", "8");
+    set_env("GGML_CUDA_MOE_CACHE_LFU", "0"); // pins the legacy readmit throttle
     set_env("GGML_CUDA_MOE_CACHE_STATS", "0");
     capture.clear();
 
@@ -4178,8 +4181,12 @@ static bool run_pool_limits() {
     for (size_t minimum : { 512u << 10, 1024u << 10 }) {
         ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0, 0, minimum) == minimum / 2;
         ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0, 1, minimum) == minimum;
-        ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0_G128, 0, minimum) == minimum / 2;
+        ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0_G128, 0, minimum) == minimum * 34 / 72;
         ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0_G128, 1, minimum) == minimum;
+        // A same-shape IQ2 expert holds as many weights as the Q4_0 floor in fewer bytes.
+        ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_IQ2_XXS, 0, minimum) == minimum * 66 / 144;
+        ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_IQ2_XS, 0, minimum) == minimum * 74 / 144;
+        ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q8_0, 0, minimum) == minimum;
     }
     const size_t expert_bytes = 400u << 10;
     const size_t exl3_limit = ggml_moe_cache_max_pool_slots(GGML_TYPE_EXL3_2, expert_bytes);

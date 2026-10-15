@@ -31,7 +31,7 @@ struct cache_state {
 };
 
 int64_t cache_rows(const ggml_tensor * dst) {
-    if (dst->op != GGML_OP_MUL_MAT_ID || ggml_mmid_window_n_local(dst) != 0) return 0;
+    if (dst->op != GGML_OP_MUL_MAT_ID) return 0;
     const int64_t rows = ggml_nelements(dst->src[2]);
     return rows <= cache_max_rows ? rows : 0;
 }

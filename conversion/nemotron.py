@@ -216,7 +216,9 @@ class NemotronHModel(GraniteHybridModel):
         hparams = kwargs.pop("hparams", None)
         if hparams is None:
             hparams = ModelBase.load_hparams(args[0], self.is_mistral_format)
-        llm_config = {**hparams, **(hparams.get("llm_config") or {})}
+        # Direct hparams callers and guessed configs may bypass ModelBase's
+        # legacy llm_config normalization; null nested configs are also valid.
+        llm_config = {**hparams, **(hparams.get("text_config") or hparams.get("llm_config") or {})}
 
         has_moe_params = "num_experts_per_tok" in llm_config
         layers_block_type = llm_config.get("layers_block_type")

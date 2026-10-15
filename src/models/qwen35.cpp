@@ -59,6 +59,10 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_out }, TENSOR_NOT_REQUIRED);
 
+    // optional projection of the embeddings output
+    cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, hparams.n_embd_out() }, TENSOR_NOT_REQUIRED);
+    cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT, "bias"),   { hparams.n_embd_out() },         TENSOR_NOT_REQUIRED);
+
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
         GGML_ASSERT(!d2t && "d2t draft-vocab trim requires its own output.weight; "
@@ -196,7 +200,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -233,12 +237,22 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (crop_after_nextn(inp_out_ids)) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+
+    if (model.cls_out) {
+        ggml_tensor * embd = build_lora_mm(model.cls_out, cur);
+        if (model.cls_out_b) {
+            embd = ggml_add(ctx0, embd, model.cls_out_b);
+        }
+        cb(embd, "result_embd_proj", -1);
+        res->t_embd = embd;
+        ggml_build_forward_expand(gf, embd);
+    }
 
     // LM head
     cur = build_lora_mm(model.output, cur, model.output_s, model.output_in_s);
@@ -610,6 +624,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     // TODO: make static using `ggml_build_forward_select()`
     //       see llm_graph_context::build_inp_embd() for reference
     ggml_tensor * tok_embd;
+    ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.token) {
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
@@ -740,36 +755,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(cur, "result_output", -1);
 
     if (model.d2t) {
-        // FR-Spec-style draft-vocab trim: scatter the compressed logits back into a
-        // full-vocab-shaped tensor (rest filled -inf) so downstream verify/sampling
-        // code never has to know the draft scored a reduced vocab. Same pattern as
-        // eagle3.cpp's d2t handling.
-        const int64_t n_draft_vocab = cur->ne[0];
-        const int64_t n_outputs     = cur->ne[1];
-        const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
-
-        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
-
-        const bool compact_backend_sampling =
-                model.d2t->type == GGML_TYPE_I32 &&
-                !samplers.empty() &&
-                llm_graph_all_outputs_have_samplers(ubatch, samplers, true);
-        if (compact_backend_sampling) {
-            // Backend samplers already support an explicit candidate-id domain.
-            // Keep the 32K logits compact and let filtering map only its winners
-            // to target token ids, avoiding a full-vocab fill/scatter and scan.
-            res->t_logits_candidates = model.d2t;
-        } else {
-            // Raw-logits consumers, mixed backend/CPU batches, and legacy I64
-            // mappings retain the exact dense representation.
-            ggml_tensor * logits = ggml_fill(ctx0,
-                    ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs), -INFINITY);
-            cur = ggml_set_rows(ctx0, logits,
-                    ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
-                    ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
-            cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs);
-            cb(cur, "result_output_d2t", -1);
-        }
+        cur = build_d2t_logits(cur, model.d2t, (int64_t) model.vocab.n_tokens());
     }
 
     res->t_logits = cur;

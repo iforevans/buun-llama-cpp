@@ -204,6 +204,16 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
+// MoE archs that are also tested with the experts in host memory
+static bool host_experts_test(const llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_DEEPSEEK2:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
@@ -243,6 +253,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
+            || arch == LLM_ARCH_GLM5_NEXT
             || arch == LLM_ARCH_MISTRAL4
             || arch == LLM_ARCH_HY_V4) {
         n_embd = 128;
@@ -256,7 +267,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         //n_vocab = 4096; // must be >= the hard-coded codec head size (3072)
         n_vocab = 3072; // TODO: should be 4096, but user code cannot get `n_vocab_out` yet [TAG_LLAMA_N_VOCAB_OUT]
     } else if (arch == LLM_ARCH_HRM_TEXT) {
-        n_layer = 8; // 1 layer per stack x 2 h-cycles x (3 l-cycles + 1) cache slots
+        n_layer = 6; // 1 layer per stack x 2 h-cycles x (2 l-cycles + 1) cache slots
     }
 
     uint32_t n_head_kv = n_head;
@@ -274,6 +285,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
+
+    if (arch == LLM_ARCH_K2_HORIZON) {
+        ms.add_kv(LLM_KV_ROPE_SCALING_YARN_BETA_FAST, 128.0f);
+        ms.add_kv(LLM_KV_ROPE_SCALING_YARN_BETA_SLOW,   4.0f);
+    }
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         std::vector<uint32_t> n_ff_per_layer;
@@ -294,14 +310,19 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     if (arch == LLM_ARCH_PLAMO2 || arch == LLM_ARCH_JAMBA || arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
             arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR ||
-            arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3) {
+            arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3 || arch == LLM_ARCH_GLM5_NEXT) {
         GGML_ASSERT(n_layer >= 2);
         std::vector<uint32_t> n_head_per_layer;
         n_head_per_layer.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
             n_head_per_layer.push_back(il == 1 ? 0 : n_head);
         }
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
+        // GLM5 next KDA heads come from the uniform head count, only head_count_kv is per layer.
+        if (arch == LLM_ARCH_GLM5_NEXT) {
+            ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
+        } else {
+            ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
+        }
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
@@ -320,11 +341,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
-            || arch == LLM_ARCH_MISTRAL4
-            || arch == LLM_ARCH_HY_V4) {
-        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(576));
+            || arch == LLM_ARCH_GLM5_NEXT
+            || arch == LLM_ARCH_HY_V4
+            || arch == LLM_ARCH_MISTRAL4) {
+        // GLM5 next MLA is nope only, the cache row is the compressed latent alone.
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       arch == LLM_ARCH_GLM5_NEXT ? uint32_t(512) : uint32_t(576));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
-        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       arch == LLM_ARCH_GLM5_NEXT ? uint32_t(0) : uint32_t(64));
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
         if (arch == LLM_ARCH_DOTS3NOTE) {
@@ -384,8 +407,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
     // indexer head count is independent of the main attention head count.
-    if (arch == LLM_ARCH_QWEN4EXP) {
+    if (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,  1.0e-6f);
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
@@ -427,6 +452,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(131072));
 
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL,        uint32_t(4));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL, true);
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS,
             arch == LLM_ARCH_QWEN4EXP
@@ -466,10 +493,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     }
 
     if (arch == LLM_ARCH_HRM_TEXT) {
-        // 8 cache slots alias 2 physical blocks: 1 low-stack layer + 1 high-stack layer
+        // 6 cache slots alias 2 physical blocks: 1 low-stack layer + 1 high-stack layer
         ms.add_kv(LLM_KV_HRM_LAYERS_PER_STACK, uint32_t(1));
         ms.add_kv(LLM_KV_HRM_H_CYCLES,         uint32_t(2));
-        ms.add_kv(LLM_KV_HRM_L_CYCLES,         uint32_t(3));
+        ms.add_kv(LLM_KV_HRM_L_CYCLES,         uint32_t(2));
     }
 
     if (arch == LLM_ARCH_MAPLE) {
@@ -497,12 +524,17 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, n_ff / 2);  // distinct from n_ff so a saver key-clobber surfaces on reload
         ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
-        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
+        // with more experts than a ubatch uses, the copy of the used experts in host memory skips some of them
+        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(host_experts_test(arch) ? 64 : 2));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
+        if (arch == LLM_ARCH_K2_HORIZON) {
+            ms.add_kv(LLM_KV_ATTENTION_VALUE_EXPERT_COUNT,      uint32_t(2));
+            ms.add_kv(LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT, uint32_t(2));
+        }
     }
 
     ms.add_kv(LLM_KV_POSNET_EMBEDDING_LENGTH,   n_embd);
@@ -587,7 +619,8 @@ static bool devices_support_vbr_vmm(const std::vector<ggml_backend_dev_t> & devi
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr, float stdev = 0.01f) {
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr, float stdev = 0.01f,
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -595,6 +628,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
+    model_params.tensor_buft_overrides = tensor_buft_overrides;
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -824,7 +858,9 @@ static void test_bonsai_loader(const size_t seed) {
             rotations += a->op == GGML_OP_MUL_MAT &&
                 reinterpret_cast<const int32_t *>(a->op_params)[1] == GGML_HINT_SRC0_IS_HADAMARD;
         }
-        GGML_ASSERT(rotations == 3);
+        // two input rotations, plus the embedding inverse on both the token
+        // and the mixed-batch lookup branch of the input select
+        GGML_ASSERT(rotations == 4);
     }
 
     // Optional means absent is allowed, not that malformed metadata is ignored.
@@ -1070,7 +1106,67 @@ static void test_dflash_selector_family_contract() {
     GGML_ASSERT(!llm_dflash_selector_tensor_schema_for_family(family::unidentified).valid);
 }
 
-static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
+// Shared k-pool representatives must never name different member groups.
+static void test_qwen4_kpool_remove_alias_cpu(llama_model * model) {
+    auto params = llama_context_default_params();
+    params.n_ctx = 128;
+    params.n_batch = params.n_ubatch = 64;
+    params.n_seq_max = 2;
+    params.n_threads = params.n_threads_batch = 2;
+    params.kv_unified = true;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    llama_context_ptr ctx(llama_init_from_model(model, params));
+    GGML_ASSERT(ctx);
+    auto * memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx.get()));
+    GGML_ASSERT(memory && memory->get_kpool() == 4 && memory->get_kpool_by_order());
+    llama_batch batch = llama_batch_init(8, 0, 1);
+    for (int p = 0; p < 8; ++p) {
+        common_batch_add(batch, p + 1, p, {0}, true);
+    }
+    GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+    GGML_ASSERT(memory->try_seq_cp(0, 1, -1, -1));
+    const auto snapshot = [&]() {
+        std::vector<uint8_t> bytes(llama_state_get_size(ctx.get()));
+        GGML_ASSERT(llama_state_get_data(ctx.get(), bytes.data(), bytes.size()) == bytes.size());
+        return bytes;
+    };
+    const auto before = snapshot();
+    using remove_fn = bool (llama_memory_hybrid_idx::*)(llama_seq_id, llama_pos, llama_pos);
+    const remove_fn removals[] = {
+        &llama_memory_hybrid_idx::seq_rm, &llama_memory_hybrid_idx::seq_rm_attn,
+        &llama_memory_hybrid_idx::seq_rm_transient, &llama_memory_hybrid_idx::seq_rm_attn_transient,
+    };
+    for (const auto remove : removals) {
+        // A's [4,5,6,7] and B's proposed [0,5,6,7] would share rep7.
+        // Refuse before changing any of the three children, including bytes.
+        GGML_ASSERT(!(memory->*remove)(1, 1, 5));
+        GGML_ASSERT(snapshot() == before);
+        for (llama_pos prefix : {2, 4}) {
+            // Both unaligned and pool-aligned prefix trims are still valid.
+            GGML_ASSERT((memory->*remove)(1, 0, prefix));
+            GGML_ASSERT(memory->get_mem_idx()->seq_pos_min(1) == prefix);
+            GGML_ASSERT(memory->get_mem_attn()->seq_pos_min(1) == prefix);
+            GGML_ASSERT(memory->get_mem_idx()->get_cells(0).seq_pos_get(0).size() == 8);
+            common_batch_clear(batch);
+            common_batch_add(batch, 9, 8, {1}, true);
+            GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+            GGML_ASSERT(llama_state_set_data(ctx.get(), before.data(), before.size()) == before.size());
+        }
+    }
+    GGML_ASSERT(memory->seq_rm_attn_transient(1, 7, -1)); // valid shared suffix rollback
+    GGML_ASSERT(memory->get_mem_idx()->get_cells(0).seq_pos_get(0).size() == 8);
+    GGML_ASSERT(llama_state_set_data(ctx.get(), before.data(), before.size()) == before.size());
+    // The same middle edit is supported once representatives are not shared.
+    GGML_ASSERT(memory->seq_rm(1, -1, -1));
+    GGML_ASSERT(memory->seq_rm(0, 1, 5));
+    GGML_ASSERT(memory->get_mem_idx()->get_cells(0).seq_pos_get(0).size() == 4);
+    GGML_ASSERT(memory->seq_rm(-1, -1, -1));
+    llama_batch_free(batch);
+    std::puts("Qwen4 kpool shared representative refusal / valid prefix trims: PASS");
+}
+
+// The loader admits only compress ratios in [1, 64], the k-pool width the index cache stores.
+static void test_qwen4_compress_ratio_admission_cpu(size_t seed) {
     const auto load_with_ratios = [&](const std::array<uint32_t, 2> & ratios) {
         gguf_context_ptr gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
         gguf_set_arr_data(gguf.get(), "qwen4exp.attention.compress_ratios", GGUF_TYPE_UINT32,
@@ -1099,331 +1195,6 @@ static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
         llama_model_ptr invalid(llama_model_init_from_user(
                 gguf.get(), set_tensor_data, &tmp, model_params));
         GGML_ASSERT(invalid == nullptr);
-    }
-
-    llama_context_params params = llama_context_default_params();
-    params.n_ctx = 128;
-    params.n_batch = 64;
-    params.n_ubatch = 64;
-    params.n_seq_max = 2;
-    params.kv_unified = true;
-    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    llama_context_ptr ctx(llama_init_from_model(model, params));
-    GGML_ASSERT(ctx != nullptr);
-
-    auto * memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx.get()));
-    GGML_ASSERT(memory != nullptr && memory->get_mem_idx() != nullptr);
-    auto * idx = memory->get_mem_idx();
-
-    const auto apply_text = [&](llama_seq_id seq, const std::vector<llama_pos> & positions) {
-        std::vector<llama_pos> mutable_positions = positions;
-        std::vector<llama_token> tokens(positions.size(), 1);
-        std::vector<int32_t> n_seq_id(positions.size(), 1);
-        std::vector<llama_seq_id> seq_values(positions.size(), seq);
-        std::vector<llama_seq_id *> seq_ids(positions.size());
-        std::vector<int8_t> output(positions.size(), 0);
-        for (size_t i = 0; i < positions.size(); ++i) {
-            seq_ids[i] = &seq_values[i];
-        }
-        llama_ubatch ubatch {
-            true, (uint32_t) positions.size(), (uint32_t) positions.size(), 1, 1, 1,
-            tokens.data(), nullptr, mutable_positions.data(), n_seq_id.data(), seq_ids.data(),
-            seq_values.data(), nullptr, output.data(), {},
-        };
-        const auto slot = idx->find_slot(ubatch, false);
-        GGML_ASSERT(!slot.empty());
-        idx->apply_ubatch(slot, ubatch);
-    };
-
-    const auto apply_shared_text = [&](const std::vector<llama_pos> & positions) {
-        std::vector<llama_pos> mutable_positions = positions;
-        std::vector<llama_token> tokens(positions.size(), 1);
-        std::vector<int32_t> n_seq_id(positions.size(), 2);
-        std::vector<llama_seq_id> seq_values(2*positions.size());
-        std::vector<llama_seq_id *> seq_ids(positions.size());
-        std::vector<int8_t> output(positions.size(), 0);
-        for (size_t i = 0; i < positions.size(); ++i) {
-            seq_values[2*i + 0] = 0;
-            seq_values[2*i + 1] = 1;
-            seq_ids[i] = &seq_values[2*i];
-        }
-        llama_seq_id seq_id_unq[2] = { 0, 1 };
-        llama_ubatch ubatch {
-            true, (uint32_t) positions.size(), (uint32_t) positions.size(), 1, 2, 1,
-            tokens.data(), nullptr, mutable_positions.data(), n_seq_id.data(), seq_ids.data(),
-            seq_id_unq, nullptr, output.data(), {},
-        };
-        const auto slot = idx->find_slot(ubatch, false);
-        GGML_ASSERT(!slot.empty());
-        idx->apply_ubatch(slot, ubatch);
-    };
-
-    const auto apply_image = [&](llama_seq_id seq, const std::vector<llama_pos> & positions) {
-        GGML_ASSERT(positions.size() % 4 == 0);
-        std::vector<llama_pos> mutable_positions = positions;
-        const size_t n = positions.size()/4;
-        std::vector<float> embd(n, 0.0f);
-        std::vector<int32_t> n_seq_id(n, 1);
-        std::vector<llama_seq_id> seq_values(n, seq);
-        std::vector<llama_seq_id *> seq_ids(n);
-        std::vector<int8_t> output(n, 0);
-        for (size_t i = 0; i < n; ++i) {
-            seq_ids[i] = &seq_values[i];
-        }
-        llama_ubatch ubatch {
-            true, (uint32_t) n, (uint32_t) n, 1, 1, 4,
-            nullptr, embd.data(), mutable_positions.data(), n_seq_id.data(), seq_ids.data(),
-            seq_values.data(), nullptr, output.data(), {},
-        };
-        const auto slot = idx->find_slot(ubatch, false);
-        GGML_ASSERT(!slot.empty());
-        idx->apply_ubatch(slot, ubatch);
-    };
-
-    struct layout_result {
-        int64_t n_kv;
-        int64_t n_blocks;
-        std::vector<int32_t> cell_blk;
-        std::vector<int32_t> blk_cells;
-        std::vector<int32_t> blk_pos;
-        std::vector<float> bias;
-    };
-
-    llama_memory_hybrid_idx_context qsa(memory);
-    const auto run = [&](uint32_t ratio, bool blk_bias, llama_seq_id seq,
-                         const std::vector<llama_pos> & query_pos, uint32_t n_query = 1,
-                         uint32_t n_streams = 1, bool causal = true) {
-        GGML_ASSERT(query_pos.size() == 1 || query_pos.size() == 4);
-        llama_memory_hybrid_idx_context query_ctx(memory);
-        GGML_ASSERT(n_streams <= query_ctx.get_n_stream());
-        const int64_t n_kv = query_ctx.get_idx()->get_n_kv();
-        const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
-        ggml_init_params tensor_params = { 128*1024, nullptr, true };
-        ggml_context_ptr tensor_ctx(ggml_init(tensor_params));
-        GGML_ASSERT(tensor_ctx != nullptr);
-        ggml_tensor * cell_blk = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_I32, n_kv, n_streams);
-        ggml_tensor * blk_cells = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_I32, ratio*n_blocks, n_streams);
-        ggml_tensor * blk_pos = ggml_new_tensor_1d(tensor_ctx.get(), GGML_TYPE_I32, 4*n_blocks*n_streams);
-        ggml_tensor * bias = ggml_new_tensor_3d(
-                tensor_ctx.get(), GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_query, n_streams);
-        ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
-        GGML_ASSERT(cpu != nullptr);
-        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(tensor_ctx.get(), cpu.get()));
-        GGML_ASSERT(buffer != nullptr);
-
-        const uint32_t n_tokens = n_query*n_streams;
-        std::vector<llama_token> tokens(n_tokens, 1);
-        std::vector<llama_pos> mutable_query_pos(query_pos.size()*n_tokens);
-        std::vector<int32_t> n_seq_id(n_tokens, 1);
-        std::vector<llama_seq_id> stream_seqs(n_streams);
-        std::vector<llama_seq_id *> seq_ids(n_tokens);
-        std::vector<int8_t> output(n_tokens, 1);
-        for (uint32_t s = 0; s < n_streams; ++s) {
-            stream_seqs[s] = seq + s;
-            for (uint32_t i = 0; i < n_query; ++i) {
-                seq_ids[s*n_query + i] = &stream_seqs[s];
-            }
-        }
-        for (size_t axis = 0; axis < query_pos.size(); ++axis) {
-            for (uint32_t s = 0; s < n_streams; ++s) {
-                for (uint32_t i = 0; i < n_query; ++i) {
-                    mutable_query_pos[axis*n_tokens + s*n_query + i] =
-                        query_pos[axis] + (axis == 0 ? llama_pos(i + 31*s) : 0);
-                }
-            }
-        }
-        llama_ubatch query {
-            true, n_tokens, n_query, n_streams, n_streams, (uint32_t) query_pos.size(),
-            tokens.data(), nullptr, mutable_query_pos.data(),
-            n_seq_id.data(), seq_ids.data(), stream_seqs.data(), nullptr, output.data(), {},
-        };
-        query_ctx.set_input_qsa(cell_blk, blk_cells, blk_pos, bias, &query, ratio, blk_bias, causal);
-
-        layout_result result {
-            n_kv, n_blocks,
-            std::vector<int32_t>((int32_t *) cell_blk->data, (int32_t *) cell_blk->data + n_kv*n_streams),
-            std::vector<int32_t>((int32_t *) blk_cells->data, (int32_t *) blk_cells->data + ratio*n_blocks*n_streams),
-            std::vector<int32_t>((int32_t *) blk_pos->data, (int32_t *) blk_pos->data + 4*n_blocks*n_streams),
-            std::vector<float>((float *) bias->data,
-                               (float *) bias->data + n_tokens*(blk_bias ? n_blocks : n_kv)),
-        };
-        return result;
-    };
-
-    // Batched direct bias must match the general single-query path exactly.
-    // Cover the admission boundary, a partial tail and an older hole that must
-    // keep the fallback, while preserving maps and gather metadata as well.
-    for (int layout = 0; layout < 3; ++layout) {
-        idx->clear(false);
-        std::vector<llama_pos> positions;
-        for (llama_pos p = 0; p < (layout == 0 ? 96 : 95); ++p) {
-            if (layout != 2 || p < 40 || p >= 44) {
-                positions.push_back(p);
-            }
-        }
-        apply_text(0, positions);
-        for (uint32_t ratio : { 1u, 4u, 16u, 64u }) {
-            for (uint32_t count : { 31u, 32u, 33u }) {
-                const auto batched = run(ratio, true, 0, { 47 }, count);
-                for (uint32_t i = 0; i < count; ++i) {
-                    const auto single = run(ratio, true, 0, { llama_pos(47 + i) });
-                    GGML_ASSERT(batched.cell_blk == single.cell_blk);
-                    GGML_ASSERT(batched.blk_cells == single.blk_cells);
-                    GGML_ASSERT(batched.blk_pos == single.blk_pos);
-                    GGML_ASSERT(std::memcmp(batched.bias.data() + i*single.n_blocks,
-                            single.bias.data(), single.n_blocks*sizeof(float)) == 0);
-                }
-            }
-        }
-    }
-
-    // An old incomplete block must remain hidden while the actual incomplete causal tail is
-    // forced visible. Pin both the compact per-block and general per-cell bias contracts.
-    idx->clear(false);
-    apply_text(0, { 0, 1, 2, 3, 8, 9, 12, 13 });
-    const auto block_layout = run(4, true, 0, { 13 });
-    const auto cell_layout  = run(4, false, 0, { 13 });
-    const auto & gap_cells = idx->get_cells(0);
-    int32_t old_cell = -1;
-    int32_t tail_cell = -1;
-    for (uint32_t physical = 0; physical < gap_cells.size(); ++physical) {
-        if (!gap_cells.is_empty(physical) && gap_cells.seq_has(physical, 0)) {
-            old_cell  = gap_cells.pos_get(physical) == 8  ? (int32_t) physical : old_cell;
-            tail_cell = gap_cells.pos_get(physical) == 12 ? (int32_t) physical : tail_cell;
-        }
-    }
-    GGML_ASSERT(old_cell >= 0 && tail_cell >= 0);
-    GGML_ASSERT(std::isinf(block_layout.bias[block_layout.cell_blk[old_cell]]));
-    GGML_ASSERT(block_layout.bias[block_layout.cell_blk[tail_cell]] == 1e9f);
-    GGML_ASSERT(std::isinf(cell_layout.bias[old_cell]));
-    GGML_ASSERT(cell_layout.bias[tail_cell] == 1e9f);
-
-    // A unified shared-prefix/private-suffix history cannot use one sparse block layout for both
-    // queries. It must take the dense-attention fallback instead of dropping the boundary block.
-    idx->clear(false);
-    apply_shared_text({ 0, 1 });
-    apply_text(0, { 2, 3 });
-    apply_text(1, { 2, 3 });
-    llama_token fork_token[2] = { 1, 1 };
-    llama_pos fork_pos[2] = { 7, 7 };
-    int32_t fork_n_seq_id[2] = { 1, 1 };
-    llama_seq_id fork_seq[2] = { 0, 1 };
-    llama_seq_id * fork_seq_ids[2] = { &fork_seq[0], &fork_seq[1] };
-    int8_t fork_output[2] = { 1, 1 };
-    llama_ubatch fork_query {
-        true, 2, 1, 2, 2, 1, fork_token, nullptr, fork_pos,
-        fork_n_seq_id, fork_seq_ids, fork_seq, nullptr, fork_output, {},
-    };
-    GGML_ASSERT(!qsa.qsa_selection_safe(&fork_query));
-    llama_ubatch dormant_query {
-        true, 1, 1, 1, 1, 1, fork_token, nullptr, fork_pos,
-        fork_n_seq_id, fork_seq_ids, fork_seq, nullptr, fork_output, {},
-    };
-    GGML_ASSERT(qsa.qsa_selection_safe(&dormant_query));
-
-    // A single image sequence ranks repeated temporal positions by spatial coordinates.
-    idx->clear(false);
-    apply_image(0, {
-        10, 10, 10, 10,
-         0,  0,  1,  1,
-         0,  1,  0,  1,
-        10, 10, 10, 10,
-    });
-    const auto mixed = run(4, false, 0, { 10, 1, 1, 10 });
-    const auto mixed_block = run(4, true, 0, { 10, 1, 1, 10 });
-    const auto & mixed_cells = idx->get_cells(0);
-    int32_t image_bid = -1;
-    std::vector<int32_t> image_cells;
-    for (uint32_t physical = 0; physical < mixed_cells.size(); ++physical) {
-        if (mixed_cells.is_empty(physical)) {
-            continue;
-        }
-        if (mixed_cells.seq_has(physical, 0)) {
-            image_cells.push_back((int32_t) physical);
-            image_bid = image_bid < 0 ? mixed.cell_blk[physical] : image_bid;
-            GGML_ASSERT(mixed.cell_blk[physical] == image_bid);
-            GGML_ASSERT(std::isfinite(mixed.bias[physical]));
-        }
-    }
-    GGML_ASSERT(image_bid >= 0 && image_cells.size() == 4);
-    std::vector<int32_t> gathered_image(
-            mixed.blk_cells.begin() + image_bid*4, mixed.blk_cells.begin() + image_bid*4 + 4);
-    std::sort(image_cells.begin(), image_cells.end());
-    std::sort(gathered_image.begin(), gathered_image.end());
-    GGML_ASSERT(image_cells == gathered_image);
-    GGML_ASSERT(mixed.blk_pos[image_bid] == 10);
-    GGML_ASSERT(mixed.blk_pos[mixed.n_blocks + image_bid] == 0);
-    GGML_ASSERT(mixed.blk_pos[2*mixed.n_blocks + image_bid] == 0);
-    GGML_ASSERT(mixed.blk_pos[3*mixed.n_blocks + image_bid] == 10);
-    GGML_ASSERT(mixed_block.cell_blk == mixed.cell_blk);
-    GGML_ASSERT(mixed_block.blk_cells == mixed.blk_cells);
-    GGML_ASSERT(mixed_block.bias[image_bid] == 0.0f);
-
-    // The four-plane position tensor is output only, not rank scratch: ratio 8 M-RoPE must work.
-    idx->clear(false);
-    apply_image(0, {
-        20, 20, 20, 20, 20, 20, 20, 20,
-         0,  0,  0,  0,  1,  1,  1,  1,
-         0,  1,  2,  3,  0,  1,  2,  3,
-        20, 20, 20, 20, 20, 20, 20, 20,
-    });
-    const auto ratio8 = run(8, false, 0, { 20, 1, 3, 20 });
-    const auto & ratio8_cells = idx->get_cells(0);
-    int32_t ratio8_bid = -1;
-    std::vector<int32_t> expected_ratio8;
-    for (uint32_t physical = 0; physical < ratio8_cells.size(); ++physical) {
-        if (!ratio8_cells.is_empty(physical)) {
-            expected_ratio8.push_back((int32_t) physical);
-            ratio8_bid = ratio8_bid < 0 ? ratio8.cell_blk[physical] : ratio8_bid;
-            GGML_ASSERT(ratio8.cell_blk[physical] == ratio8_bid);
-        }
-    }
-    GGML_ASSERT(ratio8_bid >= 0 && expected_ratio8.size() == 8);
-    std::vector<int32_t> gathered_ratio8(
-            ratio8.blk_cells.begin() + ratio8_bid*8, ratio8.blk_cells.begin() + ratio8_bid*8 + 8);
-    std::sort(expected_ratio8.begin(), expected_ratio8.end());
-    std::sort(gathered_ratio8.begin(), gathered_ratio8.end());
-    GGML_ASSERT(expected_ratio8 == gathered_ratio8);
-
-    // Physical streams have independent layouts and different query frontiers.
-    // Compare multi-query admission with the existing per-stream single-query
-    // fallback, including a hole in only one stream and non-causal attention.
-    params.kv_unified = false;
-    params.n_ctx = 256;
-    llama_context_ptr split_ctx(llama_init_from_model(model, params));
-    GGML_ASSERT(split_ctx != nullptr);
-    memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(split_ctx.get()));
-    GGML_ASSERT(memory != nullptr && memory->get_mem_idx() != nullptr);
-    idx = memory->get_mem_idx();
-    GGML_ASSERT(idx->get_n_stream() == 2);
-    for (bool hole : { false, true }) {
-        idx->clear(false);
-        for (llama_seq_id seq = 0; seq < 2; ++seq) {
-            std::vector<llama_pos> positions;
-            for (llama_pos p = 0; p < (seq == 0 ? 96 : 87); ++p) {
-                if (!hole || seq == 0 || p < 40 || p >= 44) {
-                    positions.push_back(p);
-                }
-            }
-            apply_text(seq, positions);
-        }
-        for (uint32_t ratio : { 1u, 4u, 16u, 64u }) {
-            for (uint32_t count : { 31u, 32u, 33u }) {
-                for (bool causal : { false, true }) {
-                    const auto batched = run(ratio, true, 0, { 47 }, count, 2, causal);
-                    for (uint32_t i = 0; i < count; ++i) {
-                        const auto single = run(ratio, true, 0, { llama_pos(47 + i) }, 1, 2, causal);
-                        GGML_ASSERT(batched.cell_blk == single.cell_blk);
-                        GGML_ASSERT(batched.blk_cells == single.blk_cells);
-                        GGML_ASSERT(batched.blk_pos == single.blk_pos);
-                        for (uint32_t s = 0; s < 2; ++s) {
-                            GGML_ASSERT(std::memcmp(batched.bias.data() + (s*count + i)*single.n_blocks,
-                                    single.bias.data() + s*single.n_blocks, single.n_blocks*sizeof(float)) == 0);
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -1471,14 +1242,59 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
 
     // The index cache must still be populated when every cache cell fits within
     // the QSA budget, but selection-only graph work must disappear.  Pin the exact
-    // ratio-4 boundary: top_k 253 selects at most 256 cells, while 252 selects 255.
+    // ratio-4 boundary: top_k 256 covers all 256 cells, while 252 selects 255.
     {
         gguf_context_ptr dense_gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
-        gguf_set_val_u32(dense_gguf.get(), "qwen4exp.attention.indexer.top_k", 253);
+        gguf_set_val_u32(dense_gguf.get(), "qwen4exp.attention.indexer.top_k", 256);
         qsa_trace dense_trace;
         auto dense = get_model_and_ctx(
                 dense_gguf.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false,
                 trace_qsa, &dense_trace);
+        // Persistence identity binds each active pooling semantic, including
+        // GLM's configurable tail policy; inert defaults must not invalidate
+        // ordinary non-pooled families.
+        auto & hp = dense.first->hparams;
+        const auto digest = [&]() {
+            std::array<uint8_t, 32> value = {};
+            GGML_ASSERT(llama_model_semantic_family_digest(dense.first.get(), value.data()));
+            return value;
+        };
+        const auto pooled_identity = digest();
+        const auto changes_identity = [&](auto & field, auto value) {
+            const auto before = digest();
+            const auto original = field;
+            field = value;
+            GGML_ASSERT(digest() != before);
+            field = original;
+            GGML_ASSERT(digest() == before);
+        };
+        changes_identity(hp.indexer_kpool, hp.indexer_kpool + 1);
+        changes_identity(hp.indexer_kpool_row, hp.indexer_kpool_row + 1);
+        changes_identity(hp.indexer_kpool_by_order, !hp.indexer_kpool_by_order);
+        changes_identity(hp.indexer_kpool_select_tail, !hp.indexer_kpool_select_tail);
+        changes_identity(hp.n_value_expert, 2u);
+        hp.n_value_expert = 2;
+        changes_identity(hp.n_value_expert_used, 1u);
+        hp.n_value_expert = 0;
+        changes_identity(hp.n_layer_decision, 1u);
+        changes_identity(hp.pooling_type_cls, LLAMA_POOLING_TYPE_MEAN);
+        hp.pooling_type_cls = LLAMA_POOLING_TYPE_CLS;
+        GGML_ASSERT(digest() == pooled_identity); // explicit legacy default
+        hp.pooling_type_cls = LLAMA_POOLING_TYPE_UNSPECIFIED;
+        const auto saved_pool = hp.indexer_kpool;
+        hp.indexer_kpool = 0;
+        const auto ordinary_identity = digest();
+        GGML_ASSERT(ordinary_identity != pooled_identity);
+        const auto saved_row = hp.indexer_kpool_row;
+        hp.indexer_kpool_row++;
+        hp.indexer_kpool_by_order = !hp.indexer_kpool_by_order;
+        hp.indexer_kpool_select_tail = !hp.indexer_kpool_select_tail;
+        GGML_ASSERT(digest() == ordinary_identity);
+        hp.indexer_kpool_row = saved_row;
+        hp.indexer_kpool_by_order = !hp.indexer_kpool_by_order;
+        hp.indexer_kpool_select_tail = !hp.indexer_kpool_select_tail;
+        hp.indexer_kpool = saved_pool;
+        GGML_ASSERT(digest() == pooled_identity);
         const auto dense_logits = get_logits(dense.first.get(), dense.second.get(), { 1, 2, 3, 4 });
         GGML_ASSERT(dense_trace.raw_key_nodes > 0);
         GGML_ASSERT(dense_trace.score_nodes == 0);
@@ -1516,8 +1332,27 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
         GGML_ASSERT(sparse_trace.raw_key_nodes > 0);
         GGML_ASSERT(sparse_trace.score_nodes > 0);
         GGML_ASSERT(sparse_trace.top_k_nodes > 0);
-        GGML_ASSERT(sparse_trace.score_q_reshape_seen);
+        // Final upstream uses the fused lightning indexer, not the old explicit score matmul.
         GGML_ASSERT(!sparse_trace.score_q_has_redundant_cont);
+    }
+
+    // Ratio-1 native checkpoints use singleton pools with no tail. Exercise both
+    // dense and sparse graphs, including the full cache where every cell is a rep.
+    for (uint32_t budget : { 256u, 4u }) {
+        gguf_context_ptr gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        const std::array<uint32_t, 2> ratios = { 1, 1 };
+        gguf_set_arr_data(gguf.get(), "qwen4exp.attention.compress_ratios", GGUF_TYPE_UINT32,
+                          ratios.data(), ratios.size());
+        gguf_set_val_u32(gguf.get(), "qwen4exp.attention.indexer.top_k", budget);
+        qsa_trace trace;
+        auto singleton = get_model_and_ctx(
+                gguf.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, trace_qsa, &trace);
+        GGML_ASSERT(singleton.first->hparams.indexer_kpool == 1);
+        const auto logits = get_logits(singleton.first.get(), singleton.second.get(),
+                                       std::vector<llama_token>(256, 1));
+        GGML_ASSERT(std::all_of(logits.begin(), logits.end(), [](float x) { return std::isfinite(x); }));
+        GGML_ASSERT(trace.raw_key_nodes > 0);
+        GGML_ASSERT((trace.top_k_nodes > 0) == (budget < 256));
     }
 
     // A graph built for the dense 256-cell watermark must be rejected and rebuilt
@@ -1526,7 +1361,7 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
     {
         gguf_context_ptr transition_gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
         gguf_set_val_u32(transition_gguf.get(), "qwen4exp.context_length", 512);
-        gguf_set_val_u32(transition_gguf.get(), "qwen4exp.attention.indexer.top_k", 253);
+        gguf_set_val_u32(transition_gguf.get(), "qwen4exp.attention.indexer.top_k", 256);
         qsa_trace transition_trace;
         auto transition = get_model_and_ctx(
                 transition_gguf.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false,
@@ -1590,7 +1425,8 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
 
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
     auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
-    test_qwen4_qsa_layout_cpu(model_and_ctx.first.get(), seed);
+    test_qwen4_kpool_remove_alias_cpu(model_and_ctx.first.get());
+    test_qwen4_compress_ratio_admission_cpu(seed);
 
     // Phase-0 VBR ownership/accounting contract. Qwen4's attention KV is the only storage whose
     // representation may be selected by Turbo/VBR; recurrent state is fixed and the QSA indexer
@@ -1803,6 +1639,24 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
         decode_seq(1, 2);
         assert_mirrored(0);
         assert_mirrored(1);
+
+        // Shared pooled representatives cannot express partial aliasing. Both
+        // copy entry points must refuse before touching any child or metadata.
+        const auto snapshot = [&]() {
+            std::vector<uint8_t> data(llama_state_get_size(mutation_ctx.get()));
+            const size_t written = llama_state_get_data(mutation_ctx.get(), data.data(), data.size());
+            GGML_ASSERT(written == data.size());
+            return data;
+        };
+        const auto before_partial_copy = snapshot();
+        for (const auto & range : { std::pair<llama_pos, llama_pos>{ 1, -1 }, { 0, 3 } }) {
+            GGML_ASSERT(!mutation_memory->try_seq_cp(0, 1, range.first, range.second));
+            GGML_ASSERT(snapshot() == before_partial_copy);
+            GGML_ASSERT(!mutation_memory->try_seq_cp_transient(0, 1, range.first, range.second));
+            GGML_ASSERT(snapshot() == before_partial_copy);
+            assert_mirrored(0);
+            assert_mirrored(1);
+        }
 
         GGML_ASSERT(!mutation_memory->try_seq_cp(0, 1, 0, -1));
         assert_mirrored(1);
@@ -2045,7 +1899,7 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
 
     // The 256-cell padded dense frontier becomes sparse when the continuation
     // grows to 512. This is the same boundary used by the CPU QSA mutation test.
-    model->hparams.indexer_top_k = 253;
+    model->hparams.indexer_top_k = 256;
 
     const auto assert_finite = [&](llama_context * ctx, int32_t i) {
         const float * logits = llama_get_logits_ith(ctx, i);
@@ -2323,8 +2177,8 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     GGML_ASSERT(std::isfinite(stream0_nmse) && stream0_nmse <= 1.0e-10);
     GGML_ASSERT(std::isfinite(stream1_nmse) && stream1_nmse <= 1.0e-10);
 
-    // Unified KV has one physical QSA layout. A shared prefix followed by private continuations
-    // therefore falls back to dense attention; compare each query with its isolated history.
+    // Final kpool tracks per-sequence groups in unified KV, including a shared
+    // prefix followed by private continuations. Compare sparse isolated histories.
     const auto isolated_fork = [&](llama_token private_base, llama_token query_token) {
         llama_context_ptr isolated(llama_init_from_model(model.get(), sequential_params));
         GGML_ASSERT(isolated != nullptr);
@@ -2343,12 +2197,8 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
         llama_batch_free(query);
         return last_logits(isolated.get());
     };
-    const auto saved_ratios = model->hparams.dsv4_compress_ratios;
-    std::fill(model->hparams.dsv4_compress_ratios.begin(),
-              model->hparams.dsv4_compress_ratios.end(), 0);
     const auto fork_ref0 = isolated_fork(1, 17);
     const auto fork_ref1 = isolated_fork(9, 23);
-    model->hparams.dsv4_compress_ratios = saved_ratios;
 
     qsa_gather_trace fork_trace;
     llama_context_params fork_params = streams_params;
@@ -2394,7 +2244,7 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     common_batch_add(fork_queries, 23, 64, { 1 }, true);
     GGML_ASSERT(llama_decode(fork_ctx.get(), fork_queries) == 0);
     llama_batch_free(fork_queries);
-    GGML_ASSERT(fork_trace.top_k == 0 && fork_trace.selected_k == 0 && fork_trace.selected_v == 0);
+    GGML_ASSERT(fork_trace.top_k > 0 && fork_trace.selected_k > 0 && fork_trace.selected_v > 0);
     const double fork0_nmse = nmse(fork_ref0, logits_ith(fork_ctx.get(), 0));
     const double fork1_nmse = nmse(fork_ref1, logits_ith(fork_ctx.get(), 1));
     GGML_ASSERT(std::isfinite(fork0_nmse) && fork0_nmse <= 1.0e-10);
@@ -2710,7 +2560,8 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     // relocated restore must reproduce it, proving the restored index bytes
     // are not merely plausible metadata.
     GGML_ASSERT(memory->seq_rm(1, -1, -1));
-    GGML_ASSERT(memory->try_seq_cp(0, 1, 0, 321));
+    // Source ends at 320: final pooled indexers share only whole sequences.
+    GGML_ASSERT(memory->try_seq_cp(0, 1, 0, -1));
     llama_batch qsa_reference_batch = llama_batch_init(1, 0, 1);
     common_batch_add(qsa_reference_batch, 1, 321, { 1 }, true);
     GGML_ASSERT(llama_decode(ctx.get(), qsa_reference_batch) == 0);
@@ -2809,7 +2660,25 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
         ggml_row_size(first_index_tensor->type, first_index_tensor->ne[0]);
     GGML_ASSERT(first_row_size > 0 && changed_row->second.size() >= first_row_size);
 
-    // Walk the exact v1 prefix and native KV metadata to the first layer's K
+    // Old codec envelopes and native payload versions must fail before mutation.
+    {
+        auto old_descriptor = qsa_descriptor;
+        old_descriptor.format_version = 1;
+        std::unique_ptr<vbr_parsed_companion_image> refused;
+        GGML_ASSERT(!vbr_parse_qsa_index_companion(nullptr, old_descriptor, qsa_chain, qsa_target, refused));
+        GGML_ASSERT(!refused);
+        auto old_bytes = qsa_bytes;
+        const uint32_t old_version = 1;
+        GGML_ASSERT(old_bytes.size() >= 2*sizeof(old_version));
+        std::memcpy(old_bytes.data() + sizeof(old_version), &old_version, sizeof(old_version));
+        artifact_segment_chain old_chain(old_bytes.size());
+        GGML_ASSERT(old_chain.append(old_bytes.data(), old_bytes.size()));
+        GGML_ASSERT(!vbr_parse_qsa_index_companion(nullptr, qsa_descriptor, old_chain, qsa_target, refused));
+        GGML_ASSERT(!refused);
+        assert_qsa_image(qsa_layout);
+    }
+
+    // Walk the codec prefix and native KV metadata to the first layer's K
     // rows. The native rows are serialized in ascending physical-cell order.
     size_t native_offset = 0;
     const auto read_native_scalar = [&](auto & value) {
@@ -2836,9 +2705,23 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
         uint32_t layer = 0;
         uint64_t width = 0;
         read_native_scalar(layer);
+        const size_t width_offset = native_offset;
         read_native_scalar(width);
         GGML_ASSERT(layer == index_layers[i] && width ==
             uint64_t(idx->get_k_storage(layer)->ne[0]));
+        if (i == 0) {
+            // A raw-only pre-kpool image cannot restore into raw|pooled rows.
+            auto raw_only = qsa_bytes;
+            const uint64_t old_width = model->hparams.indexer_head_size;
+            GGML_ASSERT(old_width < width);
+            std::memcpy(raw_only.data() + width_offset, &old_width, sizeof(old_width));
+            artifact_segment_chain old_chain(raw_only.size());
+            GGML_ASSERT(old_chain.append(raw_only.data(), raw_only.size()));
+            std::unique_ptr<vbr_parsed_companion_image> refused;
+            GGML_ASSERT(!vbr_parse_qsa_index_companion(nullptr, qsa_descriptor, old_chain, qsa_target, refused));
+            GGML_ASSERT(!refused);
+            assert_qsa_image(qsa_layout);
+        }
     }
     llama_pos encoded_terminal = -1;
     uint32_t encoded_stream = 0, encoded_cells = 0;
@@ -2871,13 +2754,17 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
         GGML_ASSERT(position >= 0 && sequence == 0);
     }
     uint32_t v_trans = 0, native_layers = 0;
+    uint32_t native_rot_k = 0, native_rot_v = 0;
     int32_t native_k_type = -1;
     uint64_t native_row_size = 0;
     read_native_scalar(v_trans);
     read_native_scalar(native_layers);
+    read_native_scalar(native_rot_k);
+    read_native_scalar(native_rot_v);
     read_native_scalar(native_k_type);
     read_native_scalar(native_row_size);
     GGML_ASSERT(v_trans <= 1 && native_layers == index_layers.size() &&
+        native_rot_k == 0 && native_rot_v == 0 &&
         native_k_type == int32_t(first_index_tensor->type) &&
         native_row_size == first_row_size);
     size_t physical_ordinal = 0;
@@ -4011,20 +3898,17 @@ static std::vector<float> get_logits(
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
-    llama_batch batch = llama_batch_init(n_ctx, 0, 1);
+    common_batch batch(lctx);
     GGML_ASSERT(n_tokens <= n_ctx);
     for (uint32_t pos = 0; pos < n_tokens; pos++) {
-        common_batch_add(batch, tokens[pos], pos, {0}, true);
+        batch.add(tokens[pos], pos, 0, true);
     }
-    batch.n_tokens = n_tokens;
     if (encode) {
-        if (llama_encode(lctx, batch)) {
-            llama_batch_free(batch);
+        if (llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get())) {
             throw std::runtime_error("failed to encode batch");
         }
     }
-    if (llama_decode(lctx, batch)) {
-        llama_batch_free(batch);
+    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         throw std::runtime_error("failed to decode batch");
     }
 
@@ -4036,8 +3920,96 @@ static std::vector<float> get_logits(
             ret.push_back(logits_ith[j]);
         }
     }
-    llama_batch_free(batch);
     return ret;
+}
+
+// entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
+// returns the llama_process() error code
+static int32_t get_logits_mixed(
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, const std::vector<float> & embd, bool mixed,
+        std::vector<float> & ret) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_embd   = llama_model_n_embd_inp(model);
+    const uint32_t n_tokens = tokens.size();
+    const uint32_t i_embd_0 = n_tokens/4;
+    const uint32_t i_embd_1 = n_tokens/2;
+
+    const std::vector<uint32_t> bounds = mixed
+        ? std::vector<uint32_t>{0, n_tokens}
+        : std::vector<uint32_t>{0, i_embd_0, i_embd_1, n_tokens};
+
+    llama_memory_clear(llama_get_memory(lctx), true);
+    llama_batch_ext_ptr batch(llama_batch_ext_init(lctx));
+
+    ret.clear();
+    ret.reserve(n_tokens*n_vocab);
+    for (size_t c = 0; c + 1 < bounds.size(); c++) {
+        llama_batch_ext_clear(batch.get());
+        for (uint32_t i = bounds[c]; i < bounds[c + 1]; i++) {
+            const bool is_embd = i >= i_embd_0 && i < i_embd_1;
+            const int32_t idx = is_embd
+                ? llama_batch_ext_add_embd(batch.get(), 0, { embd.data() + (size_t) (i - i_embd_0)*n_embd, 1, n_embd })
+                : llama_batch_ext_add_token(batch.get(), 0, tokens[i]);
+            GGML_ASSERT(idx >= 0);
+            const llama_pos pos[4] = { (llama_pos) i, (llama_pos) i, (llama_pos) i, 0 };
+            llama_batch_ext_set_pos(batch.get(), idx, pos);
+            llama_batch_ext_set_output_logits(batch.get(), idx, true);
+        }
+        const int32_t err = llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        if (err != 0) {
+            return err;
+        }
+        for (uint32_t i = 0; i < bounds[c + 1] - bounds[c]; i++) {
+            const float * logits_ith = llama_get_logits_ith(lctx, i);
+            ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+        }
+    }
+    return 0;
+}
+
+static bool check_causal_attn_toggle(
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_past   = tokens.size();
+    const uint32_t n_ubatch = llama_n_ubatch(lctx);
+
+    GGML_ASSERT(n_past + n_ubatch/2 + n_ubatch <= llama_n_ctx(lctx));
+
+    llama_set_causal_attn(lctx, false);
+
+    common_batch batch(lctx);
+
+    bool ok = true;
+    uint32_t pos = n_past;
+    for (const uint32_t n_tokens : { n_ubatch/2, n_ubatch }) {
+        batch.clear();
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            batch.add(tokens[i], pos++, 0, true);
+        }
+
+        const int32_t rc = llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        if (rc != 0) {
+            LOG_ERR("%s: n_tokens=%u: llama_process returned %d\n", __func__, n_tokens, rc);
+            ok = false;
+            break;
+        }
+
+        const float * logits = llama_get_logits_ith(lctx, n_tokens - 1);
+        if (logits == nullptr) {
+            LOG_ERR("%s: n_tokens=%u: no logits\n", __func__, n_tokens);
+            ok = false;
+            break;
+        }
+        for (uint32_t j = 0; j < n_vocab; j++) {
+            if (std::isnan(logits[j])) {
+                LOG_ERR("%s: n_tokens=%u: nan logit\n", __func__, n_tokens);
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    return ok;
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -4086,6 +4058,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_MELLUM:
@@ -4109,6 +4082,7 @@ static bool moe_implemented(const llm_arch arch) {
         case LLM_ARCH_GRANITE_MOE:
         case LLM_ARCH_MISTRAL3:
         case LLM_ARCH_LLAMA_EMBED:
+        case LLM_ARCH_K2_HORIZON:
             return true;
         default:
             return false;
@@ -4131,7 +4105,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_GRANITE_SWITCH) {
         return false; // FIXME adapter fixture
     }
-    if (arch == LLM_ARCH_LLAMA_EMBED || arch == LLM_ARCH_GEMMA_EMBEDDING || arch == LLM_ARCH_T5ENCODER) {
+    if (arch == LLM_ARCH_LLAMA_EMBED || arch == LLM_ARCH_GEMMA_EMBEDDING || arch == LLM_ARCH_GEMMA_EMBEDDING2 || arch == LLM_ARCH_T5ENCODER) {
         return false; // FIXME Embedding (?) models produce inconsistent results.
     }
     if (arch == LLM_ARCH_RWKV6 || arch == LLM_ARCH_RWKV6QWEN2 || arch == LLM_ARCH_RWKV7 || arch == LLM_ARCH_ARWKV7) {
@@ -4143,6 +4117,9 @@ static bool arch_supported(const llm_arch arch) {
     }
     if (arch == LLM_ARCH_PLM) {
         return false; // TODO tensor shapes
+    }
+    if (arch == LLM_ARCH_CLEF) {
+        return false; // TODO decision head tensors
     }
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
         return false;
@@ -4276,9 +4253,15 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         std::vector<ggml_backend_dev_t> devs;
         std::string                     label;
         llama_split_mode                split_mode;
+        bool                            host_experts; // keep the experts in host memory, see host_experts_test
 
-        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode)
-            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode) {}
+        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, bool host_experts = false)
+            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), host_experts(host_experts) {}
+    };
+
+    const llama_model_tensor_buft_override host_experts_overrides[] = {
+        { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() },
+        { nullptr, nullptr },
     };
 
     std::vector<device_config> dev_configs;
@@ -4305,6 +4288,12 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         if (target_backend == nullptr) {
             dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
         }
+
+        // the ops that use the experts are offloaded to the first device and the scheduler copies the used experts
+        if (!devices_meta.empty()) {
+            dev_configs.emplace_back(devices_meta, "Host experts", LLAMA_SPLIT_MODE_LAYER, true);
+            max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+        }
     }
 
     size_t max_arch_name_length = 0;
@@ -4312,15 +4301,15 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         max_arch_name_length = std::max(max_arch_name_length, strlen(llm_arch_name(arch)));
     }
 
-    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|\n";
+    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|%15s|\n";
     const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
-    const std::string template_row_res = "%15s %10s|%20s|\n";
+    const std::string template_row_res = "%15s %10s|%20s|%15s %10s|\n";
 
     bool all_ok = true;
     size_t n_tests = 0;
     size_t n_failed = 0;
     common_log_flush(common_log_main());
-    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip");
+    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Mixed batch");
     LOG("|");
     for (size_t i = 0; i < max_arch_name_length; i++) {
         LOG("-");
@@ -4329,7 +4318,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     for (size_t i = 0; i < max_device_label_length; i++) {
         LOG("-");
     }
-    LOG("|------|---------------|---------|\n");
+    LOG("|------|---------------|---------|---------------|\n");
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -4360,6 +4349,11 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
+                if (dc.host_experts && (!moe || !host_experts_test(arch))) {
+                    continue;
+                }
+                const llama_model_tensor_buft_override * overrides = dc.host_experts ? host_experts_overrides : nullptr;
+
                 // print test config first; should anything fail during model loading or inference, at least we know which test case caused it
                 LOG(template_row_cfg.c_str(), llm_arch_name(arch), dc.label.c_str(), config_name.c_str());
                 fflush(stdout);
@@ -4368,7 +4362,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 std::vector<float> logits_dev;
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
+                std::string status_mixed     = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
+                char mixed_str[12] = {0};
                 bool test_executed = false;
                 bool test_ok = true;
                 bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
@@ -4391,7 +4387,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode, nullptr, nullptr, stdev);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode, nullptr, nullptr, stdev, overrides);
                         if (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
                             (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 ||
                              arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP)) {
@@ -4536,6 +4532,51 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             test_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
+
+                        // chunked decode matches a single batch only with causal attention over a memory
+                        llama_context * lctx_dev = model_and_ctx_dev.second.get();
+                        if (!encode && llama_get_memory(lctx_dev) != nullptr) {
+                            std::vector<float> embd_mixed((size_t) llama_model_n_embd_inp(model_and_ctx_dev.first.get())*tokens.size()/4);
+                            std::mt19937 gen(seed);
+                            std::normal_distribution<float> dis(0.0f, stdev);
+                            for (float & v : embd_mixed) {
+                                v = dis(gen);
+                            }
+                            std::vector<float> logits_mixed;
+                            std::vector<float> logits_chunks;
+                            if (llm_arch_supports_mixed_batch(arch)) {
+                                if (get_logits_mixed(model_and_ctx_dev.first.get(), lctx_dev, tokens, embd_mixed, false, logits_chunks) != 0 ||
+                                    get_logits_mixed(model_and_ctx_dev.first.get(), lctx_dev, tokens, embd_mixed, true,  logits_mixed)  != 0) {
+                                    throw std::runtime_error("failed to decode mixed batch");
+                                }
+                                const double nmse_mixed = nmse(logits_chunks, logits_mixed);
+                                snprintf(mixed_str, sizeof(mixed_str), "(%.2e)", nmse_mixed);
+                                status_mixed = "\033[1;32mOK\033[0m";
+                                if (!(nmse_mixed <= 1e-4)) {
+                                    test_ok = false;
+                                    status_mixed = "\033[1;31mFAIL\033[0m";
+                                }
+                            } else {
+                                // must be rejected as an invalid batch, mute the expected error log
+                                ud.verbosity = LOG_LEVEL_OUTPUT;
+                                const int32_t err = get_logits_mixed(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, embd_mixed, true, logits_mixed);
+                                ud.verbosity = verbosity;
+                                if (err != -1) {
+                                    test_ok = false;
+                                    status_mixed = "\033[1;31mFAIL\033[0m";
+                                }
+                            }
+                        }
+
+                        // runs after the mixed batch check, as it leaves the context with non-causal attention;
+                        // the DFlash drafters pin n_ubatch to n_batch, which leaves no room for the extra batches
+                        const bool drafter = arch == LLM_ARCH_DFLASH_DRAFT || arch == LLM_ARCH_GEMMA4_DFLASH_DRAFT;
+                        if (!encode && !drafter && !check_causal_attn_toggle(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens)) {
+                            if (test_ok) {
+                                status_nmse = "\033[1;31mFAIL\033[0m (toggle)";
+                            }
+                            test_ok = false;
+                        }
                     }
 
                     file_ptr file = make_test_tmpfile();
@@ -4557,7 +4598,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         ms.save(file.get());
                         rewind(file.get());
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file.get(), seed, dc.devs, dc.split_mode, encode, nullptr, nullptr, stdev);
+                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file.get(), seed, dc.devs, dc.split_mode, encode, nullptr, nullptr, stdev, overrides);
                         const std::vector<float> logits_roundtrip = get_logits(
                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                         status_roundtrip = "\033[1;32mOK\033[0m";
@@ -4581,7 +4622,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 }
 
                 // log the results for this test case
-                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
+                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_mixed.c_str(), mixed_str);
             }
         }
     }
@@ -4598,10 +4639,50 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     return all_ok && n_tests > 0 ? 0 : 1;
 }
 
+static void test_extended_batch_view() {
+    llama_batch_ext ext(4, 2, 4, 8, nullptr, 32, 4);
+    const float media[] = { 0.25f, -0.5f };
+    const llama_pos text_pos[] = { 7, 99, 99, 99 };
+    const llama_pos media_pos[] = { 8, 2, 3, 0 };
+    const int text = ext.add_token(6);
+    const int embd = ext.add_token(6);
+    GGML_ASSERT(ext.add_seq(text, 7));
+    GGML_ASSERT(ext.set_token_id(text, 3));
+    GGML_ASSERT(ext.set_token_pos(text, text_pos));
+    GGML_ASSERT(ext.set_token_embd(embd, { media, 1, 2 }));
+    GGML_ASSERT(ext.set_token_pos(embd, media_pos));
+    GGML_ASSERT(ext.set_decision_order(text, 2));
+    llama_batch view = {};
+    GGML_ASSERT(!ext.get_batch(view)); // raw ABI cannot carry mixed/order metadata
+    GGML_ASSERT(ext.get_batch(view, true));
+    GGML_ASSERT(view.n_tokens == 2 && view.token[0] == 3 && view.token[1] == 0);
+    GGML_ASSERT(view.embd[0] == 0 && view.embd[1] == 0 && view.embd[2] == media[0] && view.embd[3] == media[1]);
+    GGML_ASSERT((ext.flat_type == std::vector<int8_t>{ 0, 1 }));
+    GGML_ASSERT((ext.flat_decision_order == std::vector<int32_t>{ 2, 0 }));
+    GGML_ASSERT((ext.flat_pos == std::vector<llama_pos>{ 7, 8, 7, 2, 7, 3, 0, 0 }));
+    GGML_ASSERT(view.n_seq_id[0] == 2 && view.n_seq_id[1] == 1);
+    ext.tokens[1].seq_ids.insert(8);
+    GGML_ASSERT(!ext.get_batch(view, true));
+    ext.tokens[1].seq_ids.erase(8);
+    GGML_ASSERT(ext.get_batch(view, true));
+
+    // All-embedding and all-both-bearing MTP batches retain borrowed storage.
+    ext.clear();
+    const int row = ext.add_token(0);
+    GGML_ASSERT(ext.set_token_embd(row, { media, 1, 2 }));
+    GGML_ASSERT(ext.set_token_pos(row, media_pos));
+    GGML_ASSERT(ext.get_batch(view, true) && view.embd == ext.embd.data());
+    GGML_ASSERT(ext.set_token_id(row, 4));
+    GGML_ASSERT(ext.get_batch(view, true) && view.embd == ext.embd.data() && view.token[0] == 4);
+    GGML_ASSERT(ext.flat_type.empty());
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
     common_init();
+    llama_backend_init();
+    test_extended_batch_view();
 
     std::random_device rd;
 

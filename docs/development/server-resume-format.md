@@ -160,7 +160,7 @@ The range writer and the append reader are the only format work in the library.
 Both reuse `state_write_meta` / `state_write_data` and their readers.
 
 ```c
-#define LLAMA_STATE_SEQ_RANGE_VERSION 1
+#define LLAMA_STATE_SEQ_RANGE_VERSION 2
 
 // size / write the base part of seq_id for positions [p0, p1), cells in
 // ascending position order. 0 on failure
@@ -176,6 +176,16 @@ size_t llama_state_seq_append_data(ctx, src, size, seq_id, p0, p1, p_limit);
 
 Range blob: 16 bytes `{magic "gqsr", LLAMA_STATE_SEQ_RANGE_VERSION, p0, p1}`,
 then `cell_count`, the meta block and the data block of §1 for one stream.
+
+Version 2 includes the key/value rotation dimensions in the native KV data
+header. Version 1 blobs and their resume compatibility keys are incompatible;
+they are refused rather than interpreted using the new layout.
+
+Indexed/QSA memory refuses these range APIs before changing child state: the
+attention-only payload omits index keys, and `PARTIAL_ONLY` supplies recurrent
+state, not those keys. Full sequence snapshots and their companion contracts
+are separate. This matches the existing server resume `unsupported_qsa` gate;
+it does not add indexed range or indexed `--resume` support.
 
 - **No `n_stream` word.** A range belongs to one sequence, so the blob is the
   same under unified and split KV and installs under either. Tested both ways on

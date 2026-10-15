@@ -56,6 +56,7 @@ struct llama_cparams {
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
+    bool fused_dsv4_hc_mix;  // whole HC pre-mix in one op for small batches
     bool auto_fhc;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
@@ -64,6 +65,7 @@ struct llama_cparams {
     bool logits_all;
     bool pipeline_parallel;
     bool vbr_dynamic;
+    bool training = false;  // enabled by llama_opt_init(), never inferred for decoding
     enum llama_vbr_codec vbr_codec = LLAMA_VBR_CODEC_TURBO;
 
     double vbr_min_bits = 0.0;
@@ -98,10 +100,10 @@ struct llama_cparams {
     // default off keeps raw-logits behavior for every other consumer.
     bool dflash_argmax = false;
 
-    // DFlash target verification: append a raw greedy argmax to the ordinary
-    // target graph. Unlike dflash_argmax, this is architecture-independent and
-    // deliberately ignores the drafter's temperature/top-K controls.
-    bool dflash_target_argmax = false;
+    // DFlash target verification: append the raw top-K (K = 1: argmax) of the
+    // logits to the ordinary target graph, 0 = off. Unlike dflash_argmax, this is
+    // architecture-independent and ignores the drafter's temperature/top-K controls.
+    int32_t dflash_target_argmax_k = 0;
 
     // DFlash2 target verification can prefer CUDA's MMA-backed quantized
     // matrix path for one exact width during an explicitly marked verify
@@ -119,6 +121,17 @@ struct llama_cparams {
     // D2D capture copies. Layer order in dflash_draft_stage_layers (k -> layer id).
     ggml_tensor *        dflash_draft_stage = nullptr;
     std::vector<int32_t> dflash_draft_stage_layers;
+
+    // Greedy MTP draft chain: device-resident token [1], hidden row [n_embd_out] and
+    // top-1 confidence [1] that 1-token draft graphs read and overwrite
+    // (see llama_set_mtp_draft_chain).
+    ggml_tensor * mtp_chain_tok = nullptr;
+    ggml_tensor * mtp_chain_h   = nullptr;
+    ggml_tensor * mtp_chain_p   = nullptr;
+    // with a host token embedding: the next token's embedding row [n_embd] and the head
+    // vocabulary's embedding rows on the device, so the chain never gathers on the CPU
+    ggml_tensor * mtp_chain_e    = nullptr;
+    ggml_tensor * mtp_chain_embd = nullptr;
 
     // Upstream drafter staged injection (DRAFTER context): the fused inject graph
     // gathers its feature rows from this tensor (the target's stage) via a per-decode

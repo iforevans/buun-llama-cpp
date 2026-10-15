@@ -9,6 +9,7 @@
 #include <string>
 #include <functional>
 #include <stdexcept>
+#include <vector>
 
 struct gguf_context;
 struct llama_model;
@@ -26,6 +27,9 @@ struct llama_model_tensor_file_region {
 // exposing its container format to model graphs or backend dispatch.
 class llama_model_tensor_source {
   public:
+    // Optional homogeneous partitions of a logical expert bank; empty means
+    // the ordinary single tensor. Routing retains the original expert IDs.
+    virtual std::vector<int64_t> expert_group_sizes(const std::string &) const { return {}; }
     virtual bool describe(
         const std::string & canonical_name,
         ggml_type & type,

@@ -972,49 +972,6 @@ static float make_q3_quants(int n, int nmax, const float * GGML_RESTRICT x, int8
     return 1/iscale;
 }
 
-static float make_qkx1_quants(int n, int nmax, const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT L, float * GGML_RESTRICT the_min,
-        int ntry, float alpha) {
-    float min = x[0];
-    float max = x[0];
-    for (int i = 1; i < n; ++i) {
-        if (x[i] < min) min = x[i];
-        if (x[i] > max) max = x[i];
-    }
-    if (max == min) {
-        for (int i = 0; i < n; ++i) L[i] = 0;
-        *the_min = 0;
-        return 0.f;
-    }
-    if (min > 0) min = 0;
-    float iscale = nmax/(max - min);
-    float scale = 1/iscale;
-    for (int itry = 0; itry < ntry; ++itry) {
-        float sumlx = 0; int suml2 = 0;
-        bool did_change = false;
-        for (int i = 0; i < n; ++i) {
-            int l = nearest_int(iscale*(x[i] - min));
-            l = MAX(0, MIN(nmax, l));
-            if (l != L[i]) {
-                L[i] = l;
-                did_change = true;
-            }
-            sumlx += (x[i] - min)*l;
-            suml2 += l*l;
-        }
-        scale = sumlx/suml2;
-        float sum = 0;
-        for (int i = 0; i < n; ++i) {
-            sum += x[i] - scale*L[i];
-        }
-        min = alpha*min + (1 - alpha)*sum/n;
-        if (min > 0) min = 0;
-        iscale = 1/scale;
-        if (!did_change) break;
-    }
-    *the_min = -min;
-    return scale;
-}
-
 static float make_qkx2_quants(int n, int nmax, const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights,
         uint8_t * GGML_RESTRICT L, float * GGML_RESTRICT the_min, uint8_t * GGML_RESTRICT Laux,
         float rmin, float rdelta, int nstep, bool use_mad) {
@@ -1255,8 +1212,9 @@ static float make_qkx3_quants(int n, int nmax, const float * GGML_RESTRICT x, co
         iscale = (rmin + rdelta*is + nmax)/(max - min);
         float sum_l = 0, sum_l2 = 0, sum_xl = 0;
         for (int i = 0; i < n; ++i) {
-            int l = nearest_int(iscale*(x[i] - min));
-            l = MAX(0, MIN(nmax, l));
+            // min is the best fit so far and can be at or near max, so v can be inf, nan or out of range for nearest_int
+            const float v = iscale*(x[i] - min);
+            const int l = v > 0 ? nearest_int(MIN(v, nmax)) : 0;
             Laux[i] = l;
             float w = weights ? weights[i] : x[i]*x[i];
             sum_l  += w*l;
@@ -1687,7 +1645,6 @@ void quantize_row_q4_K_ref(const float * GGML_RESTRICT x, block_q4_K * GGML_REST
         float max_scale = 0; // as we are deducting the min, scales are always positive
         float max_min = 0;
         for (int j = 0; j < QK_K/32; ++j) {
-            //scales[j] = make_qkx1_quants(32, 15, x + 32*j, L + 32*j, &mins[j], 9, 0.5f);
             float sum_x2 = 0;
             for (int l = 0; l < 32; ++l) sum_x2 += x[32*j + l] * x[32*j + l];
             float av_x = sqrtf(sum_x2/32);
@@ -1874,7 +1831,6 @@ void quantize_row_q5_K_ref(const float * GGML_RESTRICT x, block_q5_K * GGML_REST
         float max_scale = 0; // as we are deducting the min, scales are always positive
         float max_min = 0;
         for (int j = 0; j < QK_K/32; ++j) {
-            //scales[j] = make_qkx1_quants(32, 31, x + 32*j, L + 32*j, &mins[j], 9, 0.5f);
             float sum_x2 = 0;
             for (int l = 0; l < 32; ++l) sum_x2 += x[32*j + l] * x[32*j + l];
             float av_x = sqrtf(sum_x2/32);
@@ -4715,66 +4671,6 @@ void quantize_row_iq3_s_ref(const float * GGML_RESTRICT x, block_iq3_s * GGML_RE
 
 
 // =================================== 1.5 bpw ===================================================
-
-static int iq1_find_best_neighbour(const uint16_t * GGML_RESTRICT neighbours, const uint64_t * GGML_RESTRICT grid,
-        const float * GGML_RESTRICT xval, const float * GGML_RESTRICT weight, float * scale, int8_t * GGML_RESTRICT L, int ngrid) {
-    int num_neighbors = neighbours[0];
-    GGML_ASSERT(num_neighbors > 0);
-    float best_score = -FLT_MAX;
-    int grid_index = -1;
-    for (int j = 1; j <= num_neighbors; ++j) {
-        const int8_t * pg = (const int8_t *)(grid + neighbours[j]);
-        float sumqx = 0, sumq2 = 0;
-        for (int i = 0; i < 8; ++i) {
-            float q = (pg[i] - 3)/2;
-            float w = weight[i];
-            sumqx += w*q*xval[i];
-            sumq2 += w*q*q;
-        }
-        if (sumqx > 0 && sumq2 > 0 && sumqx*sumqx > best_score*sumq2) {
-            *scale = sumqx/sumq2; best_score = *scale * sumqx;
-            grid_index = neighbours[j];
-        }
-    }
-    if (grid_index < 0) {
-        for (int i = 0; i < ngrid; ++i) {
-            const int8_t * grid_i = (const int8_t *)(grid + i);
-            float sumqx = 0, sumq2 = 0;
-            for (int j = 0; j < 8; ++j) {
-                float w = weight[j];
-                float q = (grid_i[j] - 3)/2;
-                sumqx += w*q*xval[j];
-                sumq2 += w*q*q;
-            }
-            if (sumqx > 0 && sumq2 > 0 && sumqx*sumqx > best_score*sumq2) {
-                *scale = sumqx/sumq2; best_score = *scale*sumqx;
-                grid_index = i;
-            }
-        }
-    }
-    if (grid_index < 0) {
-        printf("Oops, did not find grid point\n");
-        printf("Have %d neighbours\n", num_neighbors);
-        for (int j = 1; j <= num_neighbors; ++j) {
-            const int8_t * pg = (const int8_t *)(grid + neighbours[j]);
-            float sumqx = 0, sumq2 = 0;
-            for (int i = 0; i < 8; ++i) {
-                float q = (pg[i] - 3)/2;
-                float w = weight[i];
-                sumqx += w*q*xval[i];
-                sumq2 += w*q*q;
-            }
-            printf("    neighbour %d: sumqx = %g sumq2 = %g\n", j, (double)sumqx, (double)sumq2);
-        }
-    }
-    GGML_ASSERT(grid_index >= 0);
-    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    *scale *= 1.05f;  // This is a fudge factor. Don't ask me why it improves the result.
-    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    const int8_t * pg = (const int8_t *)(grid + grid_index);
-    for (int i = 0; i < 8; ++i) L[i] = (pg[i] - 1)/2;
-    return grid_index;
-}
 
 static int iq1_find_best_neighbour2(const uint16_t * GGML_RESTRICT neighbours, const uint64_t * GGML_RESTRICT grid,
         const float * GGML_RESTRICT xval, const float * GGML_RESTRICT weight, float scale, const float * GGML_RESTRICT xg, int8_t * GGML_RESTRICT L, int ngrid) {

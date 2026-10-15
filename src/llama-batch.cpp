@@ -13,7 +13,7 @@
 #include <limits>
 #include <sstream>
 
-llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {
+llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed) : n_pos_per_embd(n_pos_per_embd), allow_mixed(allow_mixed) {
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
     debug = LLAMA_BATCH_DEBUG ? atoi(LLAMA_BATCH_DEBUG) : 0;
 
@@ -31,11 +31,11 @@ bool llama_batch_allocr::init(
         const llama_vocab & vocab,
         bool output_all) {
     llama_batch view = {};
-    if (!batch_inp.get_batch(view)) {
+    if (!batch_inp.get_batch(view, true)) {
         return false;
     }
     const size_t n_embd = batch_inp.n_embd > 0 ? batch_inp.n_embd : batch_inp.n_embd_inp;
-    return init(view, vocab, batch_inp.mem, n_embd, batch_inp.n_seq_max, output_all, true);
+    return init(view, vocab, batch_inp.mem, n_embd, batch_inp.n_seq_max, output_all, true, &batch_inp);
 }
 
 bool llama_batch_allocr::init(
@@ -45,8 +45,20 @@ bool llama_batch_allocr::init(
         uint32_t n_embd,
         uint32_t n_seq_max,
         bool output_all,
-        bool token_ids_validated) {
+        bool token_ids_validated,
+        const llama_batch_ext * extended) {
     clear();
+
+    if (extended) {
+        is_embd_vec = extended->flat_type;
+        decision_order = extended->flat_decision_order;
+        positions_expanded = true;
+    }
+    const bool mixed = !is_embd_vec.empty();
+    if (mixed && !allow_mixed) {
+        LLAMA_LOG_ERROR("%s: mixed token/embedding rows are unsupported in this context\n", __func__);
+        return false;
+    }
 
     batch = batch_inp;
 
@@ -249,6 +261,8 @@ bool llama_batch_allocr::init(
             /*.seq_id_unq   =*/ this->seq_id_unq.data(),
             /*.seq_idx      =*/ this->seq_idx.data(),
             /*.output       =*/ batch.logits,
+            /*.type         =*/ is_embd_vec.empty() ? nullptr : is_embd_vec.data(),
+            /*.decision_order =*/ decision_order.empty() ? nullptr : decision_order.data(),
             /*.data         =*/ {},
         };
 
@@ -278,6 +292,21 @@ bool llama_batch_allocr::init(
     //
 
     if (n_pos_per_embd > 1) {
+        // in a mixed batch, the first entry of each seq picks the rule
+        std::vector<int8_t> seq_first_embd(n_seq_max, batch.token ? 0 : 1);
+        if (mixed) {
+            std::vector<bool> seen(n_seq_max, false);
+            for (int32_t i = 0; i < batch.n_tokens; ++i) {
+                for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
+                    const llama_seq_id sid = batch.seq_id[i][s];
+                    if (!seen[sid]) {
+                        seen[sid] = true;
+                        seq_first_embd[sid] = is_embd_vec[i];
+                    }
+                }
+            }
+        }
+
         // M-RoPE case: allow position to "jump" forward only (non-continuous positions are allowed)
         for (uint32_t s = 0; s < n_seq_max; ++s) {
             if (seq_pos[s].empty()) {
@@ -286,8 +315,10 @@ bool llama_batch_allocr::init(
 
             const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
 
-            if (batch.token) {
-                if (p0 >= 0 && p0 > seq_pos_min(s)) {
+            if (!seq_first_embd[s]) {
+                // New mixed batches must not reinterpret an overlapping text
+                // row as media. Keep the established homogeneous/raw tolerance.
+                if (p0 >= 0 && (mixed ? p0 >= seq_pos_min(s) : p0 > seq_pos_min(s))) {
                     LLAMA_LOG_ERROR(
                             "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
                             " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
@@ -347,6 +378,10 @@ bool llama_batch_allocr::init(
 
     if (memory) {
         for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
+            // only sequences in the batch have couplings (n_seq_max is LLAMA_MAX_SEQ for a unified cache)
+            if (seq_pos[s0].empty()) {
+                continue;
+            }
             for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
                 if (seq_cpl[s0][s1]) {
                     if (memory->seq_pos_min(s0) != memory->seq_pos_min(s1) ||
@@ -455,6 +490,8 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.type         =*/ nullptr,
+        /*.decision_order =*/ nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -755,6 +792,9 @@ void llama_batch_allocr::clear() {
     seq_id      .clear();
     seq_id_unq  .clear();
     output      .clear();
+    decision_order.clear();
+    is_embd_vec.clear();
+    positions_expanded = false;
 
     for (auto & cur : seq_pos) {
         cur.clear();
@@ -778,7 +818,20 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
 
-    const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
+    const bool mixed_batch = !is_embd_vec.empty();
+
+    // a ubatch with a single kind of rows is emitted as a plain token or embd ubatch
+    uint32_t n_embd_rows = 0;
+    if (mixed_batch) {
+        for (int32_t idx : idxs) {
+            n_embd_rows += is_embd_vec[idx];
+        }
+    }
+    const bool mixed     = mixed_batch && n_embd_rows > 0 && n_embd_rows < n_tokens;
+    const bool use_token = batch.token && !(mixed_batch && n_embd_rows == n_tokens);
+    const bool use_embd  = batch.embd  && !(mixed_batch && n_embd_rows == 0);
+
+    const int64_t n_embd_all = use_embd ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
@@ -789,31 +842,43 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->seq_id_unq.resize(0);
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
+    udata->type      .resize(mixed ? n_tokens : 0);
+    udata->decision_order.resize(decision_order.empty() ? 0 : n_tokens);
 
+    udata->batch_idxs = idxs;
     udata->seq_id_data.reserve(n_tokens);
 
     seq_set_t seq_set_unq;
 
     for (size_t i = 0; i < idxs.size(); ++i) {
-        if (batch.token) {
+        if (use_token) {
             udata->token[i] = batch.token[idxs[i]];
         }
 
-        if (batch.embd) {
+        if (use_embd) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
         }
 
+        if (mixed) {
+            udata->type[i] = is_embd_vec[idxs[i]];
+        }
+
         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
-            // if we are using M-RoPE
-            //     if the current batch is text, we need to broadcast the same position across all RoPE sections
-            //     otherwise, the input batch is image embeddings, we copy the positions as-is
-            // if we are not using M-RoPE, there is only one position per token (this loop runs only once)
-            size_t src_off = batch.token ? 0 : j*batch.n_tokens;
-            udata->pos[j*n_tokens + i] = batch.pos[src_off + idxs[i]];
+            if (positions_expanded || !batch.token) {
+                udata->pos[j*n_tokens + i] = batch.pos[j*batch.n_tokens + idxs[i]];
+            } else {
+                // Legacy text supplies one position per row. Preserve its
+                // borrowed storage while applying the same M-RoPE expansion.
+                udata->pos[j*n_tokens + i] = j < 3 ? batch.pos[idxs[i]] : 0;
+            }
         }
 
         udata->n_seq_id[i] = batch.n_seq_id[idxs[i]];
         udata->output[i]   = batch.logits[idxs[i]];
+
+        if (!decision_order.empty()) {
+            udata->decision_order[i] = decision_order[idxs[i]];
+        }
 
         for (int s = 0; s < udata->n_seq_id[i]; ++s) {
             const llama_seq_id seq_id = batch.seq_id[idxs[i]][s];
@@ -848,14 +913,16 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_seqs_unq   =*/ (uint32_t) udata->seq_id_unq.size(),
         /*.n_pos        =*/ n_pos_per_embd,
 
-        /*.token        =*/ batch.token ? udata->token.data() : nullptr,
-        /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
+        /*.token        =*/ use_token ? udata->token.data() : nullptr,
+        /*.embd         =*/ use_embd  ? udata->embd.data()  : nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.type         =*/ mixed ? udata->type.data() : nullptr,
+        /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
         /*.data         =*/ std::move(udata),
     };
 
@@ -905,6 +972,7 @@ void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
         LLAMA_LOG_DEBUG("%s:   seq_id_unq = %s\n", __func__, ss_seq_id_unq.str().c_str());
         LLAMA_LOG_DEBUG("%s:   seq_idx    = %s\n", __func__, ss_seq_idx.str().c_str());
         LLAMA_LOG_DEBUG("%s:   output     = %p\n", __func__, (void *) ubatch.output);
+        LLAMA_LOG_DEBUG("%s:   type       = %p\n", __func__, (void *) ubatch.type);
         LLAMA_LOG_DEBUG("%s:   n_outputs  = %d\n", __func__, n_outputs);
 
         if (debug > 0) {
@@ -935,7 +1003,7 @@ void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
                     }
                 }
 
-                if (ubatch.token) {
+                if (ubatch.token && !(ubatch.is_mixed() && ubatch.type[i])) {
                     LLAMA_LOG_DEBUG("%s:  %4d: id = %6d (%16s), pos = %4d, n_seq_id = %2d, seq_id = [%s], output = %d\n",
                             __func__, i, ubatch.token[i], vocab->token_to_piece(ubatch.token[i]).c_str(),
                             ubatch.pos[i], ubatch.n_seq_id[i], ss.str().c_str(), ubatch.output[i]);
@@ -1059,7 +1127,7 @@ void llama_batch_ext::clear() {
     n_embd = 0;
 }
 
-bool llama_batch_ext::get_batch(llama_batch & batch) const {
+bool llama_batch_ext::get_batch(llama_batch & batch, bool extended_layout) const {
     batch = {};
     if (tokens.empty() || tokens.size() > n_tokens_max ||
             tokens.size() > (size_t) std::numeric_limits<int32_t>::max() ||
@@ -1069,20 +1137,38 @@ bool llama_batch_ext::get_batch(llama_batch & batch) const {
         return false;
     }
     const size_t count = tokens.size();
-    const bool has_token = tokens.front().id != LLAMA_TOKEN_NULL;
-    const bool has_embd = tokens.front().has_embd;
+    size_t n_token = 0, n_embedded = 0, n_both = 0;
+    bool has_decision = false;
+    for (const auto & t : tokens) {
+        const bool tok = t.id != LLAMA_TOKEN_NULL;
+        if (!tok && !t.has_embd) {
+            return false;
+        }
+        n_token += tok;
+        n_embedded += t.has_embd;
+        n_both += tok && t.has_embd;
+        has_decision |= t.decision_order != 0;
+    }
+    if (n_both && n_both != count) {
+        return false;
+    }
+    const bool has_token = n_token > 0;
+    const bool has_embd = n_embedded > 0;
+    const bool mixed = has_token && has_embd && !n_both;
+    if (!extended_layout && (mixed || has_decision)) {
+        return false;
+    }
     if ((!has_token && !has_embd) ||
             (has_embd && (n_embd == 0 || count > std::numeric_limits<size_t>::max() / n_embd))) {
         return false;
     }
 
-    bool ordered_embd = true;
+    bool ordered_embd = !mixed;
     size_t n_ids = 0;
     for (size_t i = 0; i < count; ++i) {
         const token & t = tokens[i];
-        if ((t.id != LLAMA_TOKEN_NULL) != has_token || t.has_embd != has_embd ||
-                t.seq_ids.empty() || t.seq_ids.size() > (size_t) n_seq_max ||
-                (has_token && (t.id < 0 || t.id >= n_vocab))) {
+        if (t.seq_ids.empty() || t.seq_ids.size() > (size_t) n_seq_max ||
+                (t.id != LLAMA_TOKEN_NULL && (t.id < 0 || t.id >= n_vocab))) {
             return false;
         }
         for (llama_seq_id id : t.seq_ids) {
@@ -1091,7 +1177,7 @@ bool llama_batch_ext::get_batch(llama_batch & batch) const {
             }
         }
         n_ids += t.seq_ids.size();
-        if (has_embd) {
+        if (t.has_embd) {
             if (t.embd_off > embd.size() || n_embd > embd.size() - t.embd_off) {
                 return false;
             }
@@ -1100,31 +1186,37 @@ bool llama_batch_ext::get_batch(llama_batch & batch) const {
     }
 
     flat_token.resize(has_token ? count : 0);
-    flat_pos.resize(count * (has_token ? 1 : n_pos_per_embd));
+    const size_t n_pos = extended_layout || !has_token ? n_pos_per_embd : 1;
+    flat_pos.resize(count * n_pos);
+    flat_type.resize(mixed ? count : 0);
+    flat_decision_order.resize(has_decision ? count : 0);
     flat_n_seq_id.resize(count);
     flat_seq_id.resize(count + 1);
     flat_seq_id_data.resize(n_ids);
     flat_output.resize(count);
     if (has_embd && !ordered_embd) {
-        flat_embd.resize(count * n_embd);
+        flat_embd.assign(count * n_embd, 0.0f);
     }
 
     size_t id_off = 0;
     for (size_t i = 0; i < count; ++i) {
         const token & t = tokens[i];
         if (has_token) {
-            flat_token[i] = t.id;
+            flat_token[i] = t.id == LLAMA_TOKEN_NULL ? 0 : t.id;
         }
-        for (size_t j = 0; j < (has_token ? 1 : n_pos_per_embd); ++j) {
-            flat_pos[j * count + i] = t.pos[j];
+        for (size_t j = 0; j < n_pos; ++j) {
+            flat_pos[j * count + i] = extended_layout && t.id != LLAMA_TOKEN_NULL
+                ? (j < 3 ? t.pos[0] : 0) : t.pos[j];
         }
+        if (mixed) { flat_type[i] = t.has_embd ? 1 : 0; }
+        if (has_decision) { flat_decision_order[i] = t.decision_order; }
         flat_n_seq_id[i] = (int32_t) t.seq_ids.size();
         flat_seq_id[i] = flat_seq_id_data.data() + id_off;
         for (llama_seq_id id : t.seq_ids) {
             flat_seq_id_data[id_off++] = id;
         }
         flat_output[i] = t.output;
-        if (has_embd && !ordered_embd) {
+        if (t.has_embd && !ordered_embd) {
             std::copy_n(embd.data() + t.embd_off, n_embd, flat_embd.data() + i * n_embd);
         }
     }
@@ -1244,6 +1336,14 @@ bool llama_batch_ext::set_output(int32_t idx, bool output_last) {
     return true;
 }
 
+bool llama_batch_ext::set_decision_order(int32_t idx, int32_t order) {
+    if (idx < 0 || idx >= (int32_t) tokens.size()) {
+        return false;
+    }
+    tokens[idx].decision_order = order;
+    return true;
+}
+
 // llama_batch_ext C API
 
 llama_batch_ext * llama_batch_ext_init(llama_context * ctx) {
@@ -1312,6 +1412,10 @@ bool llama_batch_ext_set_output_embd(llama_batch_ext * batch, int32_t idx, bool 
 
 bool llama_batch_ext_set_output_logits(llama_batch_ext * batch, int32_t idx, bool value) {
     return batch->set_output(idx, value);
+}
+
+bool llama_batch_ext_set_decision_order(llama_batch_ext * batch, int32_t idx, llama_decision_order order) {
+    return batch->set_decision_order(idx, order);
 }
 
 // llama_batch_compat

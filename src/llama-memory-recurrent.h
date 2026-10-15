@@ -175,6 +175,8 @@ private:
         copy_graph_cache_;
 
     bool resize(uint32_t new_mem_size);
+    // A layer filter may remove every recurrent layer (for example an MTP head).
+    bool is_empty() const;
 
     size_t total_size() const;
 

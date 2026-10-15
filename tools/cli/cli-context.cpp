@@ -50,17 +50,6 @@ const char * LLAMA_ASCII_LOGO = R"(
                                     ▀▀    ▀▀
 )";
 
-// number of values an arg consumes on the command line
-static int arg_num_values(const common_arg & opt) {
-    if (opt.value_hint_2 != nullptr) {
-        return 2;
-    }
-    if (opt.value_hint != nullptr) {
-        return 1;
-    }
-    return 0;
-}
-
 static std::string format_error_message(const json & err) {
     if (err.contains("error") && err.at("error").is_object()) {
         const auto & e = err.at("error");
@@ -256,7 +245,7 @@ bool cli_context::list_and_ask_models() {
         ui::user_turn user_turn;
         selection = user_turn.read_input(false, "Select model by number: ");
         if (selection.empty()) {
-            continue;
+            return false;
         }
         try {
             size_t idx = std::stoul(selection);
@@ -503,8 +492,13 @@ int cli_context::run() {
             break;
         }
 
+        // a submitted line always ends with a newline, an empty read is EOF
+        if (buffer.empty()) {
+            break;
+        }
+
         // remove trailing newline
-        if (!buffer.empty() && buffer.back() == '\n') {
+        if (buffer.back() == '\n') {
             buffer.pop_back();
         }
 

@@ -19,6 +19,14 @@ struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
 
+struct llama_expert_group {
+    ggml_tensor * weight;
+    ggml_tensor * scale;
+    ggml_tensor * input_scale;
+    ggml_tensor * ids; // I32 [1, logical experts], local ID or -1
+};
+using llama_expert_banks = std::map<ggml_tensor *, std::vector<llama_expert_group>>;
+
 // Maps a folded model weight to the activation-side transform applied
 // immediately before the matmul: optional sign flip, then the normalized
 // blockwise Hadamard rotation.
@@ -79,6 +87,7 @@ enum llm_fused_op {
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
+    LLM_FUSED_OP_DSV4_HC_MIX,
 };
 
 enum llm_ffn_op_type : int {
@@ -205,8 +214,14 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * tokens = nullptr; // I32 [n_batch]
-    ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * tokens       = nullptr; // I32 [n_batch]
+    ggml_tensor * embd         = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * mixed_tokens = nullptr; // I32 [n_tok_rows], mixed path: ids of the token rows
+    ggml_tensor * mixed_slots  = nullptr; // I64 [n_tok_rows], mixed path: batch index of the token rows
+    ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], mixed path: embd rows, token rows are overwritten
+    ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
+
+    float scale_tok = 1.0f;
 
     const int64_t n_embd = 0;
 };
@@ -360,8 +375,8 @@ public:
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
-    ggml_tensor * s_copy_main;   // I32 [n_seqs]
-    ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
+    ggml_tensor * s_copy_main; // I32 [n_seqs]
+    ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
     const llama_memory_recurrent_context * mctx;
 
@@ -937,6 +952,7 @@ struct llm_graph_params {
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
+            ubatch.is_mixed()   == other.ubatch.is_mixed() &&
             (
                 (!ubatch.token && !other.ubatch.token) ||
                 (!ubatch.embd  && !other.ubatch.embd)  ||
@@ -996,6 +1012,7 @@ struct llm_graph_params {
             cparams.dflash_inject_stage     == other.cparams.dflash_inject_stage     &&
             cparams.dflash_oneg_n_inject    == other.cparams.dflash_oneg_n_inject    &&
             cparams.dflash_target_mmq_batch == other.cparams.dflash_target_mmq_batch &&
+            cparams.mtp_chain_tok           == other.cparams.mtp_chain_tok           &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1180,6 +1197,7 @@ struct llm_graph_context {
     using hadamard_input_key = std::tuple<ggml_tensor *, ggml_tensor *, ggml_tensor *, int64_t, int64_t, int64_t>;
     mutable std::map<hadamard_input_key, ggml_tensor *> hadamard_inputs;
     mutable std::map<std::pair<ggml_tensor *, ggml_tensor *>, ggml_tensor *> segmented_inputs;
+    const llama_expert_banks * expert_banks = nullptr;
 
     // DDTree: tree-mode SSM buffers
     ggml_tensor * tree_parent_ids = nullptr;
@@ -1202,6 +1220,16 @@ struct llm_graph_context {
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
+    // true when the last layer must be narrowed to the output rows before the nextn hidden state is captured
+    bool crop_before_nextn(const ggml_tensor * inp_out_ids) const {
+        return inp_out_ids != nullptr && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    }
+
+    // true when the nextn hidden state must be narrowed to the output rows after it is captured
+    bool crop_after_nextn(const ggml_tensor * inp_out_ids) const {
+        return inp_out_ids != nullptr && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+    }
+
     //
     // common
     //
@@ -1218,6 +1246,12 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr,
               ggml_tensor * in_s = nullptr) const;
+
+    // FR-Spec draft-vocab head: map logits over d2t's draft rows back to the target vocab
+    ggml_tensor * build_d2t_logits(
+              ggml_tensor * cur,
+              ggml_tensor * d2t,
+                  int64_t   n_vocab) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
@@ -1335,7 +1369,8 @@ struct llm_graph_context {
     // inputs
     //
 
-    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    // tok_scale applies only to token rows, never caller-provided media embeddings.
+    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f, bool tok_bf16 = false) const;
     ggml_tensor * build_get_rows_embd(ggml_tensor * tok_embd, ggml_tensor * tokens) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
@@ -1510,15 +1545,15 @@ struct llm_graph_context {
     //         `llama_memory_recurrent`
     ggml_tensor * build_rs(
             ggml_tensor * s,
+            ggml_tensor * state_copy,
             ggml_tensor * state_copy_main,
-            ggml_tensor * state_copy_extra,
                 int32_t   state_size,
                 int32_t   n_seqs,
                uint32_t   n_rs,
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 
@@ -1527,7 +1562,7 @@ struct llm_graph_context {
             ggml_tensor * s,
                 int32_t   state_size,
                 int32_t   n_seqs,
-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
 
     // Like build_rs, but returns a plain view of the state slot when the gather is a
     // contiguous identity (steady-state recurrent decode), skipping the get_rows copy.

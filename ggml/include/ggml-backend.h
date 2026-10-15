@@ -34,13 +34,15 @@ extern "C" {
     // Backend buffer type
     //
 
-    GGML_API const char *          ggml_backend_buft_name          (ggml_backend_buffer_type_t buft);
-    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer  (ggml_backend_buffer_type_t buft, size_t size);
-    GGML_API size_t                ggml_backend_buft_get_alignment (ggml_backend_buffer_type_t buft);
-    GGML_API size_t                ggml_backend_buft_get_max_size  (ggml_backend_buffer_type_t buft);
-    GGML_API size_t                ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
-    GGML_API bool                  ggml_backend_buft_is_host       (ggml_backend_buffer_type_t buft);
-    GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device    (ggml_backend_buffer_type_t buft);
+    GGML_API const char *          ggml_backend_buft_name            (ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer    (ggml_backend_buffer_type_t buft, size_t size);
+    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_n  (ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+    GGML_API size_t                ggml_backend_buft_get_alignment   (ggml_backend_buffer_type_t buft);
+    GGML_API size_t                ggml_backend_buft_get_max_size    (ggml_backend_buffer_type_t buft);
+    GGML_API size_t                ggml_backend_buft_get_alloc_size  (ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
+    GGML_API size_t                ggml_backend_buft_get_alloc_size_n(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+    GGML_API bool                  ggml_backend_buft_is_host         (ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device      (ggml_backend_buffer_type_t buft);
 
     //
     // Backend buffer
@@ -361,6 +363,12 @@ extern "C" {
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
+    // Switch to one of GGML_SCHED_MAX_GRAPH_SLOTS independent split/alloc states (slot 0 is the default), so
+    // graphs of alternating shapes can each stay allocated. All slots share the compute buffers.
+    // Returns true if the slot still holds `graph` allocated and ready to compute without a reset.
+#define GGML_SCHED_MAX_GRAPH_SLOTS 16
+    GGML_API bool                 ggml_backend_sched_set_graph_slot(ggml_backend_sched_t sched, int slot, const struct ggml_cgraph * graph);
+
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
@@ -396,6 +404,7 @@ extern "C" {
         //   - most tensors have n_segments == 1 and a contiguous slice of the tensor data
         //   - some tensors have an inhomogenenous data layout along the split axis,
         //     those tensors are divided into segments which are each individually split across devices
+        //     (this usually happens when multiple tensors are fused into a single one)
         //   - ne has one entry per segment and device and that segment repeats nr times,
         //     in total when accounting for repetitions the segments add up to ggml_tensor::ne for that axis,
         //     the outer/inner loops are over segments/devices like [seg0_dev0_r0, seg0_dev1_r0, seg0_dev0_r1, seg0_dev1_r1, seg1_dev0_r0, seg1_dev1_r0],

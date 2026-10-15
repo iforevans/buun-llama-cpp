@@ -12,11 +12,12 @@ static inline size_t ggml_moe_cache_effective_min_expert_bytes(
     if (explicit_minimum) return default_minimum;
     // EXL3's CPU trellis decode is costlier than ordinary vector dots.
     if (ggml_type_is_exl3((enum ggml_type)wtype)) return 128u << 10;
-    // Q2_0 stores twice as many weights per byte as Q4_0. A 450 KiB
-    // Q2_0 expert should not miss the ordinary 512 KiB floor merely because
-    // its codes are more compact; retain the same minimum weight count.
-    if (wtype == GGML_TYPE_Q2_0 || wtype == GGML_TYPE_Q2_0_G128) return default_minimum / 2;
-    return default_minimum;
+    // The floor counts weights at Q4_0 density: a low-bit expert (Q2_0, IQ2_*)
+    // must not miss it merely because its codes are more compact.
+    const enum ggml_type type = (enum ggml_type)wtype;
+    const size_t q4_bytes = ggml_type_size(GGML_TYPE_Q4_0) * ggml_blck_size(type);
+    const size_t type_bytes = ggml_type_size(type) * ggml_blck_size(GGML_TYPE_Q4_0);
+    return type_bytes < q4_bytes ? (size_t)((uint64_t)default_minimum * type_bytes / q4_bytes) : default_minimum;
 }
 
 // Slot IDs remain int32. Ordinary kernels also index quant blocks with int32;
@@ -178,9 +179,29 @@ struct ggml_moe_cache_api {
 
     // Host buffer mutation or teardown notification. Sessions cancel or finish any fill that still reads the supplied range before this call returns.
     void (*invalidate)(const void * base, size_t size);
+
+    // Device routing: backend may run this small-batch MUL_MAT_ID in place on its host experts,
+    // reading cached experts from VRAM and the rest over the bus. The answer depends only on the
+    // op's shape and the session, so a reused graph keeps a valid assignment.
+    int (*route_supported)(void * session, void * backend, const struct ggml_tensor * op);
+
+    // Scheduler compute buffers. alloc_scope brackets the scheduler's buffer allocations so the
+    // provider can back them with memory it can alias into its pools. Before each evaluation's
+    // inputs are written, prepare reports the bytes of buffer the evaluation uses from its base;
+    // the provider stops caching in [base, base + high_water) and may cache in the rest.
+    void (*scratch_alloc_scope)(void * session, int enter);
+    void (*scratch_prepare)(void * session, void * backend, ggml_backend_buffer_t buffer, size_t high_water);
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;
+// Set by the CPU backend at init, so a device provider can run part of a routed
+// MoE layer on the host with the CPU's vector kernels without linking them.
+struct ggml_type_traits_cpu;
+GGML_API const struct ggml_type_traits_cpu * (*ggml_moe_cache_cpu_traits)(enum ggml_type type);
+// dst[r][i] = (row i of w) . act[r] for i < rows and r < nr (nr <= 4); acts are in the
+// type's vec_dot_type. Uses the CPU's batched row kernels where the type has them.
+GGML_API void (*ggml_moe_cache_cpu_rows)(enum ggml_type type, int n, float * const * dst,
+        const void * w, size_t stride, int64_t rows, const void * const * act, int nr);
 GGML_API void ggml_moe_cache_unregister(const void * owner);
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,

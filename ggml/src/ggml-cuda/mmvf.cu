@@ -2,6 +2,7 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include "mmf.cuh"
 #include "convert.cuh"
 
 static __global__ void qwen35_recurrent_gates_f16(
@@ -607,6 +608,80 @@ static __global__ void mul_mat_vec_f(
     }
 }
 
+static __device__ __forceinline__ void mul_mat_vec_f_unpack16(const uint4 & v, float * out, const float *) {
+    const float4 * f = (const float4 *) &v;
+    out[0] = f->x; out[1] = f->y; out[2] = f->z; out[3] = f->w;
+}
+static __device__ __forceinline__ void mul_mat_vec_f_unpack16(const uint4 & v, float * out, const half *) {
+    const half2 * h = (const half2 *) &v;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 f = __half22float2(h[i]);
+        out[2*i + 0] = f.x;
+        out[2*i + 1] = f.y;
+    }
+}
+static __device__ __forceinline__ void mul_mat_vec_f_unpack16(const uint4 & v, float * out, const nv_bfloat16 *) {
+    const nv_bfloat16 * b = (const nv_bfloat16 *) &v;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        out[i] = ggml_cuda_cast<float>(b[i]);
+    }
+}
+
+// Short rows (e.g. a 320-wide low-rank projection): one block per row moves too few bytes to
+// cover memory latency, so each warp takes one row with 16-byte loads instead.
+template <typename T, int ncols_dst, int rows_per_block>
+static __global__ void mul_mat_vec_f_short_rows(
+        const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const int ncols, const int nrows, const int stride_row, const int stride_col_y, const int stride_col_dst,
+        const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int vals      = 16/sizeof(T);
+
+    const int row         = blockIdx.x*rows_per_block + threadIdx.y;
+    const int channel_dst = blockIdx.y;
+    const int sample_dst  = blockIdx.z;
+    const int channel_x   = fastdiv((uint32_t) channel_dst, channel_ratio);
+    const int sample_x    = fastdiv((uint32_t) sample_dst,  sample_ratio);
+
+    ggml_cuda_pdl_sync();
+    if (row >= nrows) {
+        ggml_cuda_pdl_lc();
+        return;
+    }
+
+    x   += int64_t(sample_x)  *stride_sample_x   + int64_t(channel_x)*stride_channel_x + int64_t(row)*stride_row;
+    y   += int64_t(sample_dst)*stride_sample_y   + int64_t(channel_dst)*stride_channel_y;
+    dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
+
+    const uint4 * x4 = (const uint4 *) x;
+    float sumf[ncols_dst] = {0.0f};
+    for (int i = threadIdx.x; i < ncols/vals; i += warp_size) {
+        float xv[vals];
+        mul_mat_vec_f_unpack16(x4[i], xv, x);
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float4 * y4 = (const float4 *) (y + j*stride_col_y + i*vals);
+#pragma unroll
+            for (int k = 0; k < vals/4; ++k) {
+                const float4 yv = y4[k];
+                sumf[j] += xv[4*k + 0]*yv.x + xv[4*k + 1]*yv.y + xv[4*k + 2]*yv.z + xv[4*k + 3]*yv.w;
+            }
+        }
+    }
+    ggml_cuda_pdl_lc();
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+        if (threadIdx.x == j) {
+            dst[j*stride_col_dst + row] = sumf[j];
+        }
+    }
+}
+
 template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false>
 static void mul_mat_vec_f_switch_fusion(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -733,6 +808,60 @@ void launch_mul_mat_vec_f_cuda(
     }
 }
 
+template <typename T, int ncols_dst>
+static void launch_mul_mat_vec_f_short_rows(
+        const T * x, const float * y, float * dst, const int64_t ncols, const int64_t nrows,
+        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
+        const int64_t nchannels_x, const int64_t nchannels_dst,
+        const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const int64_t nsamples_x, const int64_t nsamples_dst,
+        const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst, cudaStream_t stream) {
+    constexpr int rows_per_block = 4;
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const dim3 block_nums((nrows + rows_per_block - 1)/rows_per_block, nchannels_dst, nsamples_dst);
+    const dim3 block_dims(warp_size, rows_per_block, 1);
+    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+    ggml_cuda_kernel_launch(mul_mat_vec_f_short_rows<T, ncols_dst, rows_per_block>, launch_params,
+        x, y, dst, (int) ncols, (int) nrows, (int) stride_row, (int) stride_col_y, (int) stride_col_dst,
+        init_fastdiv_values(nchannels_dst / nchannels_x), (int) stride_channel_x, (int) stride_channel_y, (int) stride_channel_dst,
+        init_fastdiv_values(nsamples_dst / nsamples_x), (int) stride_sample_x, (int) stride_sample_y, (int) stride_sample_dst);
+}
+
+template <typename T>
+static bool mul_mat_vec_f_try_short_rows(
+        const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int64_t ncols, const int64_t nrows, const int64_t ncols_dst,
+        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
+        const int64_t nchannels_x, const int64_t nchannels_dst,
+        const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const int64_t nsamples_x, const int64_t nsamples_dst,
+        const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst, cudaStream_t stream) {
+    constexpr int64_t vals = 16/sizeof(T);
+    // Long rows already fill a block; few rows would leave most SMs idle with one warp per row.
+    if (ids || fusion.gate || fusion.x_bias || fusion.gate_bias ||
+            ncols*(int64_t) sizeof(T) > 2048 || ncols % vals != 0 || nrows < 1024 ||
+            (uintptr_t) x % 16 != 0 || stride_row % vals != 0 || stride_channel_x % vals != 0 || stride_sample_x % vals != 0 ||
+            (uintptr_t) y % 16 != 0 || stride_col_y % 4 != 0 || stride_channel_y % 4 != 0 || stride_sample_y % 4 != 0) {
+        return false;
+    }
+#define MMVF_SHORT_ROWS_CASE(n) \
+    case n: launch_mul_mat_vec_f_short_rows<T, n>(x, y, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst, \
+                nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, \
+                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream); return true;
+    switch (ncols_dst) {
+        MMVF_SHORT_ROWS_CASE(1)
+        MMVF_SHORT_ROWS_CASE(2)
+        MMVF_SHORT_ROWS_CASE(3)
+        MMVF_SHORT_ROWS_CASE(4)
+        MMVF_SHORT_ROWS_CASE(5)
+        MMVF_SHORT_ROWS_CASE(6)
+        MMVF_SHORT_ROWS_CASE(7)
+        MMVF_SHORT_ROWS_CASE(8)
+        default: return false;
+    }
+#undef MMVF_SHORT_ROWS_CASE
+}
+
 template <typename T, typename type_acc>
 static void mul_mat_vec_f_cuda_switch_ncols_dst(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -744,6 +873,12 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
         const int64_t ids_stride, cudaStream_t stream) {
 
     const bool has_ids = ids != nullptr;
+
+    if (mul_mat_vec_f_try_short_rows<T>(x, y, ids, fusion, dst, ncols, nrows, ncols_dst, stride_row, stride_col_y,
+            stride_col_dst, nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+            nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream)) {
+        return;
+    }
 
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path only - single-token goes through regular path below
@@ -1013,7 +1148,7 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
+bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
     }
@@ -1044,13 +1179,16 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 if (fp32_mma_hardware_available(cc)) {
                     return ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             }
-            return ne11 <= 8;
+            return ne11 <= MMVF_MAX_BATCH_SIZE;
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 const bool src0_thin  = src0_ne[1] <= 64 && src0_ne[2]*src0_ne[3] == 1;
+                if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     return src0_small && (ne11 == 1 || (src0_thin && ne11 <= MMVF_MAX_BATCH_SIZE));
                 }
@@ -1060,8 +1198,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 if (fp16_mma_hardware_available(cc)) {
                     return src0_small && ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                if (GGML_CUDA_CC_IS_RDNA(cc) && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (fp16_mma_hardware_available(cc)) {
                     if (GGML_CUDA_CC_IS_RDNA3(cc)) {
                         return ne11 <= 3;
@@ -1071,9 +1212,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                     }
                     return ne11 <= 2;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             }
-            return ne11 <= 8;
+            return ne11 <= MMVF_MAX_BATCH_SIZE;
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
@@ -1081,6 +1222,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 // tensor-core GEMM: cuBLAS runs it as a 2-block 16x16 wmma kernel (~34 us) while the vector
                 // kernel finishes in a few microseconds for every batch size it supports.
                 const bool src0_thin = src0_ne[1] <= 64 && src0_ne[2]*src0_ne[3] == 1;
+                if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     return src0_small && (ne11 == 1 || (src0_thin && ne11 <= MMVF_MAX_BATCH_SIZE));
                 }
@@ -1090,14 +1234,17 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 if (bf16_mma_hardware_available(cc)) {
                     return src0_small && ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                if (GGML_CUDA_CC_IS_RDNA(cc) && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (bf16_mma_hardware_available(cc)) {
                     return ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             }
-            return ne11 <= 8;
+            return ne11 <= MMVF_MAX_BATCH_SIZE;
         default:
             return false;
     }

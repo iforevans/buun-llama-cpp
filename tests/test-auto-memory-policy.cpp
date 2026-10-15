@@ -77,7 +77,7 @@ int main() {
     const std::string other = common_moe_cache_profile_file(digest_b);
     expect(first == again, "model heatmap path must be stable");
     expect(first != other, "distinct semantic model families must not share heatmaps");
-    expect(first.rfind(fs_get_cache_directory(), 0) == 0,
+    expect(first.rfind(fs_path_to_utf8(fs_get_cache_directory()), 0) == 0,
             "heatmap must live in the canonical llama.cpp cache directory");
 
     expect(common_cpu_get_num_physical_cores() > 0,

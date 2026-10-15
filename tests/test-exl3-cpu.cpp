@@ -75,11 +75,122 @@ static void had(float * x, int n) {
                 }
 }
 
+// Decodes one 16x16 trellis tile into out[col*stride + row].
+static void decode_tile(const unsigned char * tile, int bits, int cb, float * out, int stride) {
+    for (int t = 0; t < 256; ++t) {
+        unsigned window = 0;
+        for (int b = 0; b < 16; ++b) {
+            const int p = ((t+257)*bits-1-b) % (256*bits);
+            const int bit = (p/32)*32 + 31-p%32;
+            window |= unsigned((tile[bit/8] >> (bit%8)) & 1) << b;
+        }
+        const int lane = t/8, j = t%8;
+        const int row = (lane%4)*2 + j%2 + ((j&2) ? 8 : 0);
+        const int col = lane/4 + ((j&4) ? 8 : 0);
+        out[col*stride + row] = codebook(window, cb);
+    }
+}
+
+// Mixed banks keep each expert's trellis unchanged. Exercise non-contiguous
+// logical IDs, singleton groups, absent groups and changed routes on reuse.
+static bool run_mixed(ggml_backend_t backend, int tokens, int lanes) {
+    constexpr int k = 128, n = 128, topk = 3, experts = 5;
+    constexpr float norm = 0.088388347648f;
+    const std::vector<std::vector<int>> members{{3, 0}, {4, 1}, {2}};
+    auto * ctx = ggml_init({4*1024*1024, nullptr, true});
+    auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, lanes, tokens);
+    auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, topk, tokens);
+    auto * flat = ggml_reshape_1d(ctx, ids, topk*tokens);
+    ggml_tensor * result = nullptr;
+    std::vector<ggml_tensor *> weights, signs, scales, maps;
+    for (int g = 0; g < 3; ++g) {
+        weights.push_back(ggml_new_tensor_3d(ctx, ggml_exl3_type(g+2, 2), k, n, members[g].size()));
+        signs.push_back(ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, members[g].size()));
+        scales.push_back(ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, members[g].size()));
+        maps.push_back(ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, experts));
+        auto * local = ggml_reshape_2d(ctx, ggml_get_rows(ctx, maps.back(), flat), topk, tokens);
+        auto * part = ggml_mul_mat_id(ctx, weights.back(), x, local);
+        part->src[3] = scales.back();
+        part->src[4] = signs.back();
+        ggml_mul_mat_id_set_expert_window(part, 0, members[g].size());
+        result = result ? ggml_add(ctx, result, part) : part;
+    }
+    auto * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buffer);
+    unsigned rng = 1234567;
+    auto next = [&]() { rng = rng*1664525u+1013904223u; return rng; };
+    std::vector<float> dense(experts*k*n), input(k*lanes*tokens);
+    std::vector<ggml_fp16_t> all_signs(experts*k), all_scales(experts*n);
+    for (auto & v : input) v = float(next() >> 8)/16777216.0f - 0.5f;
+    ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+    for (int g = 0; g < 3; ++g) {
+        const int bits = g+2;
+        std::vector<uint8_t> packed(ggml_nbytes(weights[g]));
+        for (auto & v : packed) v = next() >> 24;
+        std::vector<ggml_fp16_t> sg(k*members[g].size()), sc(n*members[g].size());
+        std::vector<int32_t> map(experts, -1);
+        for (size_t e = 0; e < members[g].size(); ++e) {
+            const int id = members[g][e];
+            map[id] = e;
+            for (int i = 0; i < k; ++i) all_signs[id*k+i] = sg[e*k+i] = ggml_fp32_to_fp16((i+id)%3 ? 1 : -1);
+            for (int i = 0; i < n; ++i) all_scales[id*n+i] = sc[e*n+i] = ggml_fp32_to_fp16(((i+id)%7 ? 1 : -1)*0.125f);
+            for (int nt = 0; nt < n/16; ++nt) for (int kt = 0; kt < k/16; ++kt) {
+                const size_t base = e*weights[g]->nb[2] + size_t(nt*(k/16)+kt)*32*bits;
+                decode_tile(packed.data() + base, bits, 2, dense.data() + size_t(id*n+nt*16)*k + kt*16, k);
+            }
+        }
+        ggml_backend_tensor_set(weights[g], packed.data(), 0, packed.size());
+        ggml_backend_tensor_set(signs[g], sg.data(), 0, ggml_nbytes(signs[g]));
+        ggml_backend_tensor_set(scales[g], sc.data(), 0, ggml_nbytes(scales[g]));
+        ggml_backend_tensor_set(maps[g], map.data(), 0, ggml_nbytes(maps[g]));
+    }
+    bool ok = true;
+    double worst = 0;
+    for (int round = 0; round < 3; ++round) {
+        std::vector<int32_t> routes(topk*tokens);
+        const int first_routes[] = {0, 3, 1}; // the four-bit group receives no rows
+        for (size_t i = 0; i < routes.size(); ++i) routes[i] = round == 0 ? first_routes[i%topk] : (i*3+round)%experts;
+        ggml_backend_tensor_set(ids, routes.data(), 0, ggml_nbytes(ids));
+        std::vector<float> reference(n*topk*tokens), actual(reference.size()), xr(k);
+        for (int t = 0; t < tokens; ++t) for (int e = 0; e < topk; ++e) {
+            const int id = routes[t*topk+e];
+            for (int i = 0; i < k; ++i) xr[i] = input[(t*lanes+e%lanes)*k+i]*half_bits(all_signs[id*k+i]);
+            had(xr.data(), k);
+            for (auto & v : xr) v = half_round(v*norm);
+            auto * out = reference.data()+(t*topk+e)*n;
+            for (int c = 0; c < n; ++c) {
+                double sum = 0;
+                for (int i = 0; i < k; ++i) sum += double(xr[i])*dense[(id*n+c)*k+i];
+                out[c] = sum;
+            }
+            had(out, n);
+            for (int c = 0; c < n; ++c) out[c] *= norm*half_bits(all_scales[id*n+c]);
+        }
+        GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
+        double err2 = 0, ref2 = 0;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            ok &= std::isfinite(actual[i]);
+            const double d = actual[i]-reference[i];
+            err2 += d*d;
+            ref2 += double(reference[i])*reference[i];
+        }
+        worst = std::max(worst, std::sqrt(err2/std::max(ref2, 1e-30)));
+    }
+    ok &= worst < (gpu_executor ? 1e-2 : 2e-5);
+    printf("mixed tokens=%d lanes=%d rel_l2=%.9g %s\n", tokens, lanes, worst, ok ? "PASS" : "FAIL");
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return ok;
+}
+
 static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int tokens, int lanes, bool windowed = false,
                 int k = 256, int n = 384, int overlap = -1, bool automatic = false, bool head = false) {
     constexpr float norm = 0.088388347648f;
     // The cache's existing pool policy requires at least 64 expert entries.
-    const int experts = grouped ? (cache_gpu && !windowed ? 64 : 3) : 1;
+    const int experts = grouped ? (cache_gpu ? 64 : 3) : 1;
     const int topk = grouped ? 3 : 1;
     auto * ctx = ggml_init({4*1024*1024, nullptr, true});
     auto * w = ggml_new_tensor_3d(ctx, ggml_exl3_type(bits, cb), k, n, experts);
@@ -152,18 +263,7 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
     for (int e = 0; e < std::min(experts, 3); ++e)
         for (int nt = 0; nt < n/16; ++nt) for (int kt = 0; kt < k/16; ++kt) {
             const size_t base = e*w->nb[2] + size_t(nt*(k/16)+kt)*32*bits;
-            for (int t = 0; t < 256; ++t) {
-                unsigned window = 0;
-                for (int b = 0; b < 16; ++b) {
-                    const int p = ((t+257)*bits-1-b) % (256*bits);
-                    const int bit = (p/32)*32 + 31-p%32;
-                    window |= unsigned((packed[base+bit/8] >> (bit%8)) & 1) << b;
-                }
-                const int lane = t/8, j = t%8;
-                const int row = (lane%4)*2 + j%2 + ((j&2) ? 8 : 0);
-                const int col = lane/4 + ((j&4) ? 8 : 0);
-                weights[(e*n+nt*16+col)*k+kt*16+row] = codebook(window, cb);
-            }
+            decode_tile(packed.data() + base, bits, cb, weights.data() + size_t(e*n+nt*16)*k + kt*16, k);
         }
     std::vector<float> ref(ggml_nelements(y)), xr(k), actual(ref.size()), first;
     for (int token = 0; token < tokens; ++token) for (int slot = 0; slot < topk; ++slot) {
@@ -206,7 +306,7 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
     ok &= worst < (quantized_activations ? 1e-2 : 2e-5);
     // The cache provider accepts at most ten tokens; larger cases above still
     // exercise CPU transform sharing/fallback and exact thread-count agreement.
-    if (cache_gpu && grouped && !windowed && tokens <= 10 && topk*tokens <= 64) {
+    if (cache_gpu && grouped && tokens <= 10 && topk*tokens <= 64) {
         ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         ggml_moe_cache_config config{};
         // Keep room for the minimum 64-entry pool at the larger MoE shapes too.
@@ -238,7 +338,10 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
         };
         // Auto EXL3 must retain all resident rows on GPU; fixed overrides
         // still assign the requested share to CPU. Wait for complete residency.
-        const int expected_hits = topk*tokens - (overlap < 0 ? 0 : std::min(overlap, topk*tokens - 1));
+        const int valid_rows = std::count_if(routes.begin(), routes.end(), [&](int32_t id) {
+            return !windowed || (id >= 1 && id < 1 + experts);
+        });
+        const int expected_hits = valid_rows - (overlap < 0 ? 0 : std::min(overlap, valid_rows - 1));
         for (int attempt = 0; attempt < 160 && (cache_hits < 24 || last_cache_hits != expected_hits); ++attempt) {
             ok &= check();
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -328,6 +431,7 @@ int main(int argc, char ** argv) {
         ggml_backend_free(backend);
         return ok ? 0 : 1;
     }
+    for (int tokens : {1, 7, 700}) for (int lanes : {1, 3}) ok &= run_mixed(backend, tokens, lanes);
     for (int cb = 0; cb < 3; ++cb) for (int bits = 1; bits <= 8; ++bits) {
         ok &= run(backend, bits, cb, false, 1, 1);
         ok &= run(backend, bits, cb, false, 8, 1);

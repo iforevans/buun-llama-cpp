@@ -29,6 +29,11 @@ struct llama_ubatch {
         return n_pos >= 3;
     }
 
+    // mixed: type picks token or embd per row, pos has n_pos sections for all rows
+    bool is_mixed() const {
+        return type != nullptr;
+    }
+
     uint32_t b_equal_seqs; // note: this is a boolean, but we use an int32_t for alignment
                            //       otherwise address sanitizer complains
     // TODO: whole_seqs for embeddings?
@@ -52,6 +57,8 @@ struct llama_ubatch {
     llama_seq_id *  seq_id_unq; // [n_seqs_unq]       | s   | seq_id
     int32_t      *  seq_idx;    // [LLAMA_MAX_SEQ]    | -   | seq_idx
     int8_t       *  output;     // [n_tokens]         | i   | -
+    int8_t       *  type;       // [n_tokens]         | i   | -     (mixed ubatch only, 0 - token, 1 - embd)
+    int32_t      *  decision_order; // [n_tokens], NULL if no entry has one, see llama_batch_ext_set_decision_order()
 
     struct data_t {
         std::vector<llama_token>    token;
@@ -62,6 +69,9 @@ struct llama_ubatch {
         std::vector<llama_seq_id>   seq_id_unq;
         std::vector<int32_t>        seq_idx;
         std::vector<int8_t>         output;
+        std::vector<int8_t>         type;
+        std::vector<int32_t>        batch_idxs;  // original batch index for each token
+        std::vector<int32_t>        decision_order;
 
         std::vector<llama_seq_id> seq_id_data;
     };
@@ -69,6 +79,9 @@ struct llama_ubatch {
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
 };
+
+// crash if a mixed ubatch reaches code that expects only tokens or only embd
+#define ASSERT_EMBD_OR_TOKEN(ubatch) GGML_ASSERT(!(ubatch).is_mixed() && "mixed token/embd ubatch is not supported here")
 
 struct llama_hparams;
 
@@ -95,6 +108,7 @@ struct llama_batch_ext {
         bool         has_embd = false; // whether embd_off is set
         size_t       embd_off = 0; // index offset in the embd array
         bool         output = false; // TODO: have dedicated output flags
+        int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
         std::unordered_set<llama_seq_id> seq_ids;
         std::array<llama_pos, GGML_MROPE_SECTIONS> pos = {0, 0, 0, 0};
     };
@@ -103,7 +117,9 @@ struct llama_batch_ext {
 
     // Reusable metadata view for the shared legacy decode/allocator path. The
     // extended API owns its embeddings; already ordered rows need no second copy.
-    bool get_batch(llama_batch & batch) const;
+    // Legacy views cannot carry mixed-row/decision metadata. Only the allocator
+    // opts into the extended layout and consumes the flat metadata alongside it.
+    bool get_batch(llama_batch & batch, bool extended_layout = false) const;
 
     mutable std::vector<llama_token> flat_token;
     mutable std::vector<float> flat_embd;
@@ -112,6 +128,8 @@ struct llama_batch_ext {
     mutable std::vector<llama_seq_id> flat_seq_id_data;
     mutable std::vector<llama_seq_id *> flat_seq_id;
     mutable std::vector<int8_t> flat_output;
+    mutable std::vector<int8_t> flat_type;
+    mutable std::vector<int32_t> flat_decision_order;
 
     llama_batch_ext(llama_context * ctx);
 
@@ -136,12 +154,13 @@ struct llama_batch_ext {
     bool set_token_embd(int32_t idx, llama_embd embd_in);
     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
     bool set_output(int32_t idx, bool output_last);
+    bool set_decision_order(int32_t idx, int32_t order);
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch
 class llama_batch_allocr {
 public:
-    llama_batch_allocr(uint32_t n_pos_per_embd);
+    llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed = false);
 
     // convert a llama_batch_ext to internal llama_batch and sanitize it
     bool init(
@@ -150,6 +169,7 @@ public:
             bool output_all);
 
     // Keep borrowed legacy batches on the established zero-copy input path.
+    // Processing contexts supply destination memory/limits and optional extended metadata here.
     bool init(
             const llama_batch & batch_inp,
             const llama_vocab & vocab,
@@ -157,7 +177,8 @@ public:
             uint32_t n_embd,
             uint32_t n_seq_max,
             bool output_all,
-            bool token_ids_validated = false);
+            bool token_ids_validated = false,
+            const llama_batch_ext * extended = nullptr);
 
     const llama_batch & get_batch() const;
 
@@ -209,11 +230,15 @@ private:
     //       ref: https://github.com/ggml-org/llama.cpp/issues/13694#issuecomment-2983871762
     const uint32_t n_pos_per_embd;
 
+    const bool allow_mixed;
+
     uint32_t n_embd;
     uint32_t n_seq_max;
     uint32_t n_outputs;
 
     std::vector<llama_seq_id>   seq_id_0 = { 0 };
+    std::vector<int8_t>        is_embd_vec;
+    bool positions_expanded = false;
 
     std::vector<llama_pos>      pos;
     std::vector<int32_t>        n_seq_id;
@@ -221,6 +246,7 @@ private:
     std::vector<llama_seq_id>   seq_id_unq;
     std::vector<int32_t>        seq_idx;
     std::vector<int8_t>         output;
+    std::vector<int32_t>        decision_order; // empty if no entry has one
 
     using pos_set_t = std::set<llama_pos>;
     using seq_cpl_t = std::vector<bool>;

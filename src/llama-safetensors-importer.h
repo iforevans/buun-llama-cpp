@@ -18,6 +18,7 @@
 class llama_safetensors_importer {
   public:
     virtual ~llama_safetensors_importer() = default;
+    virtual std::vector<int64_t> expert_group_sizes(const std::string &) const { return {}; }
 
     virtual gguf_context * build_metadata() const = 0;
 

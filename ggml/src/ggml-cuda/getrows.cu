@@ -139,6 +139,41 @@ static __global__ void k_get_rows_float(
     }
 }
 
+// Rows narrower than a warp: a block per row would leave most threads idle, so give each
+// thread one element instead.
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_float_narrow(
+        const src0_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
+        const int ne00, const int64_t ne10, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= ne10*ne00) {
+        return;
+    }
+    const int64_t i10 = i / ne00;
+    const int     i00 = i % ne00;
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        const uint2 dm = fast_div_modulo((uint32_t)z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+
+        const int i01 = src1_ptr[i10*s10 + i11*s11 + i12*s12];
+        const src0_t * src0_row = (const src0_t *)((const char *) src0_ptr + i01*nb01 + i11*nb02 + i12*nb03);
+        dst_t v;
+        if constexpr (std::is_same<src0_t, uint8_t>::value) {
+            v = ggml_cuda_cast<dst_t>(ggml_cuda_e4m3_to_fp32(src0_row[i00]));
+        } else {
+            v = ggml_cuda_cast<dst_t>(src0_row[i00]);
+        }
+        dst_ptr[i10*s1 + i11*s2 + i12*s3 + i00] = v;
+    }
+}
+
 template<typename dst_t>
 static __global__ void k_get_rows_float_vec(
         const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
@@ -297,7 +332,8 @@ static void get_rows_cuda_float(
         const int64_t ne00v = ne00 / VEC;
         const int64_t vec_block_num_y = (ne00v + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
         const bool enough_blocks = vec_block_num_y * ne10 * ne11 * ne12 >= 128;
-        const bool can_vec = VEC > 1 && enough_blocks &&
+        // a block per row idles nearly all its threads on rows narrower than a warp
+        const bool can_vec = VEC > 1 && enough_blocks && ne00 >= 32 &&
             (ne00 % VEC == 0) &&
             (nb01 % 16 == 0) && (nb02 % 16 == 0) && (nb03 % 16 == 0) &&
             (nb1  % 16 == 0) && (nb2  % 16 == 0) && (nb3  % 16 == 0) &&
@@ -315,6 +351,18 @@ static void get_rows_cuda_float(
                 s10, s11, s12);
             return;
         }
+    }
+
+    if (ne00 < 32) {
+        const dim3 block_nums((ne10*ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, 1, MIN(ne11*ne12, UINT16_MAX));
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+        ggml_cuda_kernel_launch(k_get_rows_float_narrow<src0_t, dst_t>, launch_params,
+            src0_d, src1_d, dst_d,
+            (int) ne00, ne10, ne11, ne12_fdv,
+            s1, s2, s3,
+            nb01, nb02, nb03,
+            s10, s11, s12);
+        return;
     }
 
     const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;

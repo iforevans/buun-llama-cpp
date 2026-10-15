@@ -1595,12 +1595,14 @@ static bool ggml_backend_cann_buffer_type_is_host(ggml_backend_buffer_type_t buf
  * memory for CANN buffer types in the GGML backend.
  */
 static const ggml_backend_buffer_type_i ggml_backend_cann_buffer_type_interface = {
-    /* .get_name         = */ ggml_backend_cann_buffer_type_name,
-    /* .alloc_buffer     = */ ggml_backend_cann_buffer_type_alloc_buffer,
-    /* .get_alignment    = */ ggml_backend_cann_buffer_type_get_alignment,
-    /* .get_max_size     = */ NULL,  // defaults to SIZE_MAX
-    /* .get_alloc_size   = */ ggml_backend_cann_buffer_type_get_alloc_size,
-    /* .is_host          = */ ggml_backend_cann_buffer_type_is_host,
+    /* .get_name            = */ ggml_backend_cann_buffer_type_name,
+    /* .alloc_buffer        = */ ggml_backend_cann_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n      = */ NULL,
+    /* .get_alignment       = */ ggml_backend_cann_buffer_type_get_alignment,
+    /* .get_max_size        = */ NULL,  // defaults to SIZE_MAX
+    /* .get_alloc_size      = */ ggml_backend_cann_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n    = */ NULL,
+    /* .is_host             = */ ggml_backend_cann_buffer_type_is_host,
 };
 
 /**
@@ -1742,12 +1744,14 @@ static ggml_backend_buffer_t ggml_backend_cann_host_buffer_type_alloc_buffer(ggm
 ggml_backend_buffer_type_t ggml_backend_cann_host_buffer_type() {
     static struct ggml_backend_buffer_type ggml_backend_cann_buffer_type_host = {
         /* .iface    = */ {
-                           /* .get_name         = */ ggml_backend_cann_host_buffer_type_name,
-                           /* .alloc_buffer     = */ ggml_backend_cann_host_buffer_type_alloc_buffer,
-                           /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
-                           /* .get_max_size     = */ NULL,  // defaults to SIZE_MAX
-            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
-                           /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+                           /* .get_name             = */ ggml_backend_cann_host_buffer_type_name,
+                           /* .alloc_buffer         = */ ggml_backend_cann_host_buffer_type_alloc_buffer,
+                           /* .alloc_buffer_n       = */ NULL,
+                           /* .get_alignment        = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+                           /* .get_max_size         = */ NULL,  // defaults to SIZE_MAX
+                           /* .get_alloc_size       = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                           /* .get_alloc_size_n     = */ NULL,
+                           /* .is_host              = */ ggml_backend_cpu_buffer_type()->iface.is_host,
                            },
         /* .device   = */
         ggml_backend_reg_dev_get(ggml_backend_cann_reg(), 0),
@@ -2620,10 +2624,12 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_PAD:
             // TODO: add circular padding support for cann, see https://github.com/ggml-org/llama.cpp/pull/16985
             return ggml_get_op_params_i32(op, 8) == 0;
+        case GGML_OP_ARGMAX:
+            // op param 3 is ggml_topk_ext's K; only CPU and CUDA fill that layout
+            return ggml_get_op_params_i32(op, 3) == 0;
         case GGML_OP_ARANGE:
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_LEAKY_RELU:
-        case GGML_OP_ARGMAX:
         case GGML_OP_COS:
         case GGML_OP_SIN:
         case GGML_OP_LOG:

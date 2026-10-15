@@ -6,6 +6,7 @@
 #include "llama-safetensors-qwen3.h"
 #include "llama-safetensors-qwen35.h"
 #include "llama-safetensors-qwen4exp.h"
+#include "llama-safetensors-glm5next.h"
 #include "llama-safetensors-tensor.h"
 #include "llama-safetensors.h"
 #include "llama.h"
@@ -34,6 +35,13 @@ void require(bool condition, const char * message) {
         throw std::runtime_error(message);
     }
 }
+
+// canonical EXL3 side-tensor suffixes and the quant roles they bind
+const struct { const char * name; llama_safetensors_quant_role kind; } exl3_roles[] = {
+    { "weight",      llama_safetensors_quant_role::WEIGHT },
+    { "scale",       llama_safetensors_quant_role::WEIGHT_SCALE },
+    { "input_scale", llama_safetensors_quant_role::INPUT_SCALE },
+};
 
 void write_shard(const std::filesystem::path & path, const std::string & header, const std::vector<uint8_t> & data) {
     std::ofstream out(path, std::ios::binary);
@@ -1069,6 +1077,163 @@ int main(int argc, char ** argv) try {
     }
 
     test_qwen35_exl3_source_names(dir.path);
+
+    {
+        const auto path = dir.path / "glm-mixed-experts";
+        const std::string prefix = "model.language_model.layers.0.mlp.experts.";
+        const int bits[] = {3, 2, 4, 2, 3};
+        std::vector<tensor_fixture> tensors;
+        size_t packed_bytes = 0;
+        for (int e = 0; e < 5; ++e) {
+            const auto module = prefix + std::to_string(e) + ".gate_proj";
+            std::vector<uint8_t> trellis(8*8*32*bits[e]);
+            for (size_t i = 0; i < trellis.size(); ++i) trellis[i] = uint8_t(i*11+e*97);
+            packed_bytes += trellis.size();
+            tensors.push_back({module + ".trellis", "I16", {8, 8, size_t(16*bits[e])}, trellis});
+            tensors.push_back({module + ".suh", "F16", {128}, std::vector<uint8_t>(256, uint8_t(e))});
+            tensors.push_back({module + ".svh", "F16", {128}, std::vector<uint8_t>(256, uint8_t(e+1))});
+            tensors.push_back({module + ".mul1", "I32", {}, std::vector<uint8_t>(4)});
+        }
+        const std::vector<uint8_t> embedding(256, 7);
+        tensors.push_back({"model.language_model.embed_tokens.weight", "F16", {1, 128}, embedding});
+        tensors.push_back({"model.language_model.layers.0.self_attn.indexer.wq_b.weight", "F16", {1, 128}, embedding});
+        for (int layer = 0; layer < 3; ++layer) {
+            const float values[] = {1, 2, 3, 4, 5, 6};
+            std::vector<uint8_t> bytes(layer == 2 ? sizeof(values) : sizeof(values)/2);
+            for (int i = 0; i < 6; ++i) {
+                if (layer == 2) {
+                    std::memcpy(bytes.data()+4*i, values+i, 4);
+                } else {
+                    const uint16_t v = layer == 0 ? ggml_fp32_to_fp16(values[i]) : ggml_fp32_to_bf16(values[i]).bits;
+                    std::memcpy(bytes.data()+2*i, &v, 2);
+                }
+            }
+            tensors.push_back({"model.language_model.layers." + std::to_string(layer) + ".self_attn.conv1d.weight",
+                               layer == 0 ? "F16" : layer == 1 ? "BF16" : "F32", {3, 1, 2}, std::move(bytes)});
+        }
+        const std::string indexer = "model.language_model.layers.1.self_attn.indexer.wq_b";
+        for (int i = 0; i < 4; ++i) {
+            auto tensor = tensors[i];
+            tensor.name = indexer + tensor.name.substr((prefix + "0.gate_proj").size());
+            tensors.push_back(std::move(tensor));
+        }
+        write_single_shard_model(path, tensors);
+        write_text(path / "tokenizer.json", json({
+            {"model", {{"vocab", {{"x", 0}}}, {"merges", json::array()}}},
+            {"added_tokens", json::array({
+                {{"content", "<|endoftext|>"}, {"id", 2}, {"special", true}},
+                {{"content", "[gMASK]"}, {"id", 4}, {"special", true}},
+                {{"content", "<|user|>"}, {"id", 5}, {"special", true}},
+                {{"content", "<|observation|>"}, {"id", 6}, {"special", true}},
+            })},
+        }).dump());
+        const json config = {
+            {"model_type", "glm5_next"}, {"num_hidden_layers", 3}, {"n_routed_experts", 5},
+            {"layer_types", {"deepseek_sparse_attention", "linear_attention", "deepseek_sparse_attention"}},
+            {"indexer_types", {"full", "full", "shared"}},
+            {"quantization_config", {{"quant_method", "exl3"}}},
+            {"max_position_embeddings", 128}, {"hidden_size", 128}, {"intermediate_size", 256},
+            {"moe_intermediate_size", 128}, {"first_k_dense_replace", 0}, {"num_experts_per_tok", 2},
+            {"n_shared_experts", 1}, {"routed_scaling_factor", 1.0}, {"norm_topk_prob", true},
+            {"swiglu_limit", 7.0}, {"num_attention_heads", 1}, {"rms_norm_eps", 1e-6},
+            {"q_lora_rank", 128}, {"kv_lora_rank", 128}, {"qk_rope_head_dim", 0},
+            {"qk_head_dim", 128}, {"v_head_dim", 128}, {"index_n_heads", 1},
+            {"index_head_dim", 128}, {"index_topk", 4}, {"index_kpool", 1},
+            {"index_kpool_always_select_tail", true},
+            {"linear_attn_config", {{"short_conv_kernel_size", 2}, {"head_dim", 128}, {"gate_lower_bound", -5.0}}},
+            {"hc_mult", 4}, {"hc_sinkhorn_iters", 20}, {"hc_eps", 1e-6},
+            {"eos_token_id", json::array({2, 5, 6})}, {"vocab_size", 8},
+        };
+        for (auto mode : {llama_safetensors_io_mode::BUFFERED, llama_safetensors_io_mode::MMAP}) {
+            llama_safetensors_glm5next_importer importer(path, config, mode);
+            std::unique_ptr<gguf_context, decltype(&gguf_free)> md(importer.build_metadata(), gguf_free);
+            for (const auto & entry : {
+                    std::make_pair("glm5-next.attention.head_count_kv", std::vector<uint32_t>{1, 0, 1}),
+                    std::make_pair("glm5-next.attention.indexer.types", std::vector<uint32_t>{1, 1, 0})}) {
+                const auto key = gguf_find_key(md.get(), entry.first);
+                require(key >= 0 && gguf_get_arr_n(md.get(), key) == entry.second.size(), "missing GLM layer layout");
+                const auto * values = static_cast<const uint32_t *>(gguf_get_arr_data(md.get(), key));
+                require(std::equal(entry.second.begin(), entry.second.end(), values), "GLM layer layout changed");
+            }
+            for (const auto & kv : {std::make_pair("bos", 4U), {"eos", 2U}, {"eot", 5U}, {"eom", 6U}, {"unknown", 2U}}) {
+                const auto key = "tokenizer.ggml." + std::string(kv.first) + "_token_id";
+                const int64_t id = gguf_find_key(md.get(), key.c_str());
+                require(id >= 0 && gguf_get_val_u32(md.get(), id) == kv.second, "GLM special token mapping differs from GGUF");
+            }
+            const auto registry = llama_safetensors_registry::load(path, mode);
+            llama_safetensors_quant_adapters quant(config, registry);
+            const auto sizes = importer.expert_group_sizes("blk.0.ffn_gate_exps.weight");
+            require(sizes == std::vector<int64_t>({2, 2, 1}), "incorrect precision partitions");
+            ggml_type type;
+            std::array<int64_t, GGML_MAX_DIMS> ne;
+            require_rejected([&] { importer.describe("blk.0.ffn_gate_exps.weight", type, ne); },
+                             "mixed experts accepted as a homogeneous stack");
+            size_t total = 0;
+            for (int g = 0; g < 3; ++g) {
+                const auto group = "blk.0.ffn_gate_exps.g" + std::to_string(g) + ".";
+                require(importer.describe(group + "expert_map", type, ne) && type == GGML_TYPE_I32 &&
+                            ne[0] == 1 && ne[1] == 5, "invalid routing table");
+                const auto map_bytes = importer.materialize(group + "expert_map", type, 20);
+                int32_t map[5];
+                std::memcpy(map, map_bytes.data(), sizeof(map));
+                for (const auto & r : exl3_roles) {
+                    const std::string role = r.name;
+                    require(importer.describe(group + role, type, ne), "missing expert partition tensor");
+                    const size_t size = ggml_row_size(type, ne[0])*ne[1]*ne[2];
+                    const auto actual = importer.materialize(group + role, type, size);
+                    std::vector<uint8_t> expected;
+                    int local = 0;
+                    for (int e = 0; e < 5; ++e) {
+                        if (bits[e] != g+2) {
+                            require(map[e] == -1, "foreign expert was mapped into a group");
+                            continue;
+                        }
+                        require(map[e] == local++, "expert ordering changed");
+                        const auto binding = quant.bind(prefix + std::to_string(e) + ".gate_proj", r.kind);
+                        require(bool(binding), "missing reference expert");
+                        const auto part = quant.finalize(*binding, quant.read(*binding));
+                        expected.insert(expected.end(), part.begin(), part.end());
+                    }
+                    require(actual == expected, "grouping altered packed weights or auxiliary vectors");
+                    importer.bind(group + role);
+                    if (role == "weight") total += size;
+                }
+            }
+            require(total == packed_bytes, "mixed bank storage was padded");
+            require(importer.describe("token_embd.weight", type, ne) && type == GGML_TYPE_F16,
+                    "plain embedding type changed");
+            require(importer.materialize("token_embd.weight", type, embedding.size()) == embedding,
+                    "buffered embedding was spuriously expanded");
+            for (int layer = 0; layer < 3; ++layer) {
+                const char * names[] = {"q", "k", "v"};
+                for (int part = 0; part < 3; ++part) {
+                    const auto name = "blk." + std::to_string(layer) + ".ssm_conv1d_" + names[part] + ".weight";
+                    require(importer.describe(name, type, ne) && type == GGML_TYPE_F32 && ne[0] == 2,
+                            "invalid convolution slice descriptor");
+                    const auto bytes = importer.materialize(name, type, 2*sizeof(float));
+                    float values[2];
+                    std::memcpy(values, bytes.data(), sizeof(values));
+                    require(values[0] == 2*part+1 && values[1] == 2*part+2,
+                            "convolution slice used the wrong source dtype");
+                }
+            }
+            require(importer.describe("blk.0.indexer.attn_q_b.weight", type, ne) && type == GGML_TYPE_F16,
+                    "plain indexer projection was not mapped");
+            require(importer.materialize("blk.0.indexer.attn_q_b.weight", type, embedding.size()) == embedding,
+                    "plain indexer projection changed");
+            for (const auto & r : exl3_roles) {
+                const auto name = std::string("blk.1.indexer.attn_q_b.") + r.name;
+                const auto binding = quant.bind(indexer, r.kind);
+                require(binding && importer.describe(name, type, ne) && type == binding->target_type,
+                        "quantized indexer projection was not mapped");
+                const auto expected = quant.finalize(*binding, quant.read(*binding));
+                require(importer.materialize(name, type, expected.size()) == expected,
+                        "quantized indexer projection changed");
+                importer.bind(name);
+            }
+            importer.validate_complete();
+        }
+    }
 
     {
         // Streamed stacked experts must retain exact expert order. The PLE

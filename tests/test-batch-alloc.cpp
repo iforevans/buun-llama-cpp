@@ -100,6 +100,15 @@ struct batch_builder {
         const llama_pos pos[GGML_MROPE_SECTIONS] = { p, 0, 0, 0 };
         return add_embd(pos, seq_ids, output);
     }
+
+    int32_t add_tok(llama_token id, llama_pos p, llama_seq_id seq_id, bool output) {
+        const int32_t idx = b.add_token(seq_id);
+        GGML_ASSERT(idx >= 0);
+        GGML_ASSERT(b.set_token_id(idx, id));
+        GGML_ASSERT(b.set_token_pos(idx, &p));
+        GGML_ASSERT(b.set_output(idx, output));
+        return idx;
+    }
 };
 
 static void test_init(testing & t) {
@@ -429,6 +438,125 @@ static void test_content_types(testing & t) {
         const int32_t idx = bb.b.add_token(0);
         const auto r = bb.row(idx, 6);
         t.assert_true(!bb.b.set_token_embd(idx, { r.data(), 1, 6 }));
+    });
+}
+
+static void test_mixed(testing & t) {
+    llama_vocab vocab;
+
+    t.test("rejected_unless_allowed", [&](testing & t) {
+        batch_builder bb(2, nullptr, 4, 1, /*n_vocab*/ 10);
+        bb.add_tok(3, 0, 0, false);
+        bb.add(1, {0}, true);
+
+        llama_batch_allocr ba_default(1);
+        t.assert_true("rejected by default", !ba_default.init(bb.b, vocab, false));
+
+        llama_batch_allocr ba_mixed(1, true);
+        t.assert_true("accepted when allowed", ba_mixed.init(bb.b, vocab, false));
+    });
+
+    t.test("layout_and_split", [&](testing & t) {
+        batch_builder bb(2, nullptr, 4, 1, /*n_vocab*/ 10);
+        bb.add_tok(3, 0, 0, false);
+        bb.add(1, {0}, false);
+        bb.add(2, {0}, false);
+        bb.add_tok(5, 3, 0, true);
+
+        llama_batch_allocr ba(1, true);
+        t.assert_true(ba.init(bb.b, vocab, false));
+
+        const llama_batch & batch = ba.get_batch();
+        t.assert_true(batch.token != nullptr && batch.embd != nullptr);
+
+        const llama_token exp_tok[4]  = { 3, 0, 0, 5 };
+        const float       exp_embd[8] = { 0, 0, 100, 101, 200, 201, 0, 0 };
+        for (int i = 0; i < 4; ++i) {
+            t.assert_equal(exp_tok[i], batch.token[i]);
+        }
+        for (int i = 0; i < 8; ++i) {
+            t.assert_equal(exp_embd[i], batch.embd[i]);
+        }
+
+        llama_ubatch ub0 = ba.split_simple(3);
+        t.assert_equal(3u, ub0.n_tokens);
+        t.assert_true(ub0.is_mixed());
+        const int8_t exp_is_embd[3] = { 0, 1, 1 };
+        for (int i = 0; i < 3; ++i) {
+            t.assert_equal(exp_is_embd[i], ub0.type[i]);
+            t.assert_equal((llama_pos) i, ub0.pos[i]);
+        }
+        t.assert_equal(3, ub0.token[0]);
+        t.assert_equal(0.0f, ub0.embd[0]);
+        t.assert_equal(100.0f, ub0.embd[2]);
+
+        // token rows only: a plain token ubatch
+        llama_ubatch ub1 = ba.split_simple(3);
+        t.assert_equal(1u, ub1.n_tokens);
+        t.assert_true(!ub1.is_mixed());
+        t.assert_true(ub1.embd == nullptr);
+        t.assert_equal(5, ub1.token[0]);
+        t.assert_equal((llama_pos) 3, ub1.pos[0]);
+
+        t.assert_equal(0u, ba.split_simple(3).n_tokens);
+    });
+
+    t.test("rejects_entry_with_both", [&](testing & t) {
+        // token + embd on one entry is the MTP layout
+        batch_builder bb(2, nullptr, 4, 1, /*n_vocab*/ 10);
+        bb.add_tok(3, 0, 0, false);
+        bb.add(1, {0}, false);
+        const int32_t idx = bb.add_tok(4, 2, 0, true);
+        const auto r = bb.row(idx, bb.n_embd);
+        t.assert_true(bb.b.set_token_embd(idx, { r.data(), 1, bb.n_embd }));
+
+        llama_batch_allocr ba(1, true);
+        t.assert_true(!ba.init(bb.b, vocab, false));
+    });
+
+    t.test("mrope_pos_expanded", [&](testing & t) {
+        const uint32_t n_pos = 4;
+        batch_builder bb(2, nullptr, 4, n_pos, /*n_vocab*/ 10);
+
+        bb.add_tok(3, 10, 0, false);
+        const llama_pos pos1[n_pos] = { 11, 5, 7, 0 };
+        bb.add_embd(pos1, {0}, true);
+
+        llama_batch_allocr ba(n_pos, true);
+        t.assert_true(ba.init(bb.b, vocab, false));
+
+        llama_ubatch ub = ba.split_simple(2);
+        const llama_pos expected[8] = { 10, 11, 10, 5, 10, 7, 0, 0 };
+        for (int i = 0; i < 8; ++i) {
+            t.assert_equal(expected[i], ub.pos[i]);
+        }
+    });
+
+    t.test("mrope_rule_follows_first_entry", [&](testing & t) {
+        const uint32_t n_pos = 4;
+
+        mock_memory mem;
+        mem.ranges[0] = {0, 9};
+
+        llama_batch_allocr ba(n_pos, true);
+
+        // token first: must start after the memory
+        {
+            batch_builder bb(2, &mem, 4, n_pos, /*n_vocab*/ 10);
+            bb.add_tok(3, 9, 0, false);
+            const llama_pos pos[n_pos] = { 10, 1, 1, 0 };
+            bb.add_embd(pos, {0}, true);
+            t.assert_true("token overlapping the memory is rejected", !ba.init(bb.b, vocab, false));
+        }
+
+        // embd first: can overlap the memory
+        {
+            batch_builder bb(2, &mem, 4, n_pos, /*n_vocab*/ 10);
+            const llama_pos pos[n_pos] = { 9, 1, 1, 0 };
+            bb.add_embd(pos, {0}, false);
+            bb.add_tok(3, 10, 0, true);
+            t.assert_true("embd overlapping the memory is allowed", ba.init(bb.b, vocab, false));
+        }
     });
 }
 
@@ -1108,6 +1236,67 @@ static void test_sync_bridge(testing & t) {
     });
 }
 
+static void test_destination_frontier(testing & t) {
+    // Exercise the allocator entry used by llama_context's encode/decode owner.
+    // The batch's creator may have a different frontier and sequence capacity.
+    llama_vocab vocab;
+    mock_memory creator;
+    creator.ranges[0] = {0, 9};
+    mock_memory destination;
+    batch_builder bb(2, &creator, 4, 1, 0, /*encoder width*/ 6);
+    for (llama_pos pos = 0; pos < 2; ++pos) {
+        const int idx = bb.add_embd(&pos, {0}, true, 6);
+        t.assert_true(bb.b.set_decision_order(idx, 1));
+    }
+    llama_batch_allocr alloc(1);
+    auto init_at_destination = [&](const llama_memory_i * memory) {
+        llama_batch view = {};
+        t.assert_true(bb.b.get_batch(view, true));
+        return alloc.init(view, vocab, memory, 6, 2, true, true, &bb.b);
+    };
+    auto check_rows = [&](llama_pos first) {
+        const auto ub = alloc.split_simple(2);
+        t.assert_equal(2u, ub.n_tokens);
+        t.assert_equal(first, ub.pos[0]);
+        t.assert_equal(first + 1, ub.pos[1]);
+        t.assert_true(ub.decision_order != nullptr);
+        t.assert_equal(1, ub.decision_order[0]);
+        t.assert_equal(1, ub.decision_order[1]);
+        t.assert_equal(100.0f, ub.embd[6]); // preserve encoder input stride
+        t.assert_equal(105.0f, ub.embd[11]);
+    };
+
+    // Encode is position-zero even when the creator already has decoder KV.
+    t.assert_true("creator frontier would reject encode", !alloc.init(bb.b, vocab, true));
+    t.assert_true("encode ignores decoder memory", init_at_destination(nullptr));
+    check_rows(0);
+
+    destination.ranges[0] = {0, 1};
+    for (int i = 0; i < 2; ++i) {
+        const llama_pos pos = i + 2;
+        t.assert_true(bb.b.set_token_pos(i, &pos));
+    }
+    t.assert_true("decode rejects creator frontier", !alloc.init(bb.b, vocab, true));
+    t.assert_true("decode follows destination frontier", init_at_destination(&destination));
+    check_rows(2);
+
+    destination.ranges[0] = {0, 3};
+    for (int i = 0; i < 2; ++i) {
+        const llama_pos pos = i;
+        t.assert_true(bb.b.set_token_pos(i, &pos));
+    }
+    t.assert_true("decoder rejects repeated position-zero input", !init_at_destination(&destination));
+    t.assert_true("second encode is independent of previous decode", init_at_destination(nullptr));
+    check_rows(0);
+
+    batch_builder foreign_seq(2, &creator, 4);
+    foreign_seq.add(0, {3}, true);
+    llama_batch view = {};
+    t.assert_true(foreign_seq.b.get_batch(view, true));
+    t.assert_true("destination sequence capacity wins", !alloc.init(
+            view, vocab, nullptr, 2, 2, true, true, &foreign_seq.b));
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -1125,12 +1314,14 @@ int main(int argc, char ** argv) {
 
     t.test("init",           test_init);
     t.test("content_types",  test_content_types);
+    t.test("mixed",          test_mixed);
     t.test("compat",         test_compat);
     t.test("split",          test_split);
     t.test("keep_tail",      test_keep_tail);
     t.test("mrope",          test_mrope);
     t.test("mtp_embd_width", test_mtp_embd_width);
     t.test("sync_bridge",    test_sync_bridge);
+    t.test("destination_frontier", test_destination_frontier);
 
     return t.summary();
 }

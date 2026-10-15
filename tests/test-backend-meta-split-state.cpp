@@ -8,11 +8,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 static ggml_backend_meta_split_state split_state(const ggml_tensor * tensor, void * user_data) {
     ++*static_cast<size_t *>(user_data);
-    if (tensor->ne[1] == 4) {
+    if (tensor->ne[1] == 4 && std::strcmp(tensor->name, "full-view") != 0) {
         return {GGML_BACKEND_SPLIT_AXIS_0, {2, 2}, {1}, 1};
     }
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
@@ -76,13 +77,21 @@ static void test_chain(ggml_backend_buffer_type_t buft, int depth, int repeats) 
 static void test_sync_modes(ggml_backend_buffer_type_t buft, size_t & callback_calls) {
     // Sources live in a different meta buffer. Sharded matmul output is
     // MIRRORED with assume_sync=true (allocation) but PARTIAL with false (I/O).
-    ggml_context_ptr weights(ggml_init({ggml_tensor_overhead() * 4, nullptr, true}));
+    ggml_context_ptr weights(ggml_init({ggml_tensor_overhead() * 5, nullptr, true}));
     auto * a = ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, 4, 4);
     auto * b = ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, 4, 4);
     auto * view = ggml_view_2d(weights.get(), a, 4, 2, a->nb[1], 0);
+    auto * full_view = ggml_view_tensor(weights.get(), a);
+    ggml_set_name(full_view, "full-view");
     ggml_backend_buffer_ptr weights_buffer(ggml_backend_alloc_ctx_tensors_from_buft(weights.get(), buft));
     GGML_ASSERT(weights_buffer);
     ggml_backend_buffer_set_usage(weights_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    // OP_NONE views inherit their source's sharding; the callback would
+    // deliberately classify this name as mirrored if consulted directly.
+    for (size_t rank = 0; rank < 2; ++rank) {
+        auto * shard = ggml_backend_meta_buffer_simple_tensor(full_view, rank);
+        GGML_ASSERT(shard->ne[0] == 2 && shard->ne[1] == 4);
+    }
 
     // Renaming a view must invalidate its same-buffer source too. Just erasing
     // the stale view would preserve these bytes but skip the source callback.

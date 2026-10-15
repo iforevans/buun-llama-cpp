@@ -111,11 +111,14 @@ struct ring_buffer {
 
 struct common_sampler {
     common_params_sampling params;
+    const llama_vocab * vocab;
 
-    // True when the configured chain is provably equivalent to selecting the
-    // largest raw model logit. Computed once from the chain configuration at
-    // construction so callers do not have to duplicate sampler semantics.
-    bool raw_argmax_exact;
+    // Number of largest raw model logits that provably contain the sampled
+    // token: 1 when the chain is exactly the raw argmax, n + 1 when its only
+    // change bans n tokens (-inf biases, e.g. ignore_eos), 0 otherwise.
+    // Computed once from the chain configuration at construction so callers do
+    // not have to duplicate sampler semantics.
+    int32_t raw_argmax_k;
 
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
@@ -133,6 +136,12 @@ struct common_sampler {
     // on rejection, the residual p-q distribution.
     uint32_t speculative_seed;
     std::mt19937 speculative_rng;
+
+    // Greedy chain whose only logit change is a sparse bias (user biases, ignore_eos,
+    // suppress tokens): sampling is the argmax of the biased logits. Biases are sorted
+    // by token with duplicates summed.
+    bool greedy_argmax;
+    std::vector<llama_logit_bias> greedy_bias;
 
     void reset() {
         prev.clear();
@@ -357,17 +366,16 @@ struct common_sampler * common_sampler_init(
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
+    std::vector<llama_logit_bias> logit_bias = params.logit_bias;
     {
-        std::vector<llama_logit_bias> merged = params.logit_bias;
-
         int32_t n_suppress = 0;
         const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
         for (int32_t i = 0; i < n_suppress; ++i) {
-            merged.push_back({ suppress[i], -INFINITY });
+            logit_bias.push_back({ suppress[i], -INFINITY });
         }
 
-        if (!merged.empty()) {
-            samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+        if (!logit_bias.empty()) {
+            samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), logit_bias.size(), logit_bias.data()));
         }
     }
 
@@ -468,7 +476,8 @@ struct common_sampler * common_sampler_init(
 
     auto * result = new common_sampler {
         /* .params  = */ params,
-        /* .raw_argmax_exact = */ false,
+        /* .vocab   = */ vocab,
+        /* .raw_argmax_k = */ 0,
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
         /* .chain   = */ chain,
@@ -479,16 +488,13 @@ struct common_sampler * common_sampler_init(
         /* .speculative_rng  = */ std::mt19937(speculative_seed),
     };
 
-    int32_t n_suppress = 0;
-    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
-    if (grmr == nullptr && rbudget == nullptr && n_suppress == 0 &&
+    if (grmr == nullptr && rbudget == nullptr &&
         params.temp <= 0.0f && params.dynatemp_range == 0.0f &&
         params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f &&
         params.penalty_present == 0.0f && params.dry_multiplier == 0.0f &&
         params.xtc_probability == 0.0f && params.typ_p >= 1.0f &&
         params.top_n_sigma < 0.0f && params.adaptive_target < 0.0f &&
-        params.mirostat == 0 && params.n_probs == 0 &&
-        params.logit_bias.empty()) {
+        params.mirostat == 0 && params.n_probs == 0) {
         bool has_greedy_selector = false;
         bool supported = true;
         for (const auto sampler : params.samplers) {
@@ -512,14 +518,56 @@ struct common_sampler * common_sampler_init(
                     break;
             }
         }
-        result->raw_argmax_exact = supported && has_greedy_selector;
+        result->greedy_argmax = supported && has_greedy_selector;
+        if (result->greedy_argmax) {
+            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+            auto & bias = result->greedy_bias;
+            for (const auto & b : logit_bias) {
+                if (b.token >= 0 && b.token < n_vocab) {
+                    bias.push_back(b);
+                }
+            }
+            std::sort(bias.begin(), bias.end(), [](const llama_logit_bias & a, const llama_logit_bias & b) {
+                return a.token < b.token;
+            });
+            size_t n = 0;
+            for (const auto & b : bias) {
+                if (n > 0 && bias[n - 1].token == b.token) {
+                    bias[n - 1].bias += b.bias;
+                } else {
+                    bias[n++] = b;
+                }
+            }
+            bias.resize(n);
+
+            // a banned token never wins, so the answer is the best unbanned one,
+            // which ranks within the first n + 1 raw logits (ggml_topk_ext caps K at 64)
+            const bool bans_only = std::all_of(bias.begin(), bias.end(), [](const llama_logit_bias & b) {
+                return b.bias == -INFINITY;
+            });
+            if (bans_only && bias.size() < 64) {
+                result->raw_argmax_k = (int32_t) bias.size() + 1;
+            }
+        }
     }
 
     return result;
 }
 
-bool common_sampler_raw_argmax_exact(const struct common_sampler * gsmpl) {
-    return gsmpl != nullptr && gsmpl->raw_argmax_exact;
+int32_t common_sampler_raw_argmax_k(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr ? gsmpl->raw_argmax_k : 0;
+}
+
+llama_token common_sampler_raw_argmax_pick(const struct common_sampler * gsmpl, const int32_t * cand, int32_t k) {
+    const auto & bias = gsmpl->greedy_bias;
+    for (int32_t i = 0; i < k; ++i) {
+        const bool banned = std::binary_search(bias.begin(), bias.end(), llama_logit_bias{cand[i], 0.0f},
+            [](const llama_logit_bias & a, const llama_logit_bias & b) { return a.token < b.token; });
+        if (cand[i] >= 0 && !banned) {
+            return cand[i];
+        }
+    }
+    return LLAMA_TOKEN_NULL;
 }
 
 void common_sampler_free(struct common_sampler * gsmpl) {
@@ -596,9 +644,10 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
-        /* .raw_argmax_exact = */ gsmpl->raw_argmax_exact,
+        /* .vocab   = */ gsmpl->vocab,
+        /* .raw_argmax_k = */ gsmpl->raw_argmax_k,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
@@ -607,7 +656,11 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur_p   = */ gsmpl->cur_p,
         /* .speculative_seed = */ gsmpl->speculative_seed,
         /* .speculative_rng  = */ gsmpl->speculative_rng,
+        /* .greedy_argmax    = */ gsmpl->greedy_argmax,
+        /* .greedy_bias      = */ gsmpl->greedy_bias,
     };
+    result->cur_p.data = gsmpl->cur_p.data ? result->cur.data() : nullptr;
+    return result;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -623,10 +676,16 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     llama_sampler_copy(src->chain,   dst->chain);
 
     dst->params     = src->params;
+    dst->vocab      = src->vocab;
+    dst->raw_argmax_k = src->raw_argmax_k;
+    dst->greedy_argmax = src->greedy_argmax;
+    dst->greedy_bias = src->greedy_bias;
     dst->prev       = src->prev;
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->speculative_seed = src->speculative_seed;
+    dst->speculative_rng = src->speculative_rng;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -772,6 +831,46 @@ static llama_token common_sampler_sample_impl(
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
+    // greedy: argmax the (sparsely biased) logits in index order instead of building and
+    // partially sorting a candidate per vocab entry
+    if (gsmpl->greedy_argmax && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL &&
+        llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
+        const auto tm = gsmpl->tm();
+
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+
+        llama_token id     = LLAMA_TOKEN_NULL;
+        float       best   = -INFINITY;
+        llama_token next   = 0;
+        const auto  scan   = [&](llama_token end) {
+            for (llama_token i = next; i < end; ++i) {
+                if (logits[i] > best) {
+                    best = logits[i];
+                    id   = i;
+                }
+            }
+        };
+        for (const auto & b : gsmpl->greedy_bias) {
+            scan(b.token);
+            if (logits[b.token] + b.bias > best) {
+                best = logits[b.token] + b.bias;
+                id   = b.token;
+            }
+            next = b.token + 1;
+        }
+        scan(n_vocab);
+
+        // every candidate at -inf: leave it to the chain
+        if (id != LLAMA_TOKEN_NULL) {
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = llama_token_data{id, best, 1.0f};
+            gsmpl->cur_p  = { gsmpl->cur.data(), 1, 0, true };
+            return id;
+        }
+    }
+
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     return common_sampler_sample_impl(
         gsmpl,
@@ -809,7 +908,9 @@ static std::vector<llama_token> common_sampler_sample_and_accept_n_impl(
 
         result.push_back(id);
 
-        if (draft[i] != id) {
+        // do not accept draft tokens after an EOG - they are not output but would stay in the context
+        // on replay the last token is from the target and can be EOG, so a trailing EOG is still accepted
+        if (draft[i] != id || (llama_vocab_is_eog(gsmpl->vocab, id) && i + 1 < draft.size())) {
             break;
         }
     }
@@ -1096,7 +1197,7 @@ bool common_sampler_sample_and_accept_n_q(
             const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[row], true);
             common_sampler_accept(gsmpl, id, true);
             result.push_back(id);
-            if (id != draft[row]) {
+            if (id != draft[row] || (llama_vocab_is_eog(gsmpl->vocab, id) && row + 1 < draft.size())) {
                 return true;
             }
             continue;
@@ -1124,7 +1225,7 @@ bool common_sampler_sample_and_accept_n_q(
 
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
-        if (id != proposed) {
+        if (id != proposed || (llama_vocab_is_eog(gsmpl->vocab, id) && row + 1 < draft.size())) {
             return true;
         }
     }

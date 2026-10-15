@@ -53,10 +53,17 @@ void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
 void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 
 // Dot product
+// dst[r][row] = (vx + row*stride) . vy[r] for nr <= 4 activation rows in the type's
+// vec_dot_type, each bit-identical to vec_dot. NULL when the type has no batched kernel.
+typedef void (*ggml_vec_dot_batch_rows_t)(int n, float * const * dst, const void * vx, size_t stride,
+                                          const void * const * vy, int nr, int64_t rows);
 #if defined(__AVX2__)
-void ggml_vec_dot_q2_0_q8_0_batch(int n, float * s, const void * vx, const void * const * vy, int nr);
-void ggml_vec_dot_q2_0_q8_0_batch_rows(int n, float * const * dst, const void * vx, size_t stride,
-                                    const void * const * vy, int nr, int64_t rows);
+ggml_vec_dot_batch_rows_t ggml_get_vec_dot_batch_rows(enum ggml_type type);
+#else
+static inline ggml_vec_dot_batch_rows_t ggml_get_vec_dot_batch_rows(enum ggml_type type) {
+    (void) type;
+    return NULL;
+}
 #endif
 void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

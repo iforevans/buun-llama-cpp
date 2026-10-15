@@ -4,6 +4,8 @@
 #include "llama-cparams.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -136,6 +138,10 @@ public:
     // Publish prepared metadata without move-constructing the position trees:
     // MSVC's std::set move constructor allocates a new sentinel.
     void swap(llama_kv_cells & other) noexcept {
+        std::swap(rev, other.rev);
+        std::swap(changes, other.changes);
+        std::swap(head, other.head);
+        std::swap(n_changes, other.n_changes);
         std::swap(has_shift, other.has_shift);
         std::swap(used, other.used);
         pos.swap(other.pos);
@@ -168,6 +174,8 @@ public:
             shift[i] =  0;
             seq[i].reset();
         }
+
+        touch_all();
 
         has_shift = false;
 
@@ -225,6 +233,30 @@ public:
 
     bool get_has_shift() const {
         return has_shift;
+    }
+
+    // Every metadata mutation takes a process-unique revision, so two cell sets with the same
+    // revision hold the same metadata, copies included. Consumers that derive per-cell layouts
+    // patch them from the cells touched since the revision they last saw.
+    uint64_t get_rev() const {
+        return rev;
+    }
+
+    // call f(cell) for every cell changed after revision `since` (repeats possible), or return
+    // false without calling f when that history is no longer known
+    template <typename F>
+    bool changes_since(uint64_t since, F && f) const {
+        uint32_t n = 0;
+        for (uint64_t cur = rev; cur != since; ++n) {
+            if (n == n_changes) {
+                return false;
+            }
+            cur = changes[(head + N_CHANGES - 1 - n) % N_CHANGES].prev;
+        }
+        for (uint32_t k = 0; k < n; ++k) {
+            f(changes[(head + N_CHANGES - 1 - k) % N_CHANGES].cell);
+        }
+        return true;
     }
 
     // move cell isrc to idst (used during defrag)
@@ -314,6 +346,8 @@ public:
                 seq_pos_add(i + j);
             }
 
+            touch(idx);
+
             assert(shift[idx] == 0);
         }
     }
@@ -345,6 +379,8 @@ public:
                 seq_pos_add(idx);
             }
 
+            touch(idx);
+
             assert(shift[idx] == 0);
         }
     }
@@ -362,6 +398,8 @@ public:
         shift[i] = 0;
 
         used.erase(i);
+
+        touch(i);
     }
 
     // note: call only if the cell has seq_id
@@ -374,6 +412,7 @@ public:
 
         seq[i].reset(seq_id);
         seq_pos_dec(seq_id, i);
+        touch(i);
 
         if (seq[i].none()) {
             pos[i] = -1;
@@ -398,6 +437,7 @@ public:
 
             seq[i].set(seq_id);
             seq_pos_inc(seq_id, i);
+            touch(i);
 
             return false;
         }
@@ -411,6 +451,7 @@ public:
             shift[i] = 0;
 
             used.erase(i);
+            touch(i);
 
             return true;
         }
@@ -463,6 +504,11 @@ public:
         return seq[i].test(seq_id);
     }
 
+    const std::set<std::pair<llama_pos, uint32_t>> & seq_pos_get(llama_seq_id seq_id) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        return seq_pos[seq_id];
+    }
+
     // Token in the sequence cell at the greatest position <= p. When several cells
     // share a temporal position (M-RoPE), the highest physical index wins, matching
     // the previous ascending-cell scan. Returns LLAMA_TOKEN_NULL when no predecessor
@@ -489,6 +535,7 @@ public:
         seq_pos_inc(seq_id, i);
         // Publish membership only after the allocating index insertion succeeds.
         seq[i].set(seq_id);
+        touch(i);
     }
 
     // return the sequence id of this cell
@@ -623,11 +670,13 @@ public:
         pos[i] = p;
 
         used.insert(i);
+        touch(i);
     }
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
         assert(i < ext.size());
         ext[i] = p;
+        touch(i);
     }
 
     // pos[i] = pos[i] + d
@@ -666,6 +715,7 @@ public:
         shift[i] += p_old - pos[i];
 
         seq_pos_add(i);
+        touch(i);
 
         has_shift = true;
     }
@@ -676,6 +726,7 @@ private:
         assert(pos[i] != -1);
 
         seq_pos_rm(i);
+        touch(i);
 
         pos[i] += d;
         if (broadcast_text) {
@@ -702,6 +753,37 @@ private:
 
         return false;
     }
+
+    static uint64_t next_rev() {
+        static std::atomic<uint64_t> counter { 0 };
+        return ++counter;
+    }
+
+    void touch(uint32_t i) {
+        const uint64_t r = next_rev();
+        changes[head] = { rev, i };
+        head = (head + 1) % N_CHANGES;
+        n_changes = std::min(n_changes + 1, N_CHANGES);
+        rev = r;
+    }
+
+    // a bulk change: forget the history so consumers rebuild
+    void touch_all() {
+        rev = next_rev();
+        n_changes = 0;
+    }
+
+    struct change {
+        uint64_t prev; // revision before this change
+        uint32_t cell;
+    };
+
+    static constexpr uint32_t N_CHANGES = 256;
+
+    uint64_t rev = next_rev();
+    std::array<change, N_CHANGES> changes;
+    uint32_t head      = 0;
+    uint32_t n_changes = 0;
 
     bool has_shift = false;
 

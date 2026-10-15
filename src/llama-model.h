@@ -154,6 +154,7 @@ enum llm_type {
     LLM_TYPE_685B_A37B, // DeepSeek V3.2
     LLM_TYPE_744B_A40B, // GLM-5
     LLM_TYPE_2_8T_A50B, // Kimi-K3
+    LLM_TYPE_320B_A18B, // GLM-5.3-Flash
     LLM_TYPE_E2B,
     LLM_TYPE_E4B,
 };
@@ -321,6 +322,10 @@ struct llama_layer {
     struct ggml_tensor * wv_enc    = nullptr;
     struct ggml_tensor * wo_enc    = nullptr;
     struct ggml_tensor * wqkv_gate = nullptr;
+    // K2 Horizon MoVA
+    struct ggml_tensor * attn_v_gate   = nullptr;
+    struct ggml_tensor * attn_v_gate_b = nullptr;
+    struct ggml_tensor * attn_v_exps   = nullptr;
 
     // relative position bias
     struct ggml_tensor * attn_rel_b       = nullptr;
@@ -546,10 +551,18 @@ struct llama_layer {
     struct ggml_tensor * wkv_s                = nullptr;
     struct ggml_tensor * wo_a_s               = nullptr;
     struct ggml_tensor * wo_b_s               = nullptr;
+    // EXL3 scale/sign companions for the MLA low-rank projections (GLM5-Next).
+    // DeepSeek-V4's block-FP8 path stores only a weight scale (wq_a_s/wq_b_s
+    // above); EXL3 needs the svh weight scale and the suh input-sign vector.
+    struct ggml_tensor * wq_a_in_s            = nullptr;
+    struct ggml_tensor * wq_b_in_s            = nullptr;
+    struct ggml_tensor * wkv_a_mqa_s          = nullptr;
+    struct ggml_tensor * wkv_a_mqa_in_s       = nullptr;
     struct ggml_tensor * attn_comp_wkv_s      = nullptr;
     struct ggml_tensor * attn_comp_wgate_s    = nullptr;
     struct ggml_tensor * indexer_proj_s        = nullptr;
     struct ggml_tensor * indexer_attn_q_b_s    = nullptr;
+    struct ggml_tensor * indexer_attn_q_b_in_s = nullptr;
     struct ggml_tensor * indexer_comp_wkv_s    = nullptr;
     struct ggml_tensor * indexer_comp_wgate_s  = nullptr;
 
@@ -592,6 +605,10 @@ struct llama_layer {
     struct ggml_tensor * indexer_proj     = nullptr;
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
+
+    // glm5-next k-pool indexer
+    struct ggml_tensor * indexer_kpool_gate = nullptr;
+    struct ggml_tensor * indexer_kpool_ape  = nullptr;
 
     // MSA
     struct ggml_tensor * index_q_proj = nullptr;
@@ -714,6 +731,7 @@ struct llama_model {
     struct ggml_tensor * cls_out   = nullptr;
     struct ggml_tensor * cls_out_b = nullptr;
     struct ggml_tensor * cls_norm  = nullptr;
+    struct ggml_tensor * cls_norm_b = nullptr;
 
     struct ggml_tensor * conv1d   = nullptr;
     struct ggml_tensor * conv1d_b = nullptr;
@@ -779,6 +797,7 @@ struct llama_model {
     std::map<uint32_t, std::vector<int32_t>> hadamard_sign_data;
     bool hadamard_gdn_v_grouped = false;
     llama_hadamard_rotations hadamard_rotations;
+    llama_expert_banks expert_banks;
     llama_hadamard_rotations hadamard_inverses;
 
     struct segmented_rotation_spec {
@@ -795,6 +814,9 @@ struct llama_model {
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
+
+    // which tensors can be prefetched - driven by TENSOR_READ_LAZY
+    std::unordered_set<const ggml_tensor *> can_prefetch;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
@@ -905,6 +927,9 @@ struct llama_model_base : public llama_model {
     void create_tensor_qkv(llama_layer & layer, int bid,
                 int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
                 int flags);
+
+    void create_expert_bank(llm_tensor tid, int bid, int64_t k, int64_t n, int64_t experts, int flags,
+                           ggml_tensor * & weight, ggml_tensor * & scale, ggml_tensor * & input_scale);
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

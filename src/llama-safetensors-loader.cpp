@@ -7,6 +7,7 @@
 #include "llama-safetensors-qwen35.h"
 #include "llama-safetensors-qwen4exp.h"
 #include "llama-safetensors-deepseek4.h"
+#include "llama-safetensors-glm5next.h"
 #include "llama-model-source.h"
 #include "llama-repack-cache.h"
 #include "llama.h"
@@ -63,15 +64,23 @@ std::unique_ptr<llama_safetensors_importer> create_deepseek4_importer(
     return std::make_unique<llama_safetensors_deepseek4_importer>(model_dir, config, io_mode);
 }
 
+std::unique_ptr<llama_safetensors_importer> create_glm5next_importer(
+        const std::filesystem::path & model_dir,
+        const llama_safetensors_json & config,
+        llama_safetensors_io_mode io_mode) {
+    return std::make_unique<llama_safetensors_glm5next_importer>(model_dir, config, io_mode);
+}
+
 std::unique_ptr<llama_safetensors_importer> select_importer(
         const std::filesystem::path & model_dir,
         llama_safetensors_io_mode io_mode) {
     const llama_safetensors_json config = llama_safetensors_read_model_config(model_dir);
-    static constexpr std::array<importer_registration, 4> importers = { {
+    static constexpr std::array<importer_registration, 5> importers = { {
         { "qwen3", llama_safetensors_qwen3_importer::probe, create_qwen3_importer },
         { "qwen3_5", llama_safetensors_qwen35_importer::probe, create_qwen35_importer },
         { "qwen4_exp", llama_safetensors_qwen4exp_importer::probe, create_qwen4exp_importer },
         { "deepseek_v4", llama_safetensors_deepseek4_importer::probe, create_deepseek4_importer },
+        { "glm5_next", llama_safetensors_glm5next_importer::probe, create_glm5next_importer },
     } };
 
     const importer_registration * match = nullptr;
@@ -180,6 +189,10 @@ llama_model * llama_model_load_from_safetensors_dir(
                 bool check_tensors, const std::filesystem::path & model_dir,
                 const llama_repack_cache * cache) :
             importer_(std::move(importer)), check_tensors_(check_tensors), model_dir_(model_dir), cache_(cache) {}
+
+        std::vector<int64_t> expert_group_sizes(const std::string & name) const override {
+            return importer_->expert_group_sizes(name);
+        }
 
         bool describe(
                 const std::string & canonical_name,

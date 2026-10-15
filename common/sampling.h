@@ -76,9 +76,12 @@ llama_token common_sampler_sample_from_logits(
         size_t n_logits,
         bool grammar_first = false);
 
-// True when the sampler initialized for this request is exactly equivalent to
-// selecting the token with the largest unmodified model logit.
-bool common_sampler_raw_argmax_exact(const struct common_sampler * gsmpl);
+// K such that the token this sampler selects is always among the K largest
+// unmodified model logits (1 = plain raw argmax), or 0 when no such bound holds.
+int32_t common_sampler_raw_argmax_k(const struct common_sampler * gsmpl);
+
+// The sampled token from a row's K raw-logit candidates in descending order.
+llama_token common_sampler_raw_argmax_pick(const struct common_sampler * gsmpl, const int32_t * cand, int32_t k);
 
 // generalized version of common_sampler_sample
 //

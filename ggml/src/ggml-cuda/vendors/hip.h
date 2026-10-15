@@ -91,6 +91,7 @@
 #define cudaHostRegister hipHostRegister
 #define cudaHostAlloc hipHostMalloc
 #define cudaHostAllocPortable hipHostMallocPortable
+#define cudaHostRegisterMapped hipHostRegisterMapped
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
 #define cudaHostUnregister hipHostUnregister

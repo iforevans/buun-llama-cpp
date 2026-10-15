@@ -501,6 +501,10 @@ extern "C" {
     static inline bool ggml_type_is_exl3(enum ggml_type type) {
         return type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3T_8;
     }
+    // Q2_0 and Q2_0_G128 (PQ2) share packed ternary codes and differ only in group size
+    static inline bool ggml_type_is_q2_0(enum ggml_type type) {
+        return type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_0_G128;
+    }
     static inline int ggml_exl3_bits(enum ggml_type type) {
         return ((int) type - (int) GGML_TYPE_EXL3_1) % 8 + 1;
     }
@@ -728,6 +732,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_HC_MIX,
         GGML_OP_DFLASH2_CONV,
         GGML_OP_GATED_DELTA_NET_TREE,
         GGML_OP_SSM_CONV_TREE,
@@ -2945,6 +2950,34 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // hc_post with the identity comb and post = 2*sigmoid(scale*inject), inject [hc, n_tokens]
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post_inject(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * inject,
+            float                 scale);
+
+    // hc_mix (Qwen3.8-Flash-Next): the whole gated pre-mix of one hyper-connection.
+    //   x [n_embd, hc, n_tokens], w_norm [n_embd, hc], w_down [hc*n_embd, r],
+    //   w_up [r, hc*n_embd], w_inject [hc*n_embd, hc] or NULL
+    //   xn          = rms_norm(x, eps)*w_norm (per stream), flattened to [hc*n_embd, n_tokens]
+    //   lo          = silu(scale*(w_down xn))
+    //   mixed[i, t] = scale*sum_h xn[i, h, t]*sigmoid(w_up lo)[i + n_embd*h, t]
+    //   inject      = w_inject xn
+    //   -> 1D: mixed [n_embd, n_tokens], followed by inject [hc, n_tokens] when w_inject is set
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_norm,
+            struct ggml_tensor  * w_down,
+            struct ggml_tensor  * w_up,
+            struct ggml_tensor  * w_inject,
+            float                 eps,
+            float                 scale);
 
     // DFlash2 grouped two-tap convolution. hidden [n_embd, n_tokens],
     // projected [4*n_groups, n_tokens], base [n_embd, 2, 2].

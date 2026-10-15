@@ -2104,7 +2104,7 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    if (src1_cont) {
+    if (!params->use_ref && src1_cont) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -2133,7 +2133,9 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+        const bool widen = src1->type != GGML_TYPE_F32;
+        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32);
+        GGML_ASSERT(!widen || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -2146,25 +2148,24 @@ UseGgmlGemm1:;
             }
         }
     #else
+        const int64_t bs = ggml_blck_size(vec_dot_type);
+
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    const char * src1_block = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10;
-                    char * dst_block = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
-                    const int64_t n_block = (ne10_block_end - ne10_block_start) * bs;
+                    const void * src1_row  = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10;
+                    void       * wdata_row =                    wdata  + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
 
-                    if (src1->type == GGML_TYPE_F32) {
-                        from_float((const float *) src1_block, dst_block, n_block);
+                    const int64_t ne10_block_size = (ne10_block_end - ne10_block_start) * bs;
+
+                    if (src1->type == GGML_TYPE_F16) {
+                        ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, (float *) wdata_row, ne10_block_size);
+                    } else if (src1->type == GGML_TYPE_BF16) {
+                        ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row, (float *) wdata_row, ne10_block_size);
                     } else {
-                        GGML_ASSERT(vec_dot_type == GGML_TYPE_F32);
-                        const ggml_fp16_t * src_f16 = (const ggml_fp16_t *) src1_block;
-                        float * dst_f32 = (float *) dst_block;
-                        for (int64_t i = 0; i < n_block; ++i) {
-                            dst_f32[i] = GGML_CPU_FP16_TO_FP32(src_f16[i]);
-                        }
+                        from_float((const float *) src1_row, wdata_row, ne10_block_size);
                     }
                 }
             }
@@ -2180,7 +2181,7 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type) {
+    if (!params->use_ref && src1->type != vec_dot_type) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -2300,10 +2301,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
-#if defined(__AVX2__)
-    // Amortize activation preparation over at least one output-column tile.
-    const bool prepare_q2 = ne00 <= 16384 && ir0_end - ir0_start >= 16;
-    if (type == GGML_TYPE_Q2_0 && (prepare_q2 || ir1_end - ir1_start > 1)) {
+    const ggml_vec_dot_batch_rows_t batch_rows = ggml_get_vec_dot_batch_rows(type);
+    if (batch_rows) {
         for (int64_t first = ir1_start; first < ir1_end; first += 4) {
             const int nr = (int) MIN(4, ir1_end - first);
             const void * ys[4];
@@ -2313,23 +2312,12 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 const int64_t i11 = rm.i1 % ne11;
                 ys[r] = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
                     ? (i11 + rm.i2 * ne11) * row_size : i11 * nb11 + rm.i2 * nb12);
-                outs[r] = (float *) ((char *) dst->data + rm.i1 * nb1 + rm.i2 * nb2);
+                outs[r] = (float *) ((char *) dst->data + rm.i1 * nb1 + rm.i2 * nb2) + ir0_start;
             }
-            if (prepare_q2) {
-                for (int r = 0; r < nr; ++r) outs[r] += ir0_start;
-                ggml_vec_dot_q2_0_q8_0_batch_rows(ne00, outs, src0_cur + ir0_start * nb01,
-                        nb01, ys, nr, ir0_end - ir0_start);
-                continue;
-            }
-            for (int64_t row = ir0_start; row < ir0_end; ++row) {
-                float sums[4];
-                ggml_vec_dot_q2_0_q8_0_batch(ne00, sums, src0_cur + row * nb01, ys, nr);
-                for (int r = 0; r < nr; ++r) outs[r][row] = sums[r];
-            }
+            batch_rows(ne00, outs, src0_cur + ir0_start * nb01, nb01, ys, nr, ir0_end - ir0_start);
         }
         return;
     }
-#endif
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -3136,6 +3124,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_DSV4_HC_MIX:
+            {
+                ggml_compute_forward_dsv4_hc_mix(params, tensor);
+            } break;
         case GGML_OP_DFLASH2_CONV:
             {
                 ggml_compute_forward_dflash2_conv(params, tensor);
@@ -3334,6 +3326,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_DSV4_HC_MIX:
         case GGML_OP_DFLASH2_CONV:
             {
                 n_tasks = n_threads;
@@ -4093,6 +4086,10 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_TURBO_WHT:
                     {
                         cur = 0;  // no extra workspace needed
+                    } break;
+                case GGML_OP_DSV4_HC_MIX:
+                    {
+                        cur = ggml_compute_forward_dsv4_hc_mix_work_size(node, n_tasks);
                     } break;
                 case GGML_OP_COUNT:
                     {
@@ -5447,6 +5444,21 @@ int ggml_cpu_has_sme2(void) {
 #endif
 }
 
+static void ggml_cpu_moe_cache_rows(enum ggml_type type, int n, float * const * dst,
+        const void * w, size_t stride, int64_t rows, const void * const * act, int nr) {
+    const ggml_vec_dot_batch_rows_t batch_rows = ggml_get_vec_dot_batch_rows(type);
+    if (batch_rows) {
+        batch_rows(n, dst, w, stride, act, nr, rows);
+        return;
+    }
+    const ggml_vec_dot_t vec_dot = type_traits_cpu[type].vec_dot;
+    for (int64_t i = 0; i < rows; ++i) {
+        for (int r = 0; r < nr; ++r) {
+            vec_dot(n, dst[r] + i, 0, (const char *) w + i*stride, 0, act[r], 0, 1);
+        }
+    }
+}
+
 void ggml_cpu_init(void) {
     // needed to initialize ggml_time
     {
@@ -5520,6 +5532,8 @@ void ggml_cpu_init(void) {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
         }
+        ggml_moe_cache_cpu_traits = ggml_get_type_traits_cpu;
+        ggml_moe_cache_cpu_rows = ggml_cpu_moe_cache_rows;
         is_first_call = false;
     }
 

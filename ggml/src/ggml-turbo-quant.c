@@ -22,7 +22,6 @@
 /* ---------- constants ---------- */
 
 #define TURBO_SEED_ROTATION 42
-#define TURBO_SEED_QJL      1042
 #define TURBO_D             128  /* rotation group size = head_dim (independent of block size) */
 #define TURBO_QJL_CONST     1.2533141373155003f  /* sqrt(pi/2) */
 
@@ -192,32 +191,6 @@ static void turbo_init_rotation(void) {
     turbo_rotation_initialized = 1;
 }
 
-/* ---------- QJL projection matrix (lazy init, seed-based) ---------- */
-
-static float turbo_qjl_matrix[TURBO_D * TURBO_D];
-static float turbo_qjl_matrix_t[TURBO_D * TURBO_D];
-static int   turbo_qjl_initialized = 0;
-
-static void turbo_init_qjl(void) {
-    if (turbo_qjl_initialized) return;
-
-    const int d = TURBO_D;
-    turbo_prng_seed(TURBO_SEED_QJL);
-
-    for (int i = 0; i < d * d; i++) {
-        turbo_qjl_matrix[i] = (float)turbo_prng_normal();
-    }
-
-    /* Transpose */
-    for (int i = 0; i < d; i++) {
-        for (int j = 0; j < d; j++) {
-            turbo_qjl_matrix_t[i * d + j] = turbo_qjl_matrix[j * d + i];
-        }
-    }
-
-    turbo_qjl_initialized = 1;
-}
-
 /* ---------- helper: matrix-vector multiply ---------- */
 
 static void matvec(const float * M, const float * x, float * y, int d) {
@@ -232,26 +205,6 @@ static void matvec(const float * M, const float * x, float * y, int d) {
 }
 
 /* ---------- nearest centroid ---------- */
-
-static int nearest_centroid_2bit(float val) {
-    /* Binary search on midpoints: {-0.133, -0.040, 0.040, 0.133} */
-    if (val < -0.086728f) return 0;       /* midpoint(-0.133, -0.040) */
-    if (val <  0.000000f) return 1;       /* midpoint(-0.040, 0.040) */
-    if (val <  0.086728f) return 2;       /* midpoint(0.040, 0.133) */
-    return 3;
-}
-
-static int nearest_centroid_3bit(float val) {
-    /* 8 centroids, find nearest via midpoints */
-    if (val < -0.154259f) return 0;
-    if (val < -0.091775f) return 1;
-    if (val < -0.043589f) return 2;
-    if (val <  0.000000f) return 3;
-    if (val <  0.043589f) return 4;
-    if (val <  0.091775f) return 5;
-    if (val <  0.154259f) return 6;
-    return 7;
-}
 
 static int nearest_centroid_4bit(float val) {
     /* 16 centroids, binary search on midpoints */

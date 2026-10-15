@@ -17,7 +17,8 @@
 namespace {
 
 constexpr uint32_t QSA_INDEX_STATE_MAGIC = 0x49534151; // "QSAI"
-constexpr uint32_t QSA_INDEX_STATE_VERSION = 1;
+// Native index KV rows now include rotation dimensions and persistent pooled keys.
+constexpr uint32_t QSA_INDEX_STATE_VERSION = 2;
 constexpr char QSA_INDEX_CODEC_DOMAIN[] = "buun.vbr.capture/qsa-index-codec/v1";
 
 class counting_writer final : public llama_io_write_i {
@@ -118,11 +119,6 @@ struct qsa_cell_key {
     int32_t y = 0;
     llama_token token = LLAMA_TOKEN_NULL;
 };
-
-bool operator<(const qsa_cell_key & lhs, const qsa_cell_key & rhs) noexcept {
-    return std::tie(lhs.pos, lhs.x, lhs.y, lhs.token) <
-           std::tie(rhs.pos, rhs.x, rhs.y, rhs.token);
-}
 
 struct qsa_cell_location {
     llama_pos pos = -1;
@@ -308,10 +304,15 @@ public:
             if (!terminal_ok || terminal != parsed.terminal || !bytes_ok) {
                 return false;
             }
+            // Physical placement can change pool representatives even when
+            // the restored token count is unchanged. Rebuild derived pools
+            // through the indexed-memory owner before the next decode.
+            target.index_state_restored();
             return true;
         } catch (...) {
             if (auto * cache = target.get_mem_idx()) {
                 cache->seq_rm(destination, -1, -1);
+                target.index_state_restored();
             }
             return false;
         }
@@ -424,6 +425,7 @@ public:
             return false;
         }
         image.target->get_mem_idx()->seq_rm(image.destination, -1, -1);
+        image.target->index_state_restored();
         if (image.destination_was_empty) {
             return true;
         }

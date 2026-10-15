@@ -43,10 +43,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 10
+#define LLAMA_SESSION_VERSION 11
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 3
+#define LLAMA_STATE_SEQ_VERSION 4
 
 #ifdef __cplusplus
 extern "C" {
@@ -78,6 +78,7 @@ extern "C" {
         LLAMA_VOCAB_TYPE_RWKV   = 5, // RWKV tokenizer based on greedy tokenization
         LLAMA_VOCAB_TYPE_PLAMO2 = 6, // PLaMo-2 tokenizer based on Aho-Corasick with dynamic programming
         LLAMA_VOCAB_TYPE_TEST   = 7, // Dummy tokenizer for testing: rolling hash of fixed-size chunks -> tokens, tokens -> hex
+        LLAMA_VOCAB_TYPE_PLAMO3 = 8, // PLaMo-3 tokenizer with pre-segmentation and dynamic programming
     };
 
     enum llama_rope_type {
@@ -555,6 +556,7 @@ extern "C" {
     LLAMA_API void llama_backend_free(void);
 
     // Optional: enable numa optimizations
+    // TODO: deprecate and make part of llama_backend_init()
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
 
     // Optional: an auto threadpool gets created in ggml if not passed explicitly
@@ -668,6 +670,12 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
     LLAMA_API bool    llama_model_has_mtp      (const struct llama_model * model);
+
+    // Restrict an MTP draft model's LM head to the ascending target token ids `ids`
+    // (FR-Spec style): gathers those rows of its output head into a draft-owned copy
+    // and maps draft logits back through d2t. Call after loading, before creating a
+    // context. Returns false (model unchanged) when the head cannot be trimmed.
+    LLAMA_API bool    llama_model_set_draft_vocab(struct llama_model * model, const int32_t * ids, int32_t n_ids);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
 
@@ -1209,8 +1217,9 @@ extern "C" {
     // Position-range form of a sequence's base state: the part that PARTIAL_ONLY leaves out,
     // restricted to positions [p0, p1). A range blob does not depend on the stream layout, so it
     // moves between split and unified KV caches. All three return 0 on failure.
+    // Indexed/QSA memories currently refuse ranges: attention-only ranges cannot restore their index state.
     // Bump the version on any change to the blob layout: readers refuse other versions.
-#define LLAMA_STATE_SEQ_RANGE_VERSION 1
+#define LLAMA_STATE_SEQ_RANGE_VERSION 2
 
     // The sequence must hold every position of the range, with none masked out.
     // A memory with no base part (pure recurrent) yields a blob that is only its header.
@@ -1439,9 +1448,10 @@ extern "C" {
     // Log-probabilities of top-K tokens (available when dflash_sample_temp > 0).
     LLAMA_API float *   llama_get_logits_argmax_probs(struct llama_context * ctx);
     // True when the last decode computed the argmax/top-K tail on a GPU backend.
-    // Only the GPU argmax kernels implement the extended [ids + log-probs] output
-    // layout; a tail scheduled on the CPU backend (e.g. a drafter with -ngld 0)
-    // runs the plain per-row argmax and leaves the extended layout uninitialized.
+    // Only the GPU argmax kernels implement the sampled (temp/seed) extended
+    // [ids + log-probs] output layout; a tail scheduled on the CPU backend (e.g. a
+    // drafter with -ngld 0) fills it only for the noise-free top-K (K > 1), and
+    // otherwise runs the plain per-row argmax and leaves it uninitialized.
     LLAMA_API bool      llama_get_logits_argmax_gpu(struct llama_context * ctx);
 
     // Get all output token embeddings.

@@ -63,6 +63,7 @@ set(LLAMA_CORE_SOURCES
             llama-safetensors-qwen35.cpp
             llama-safetensors-qwen4exp.cpp
             llama-safetensors-deepseek4.cpp
+            llama-safetensors-glm5next.cpp
             llama-vocab.cpp
             llama-cache-accounting.cpp
             llama-cache-budget.cpp
